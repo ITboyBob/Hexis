@@ -58,6 +58,21 @@ temporary analysis artifacts in the source repo. Use
 code, or a checked-in test fixture, move it into the appropriate repo path
 intentionally and commit it like any other source change.
 
+## CODEMAP Navigation Protocol
+
+This project uses hierarchical `CODEMAP.md` index files for code navigation. Files over 1000 lines may have companion `.analysis.md` structural maps.
+
+### Navigation Rules
+
+1. Start from root `CODEMAP.md`. Read Task Guide first.
+2. Task Guide match: Target = primary read set. Also Check = conditional candidates (decide after reading Target).
+3. No Task Guide match → filter Subdirectories by Domain, enter only matching-domain subdirectories.
+4. Drill down layer by layer; consult local Task Guide at each level before reading source files.
+5. Container directories (no source files): read only Task Guide + Subdirectories.
+6. Large files: read `.analysis.md` Feature Index first, match Intent to line ranges. Use Logical Sections as fallback.
+7. Batch-read final target files in parallel.
+8. No speculative expansion: extend read set only when already-read code proves the need.
+
 ## Everything else
 
 See `CLAUDE.md` for project overview, structure, build/test commands, the venv +
