@@ -631,6 +631,175 @@ describe("ChatPage attachments", () => {
   });
 });
 
+describe("ChatPage recall activity", () => {
+  const eventStream = (events: string[]) =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          for (const event of events) controller.enqueue(encoder.encode(event));
+          controller.close();
+        },
+      }),
+      { headers: { "Content-Type": "text/event-stream" } }
+    );
+
+  const logEvent = (payload: Record<string, unknown>) =>
+    `event: log\ndata: ${JSON.stringify(payload)}\n\n`;
+
+  const recallResult = (detail: string) => ({
+    kind: "tool_result",
+    title: "recall",
+    detail,
+  });
+
+  const doneEvent =
+    'event: done\ndata: {"assistant":"","session_id":"00000000-0000-4000-8000-000000000001"}\n\n';
+
+  const stubFetchWithChatEvents = (chatEvents: string[]) => {
+    // Desktop viewport: the activity inspector mounts open, matching the
+    // real >=1024px layout the recall body is verified against.
+    vi.stubGlobal("matchMedia", vi.fn(() => ({
+      matches: true,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/api/status")) {
+          return Response.json({
+            configured: true,
+            agent_name: "Samantha",
+            mood: "Ready",
+            valence: 0,
+          });
+        }
+        if (url.endsWith("/api/outbox")) {
+          return Response.json({ unread: 0, messages: [], pending_requests: [] });
+        }
+        if (url.endsWith("/api/chat")) {
+          return eventStream([...chatEvents, doneEvent]);
+        }
+        return Response.json({});
+      }) as unknown as typeof fetch
+    );
+  };
+
+  const detailParagraphs = (container: HTMLElement, detail: string) =>
+    Array.from(container.querySelectorAll("p")).filter(
+      (p) => p.textContent === detail
+    );
+
+  const sendChatMessage = async () => {
+    const composer = await screen.findByLabelText("Message Samantha");
+    fireEvent.change(composer, { target: { value: "请调用 recall 工具检索记忆" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  it("shows the full recall body verbatim in the expanded activity list", async () => {
+    const recallDetail = [
+      "1. 第一条记忆正文首行\n第一条记忆正文第二行",
+      `2. ${"长正文段落".repeat(60)}`,
+      "3. 第三条记忆正文末尾标记",
+    ].join("\n\n");
+    stubFetchWithChatEvents([logEvent(recallResult(recallDetail))]);
+
+    const { container } = render(<ChatPage />);
+    await sendChatMessage();
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Activity/ }));
+
+    await waitFor(() => {
+      expect(detailParagraphs(container, recallDetail)).toHaveLength(1);
+    });
+    const target = detailParagraphs(container, recallDetail)[0];
+    expect(target.className).toContain("whitespace-pre-wrap");
+    expect(target.className).toContain("break-words");
+    expect(target.className).not.toContain("line-clamp-2");
+  });
+
+  it("keeps the recall body unclamped in the collapsed activity preview", async () => {
+    const recallDetail = [
+      "1. 第一条记忆正文首行\n第一条记忆正文第二行",
+      `2. ${"长正文段落".repeat(60)}`,
+      "3. 第三条记忆正文末尾标记",
+    ].join("\n\n");
+    stubFetchWithChatEvents([logEvent(recallResult(recallDetail))]);
+
+    const { container } = render(<ChatPage />);
+    await sendChatMessage();
+
+    await screen.findByRole("button", { name: /^Activity/ });
+
+    await waitFor(() => {
+      expect(detailParagraphs(container, recallDetail)).toHaveLength(1);
+    });
+    const target = detailParagraphs(container, recallDetail)[0];
+    expect(target.className).toContain("whitespace-pre-wrap");
+    expect(target.className).toContain("break-words");
+    expect(target.className).not.toContain("line-clamp-2");
+  });
+
+  it("renders each recall result separately without mixing bodies", async () => {
+    const firstDetail = "1. 本次A";
+    const secondDetail = "1. 本次B";
+    stubFetchWithChatEvents([
+      logEvent({ kind: "tool_call", title: "recall", detail: '{"query":"话题A"}' }),
+      logEvent(recallResult(firstDetail)),
+      logEvent({ kind: "tool_call", title: "recall", detail: '{"query":"话题B"}' }),
+      logEvent(recallResult(secondDetail)),
+    ]);
+
+    const { container } = render(<ChatPage />);
+    await sendChatMessage();
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Activity/ }));
+
+    await waitFor(() => {
+      expect(detailParagraphs(container, firstDetail)).toHaveLength(1);
+    });
+    expect(detailParagraphs(container, secondDetail)).toHaveLength(1);
+    expect(
+      Array.from(container.querySelectorAll("p")).filter((p) =>
+        p.textContent?.includes("本次A")
+      )
+    ).toHaveLength(1);
+    expect(
+      Array.from(container.querySelectorAll("p")).filter((p) =>
+        p.textContent?.includes("本次B")
+      )
+    ).toHaveLength(1);
+  });
+
+  it("keeps the two-line preview for non-recall tools in compact mode", async () => {
+    const recallDetail = "1. 召回正文";
+    const searchDetail = "非召回工具的摘要输出";
+    stubFetchWithChatEvents([
+      logEvent(recallResult(recallDetail)),
+      logEvent({ kind: "tool_result", title: "search_web", detail: searchDetail }),
+    ]);
+
+    const { container } = render(<ChatPage />);
+    await sendChatMessage();
+
+    await screen.findByRole("button", { name: /^Activity/ });
+
+    await waitFor(() => {
+      expect(detailParagraphs(container, searchDetail)).toHaveLength(1);
+    });
+    const target = detailParagraphs(container, searchDetail)[0];
+    expect(target.className).toContain("line-clamp-2");
+    expect(target.className).not.toContain("whitespace-pre-wrap");
+  });
+});
+
 describe("ChatPage outbox replies", () => {
   beforeEach(() => {
     vi.stubGlobal("matchMedia", vi.fn(() => ({

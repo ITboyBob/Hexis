@@ -4445,13 +4445,14 @@ function EmotionSnapshotView({ snapshot, compact = false }: { snapshot: EmotionS
 }
 
 function ActivityEventRow({ event, compact = false }: { event: LogEvent; compact?: boolean }) {
+  const isRecallResult = event.title === "recall" && asRecord(event.raw).kind === "tool_result";
   return (
     <div className={compact ? "" : "border-t border-[var(--outline)] pt-2 first:border-t-0 first:pt-0"}>
       <div className="flex items-center justify-between gap-2">
         <p className="truncate text-xs font-semibold">{event.title}</p>
         <Badge variant={event.category === "error" ? "error" : "muted"}>{event.category === "error" ? "error" : "tool"}</Badge>
       </div>
-      <p className={`${compact ? "line-clamp-2" : ""} mt-1 text-xs leading-5 text-[var(--ink-soft)]`}>
+      <p className={`${isRecallResult ? "whitespace-pre-wrap break-words" : compact ? "line-clamp-2" : ""} mt-1 text-xs leading-5 text-[var(--ink-soft)]`}>
         {event.detail || "No detail"}
       </p>
       {!compact ? <p className="mt-1 text-[10px] text-[var(--ink-soft)]">{timeLabel(event.ts)}</p> : null}
