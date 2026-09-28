@@ -355,6 +355,11 @@ services:
       HEXIS_DATABASE_URL: postgresql://${POSTGRES_USER:-hexis_user}:${POSTGRES_PASSWORD:-hexis_password}@db:5432/${POSTGRES_DB:-hexis_memory}
       DATABASE_URL: postgresql://${POSTGRES_USER:-hexis_user}:${POSTGRES_PASSWORD:-hexis_password}@db:5432/${POSTGRES_DB:-hexis_memory}
       HEXIS_API_URL: http://api:43817
+      # Next.js standalone binds `process.env.HOSTNAME || '0.0.0.0'`. Docker
+      # injects HOSTNAME=<container-id>, which resolves to ONE of this
+      # container's two network IPs; the published-port forward arrives on
+      # the other interface and is refused. Bind all interfaces instead.
+      HOSTNAME: 0.0.0.0
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
