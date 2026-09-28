@@ -680,6 +680,254 @@ async def test_chat_projects_durable_question_as_sse(client):
     }
 
 
+async def _chat_log_payloads(client, fake_stream):
+    with patch.object(web_module, "stream_chat_events", fake_stream):
+        response = await client.post("/api/chat", json={"message": "Hello"})
+    assert response.status_code == 200
+    return [
+        json.loads(event["data"])
+        for event in _parse_sse(response.text)
+        if event["event"] == "log"
+    ]
+
+
+def _recall_result_payloads(log_payloads):
+    return [
+        payload
+        for payload in log_payloads
+        if payload.get("kind") == "tool_result" and payload.get("title") == "recall"
+    ]
+
+
+def _recall_tool_result_event(
+    output,
+    *,
+    success=True,
+    error=None,
+    display_output="LEGACY_RECALL_SUMMARY Found 3 memories",
+):
+    return AgentEventData(
+        event=AgentEvent.TOOL_RESULT,
+        data={
+            "tool_name": "recall",
+            "success": success,
+            "error": error,
+            "output": output,
+            "display_output": display_output,
+        },
+    )
+
+
+async def test_chat_recall_activity_lists_full_contents_in_order(client):
+    memories = [
+        {
+            "id": "mem-0001",
+            "type": "semantic",
+            "score": 0.97,
+            "content": "  第一条 记忆🎯\n第二行  ",
+        },
+        {"id": "mem-0002", "type": "semantic", "score": 0.91, "content": "重复正文"},
+        {"id": "mem-0003", "type": "semantic", "score": 0.88, "content": "重复正文"},
+    ]
+
+    async def fake_stream(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.LOOP_START)
+        yield _recall_tool_result_event(
+            {"memories": memories, "count": 3, "query": "话题"}
+        )
+        yield AgentEventData(
+            event=AgentEvent.LOOP_END, data={"stopped_reason": "completed"}
+        )
+
+    log_payloads = await _chat_log_payloads(client, fake_stream)
+    results = _recall_result_payloads(log_payloads)
+    assert len(results) == 1
+    payload = results[0]
+    assert payload["detail"] == (
+        "1.   第一条 记忆🎯\n第二行  \n\n"
+        "2. 重复正文\n\n"
+        "3. 重复正文"
+    )
+    assert "display_output" not in payload
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "LEGACY_RECALL_SUMMARY" not in serialized
+    assert "mem-0001" not in serialized
+    assert "0.97" not in serialized
+
+
+async def test_chat_recall_activity_keeps_long_content_untruncated(client):
+    long_content = "开头标记" + "甲" * 6000 + "\n" + "结尾标记"
+    second_content = "第二条记忆正文"
+
+    async def fake_stream(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.LOOP_START)
+        yield _recall_tool_result_event(
+            {"memories": [{"content": long_content}, {"content": second_content}]}
+        )
+        yield AgentEventData(
+            event=AgentEvent.LOOP_END, data={"stopped_reason": "completed"}
+        )
+
+    log_payloads = await _chat_log_payloads(client, fake_stream)
+    results = _recall_result_payloads(log_payloads)
+    assert len(results) == 1
+    payload = results[0]
+    assert payload["detail"] == f"1. {long_content}\n\n2. {second_content}"
+    assert payload["detail"].count("甲") == 6000
+    assert payload["detail"].endswith("结尾标记\n\n2. 第二条记忆正文")
+    assert "display_output" not in payload
+
+
+async def test_chat_recall_activity_empty_memories_shows_placeholder(client):
+    async def fake_stream(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.LOOP_START)
+        yield _recall_tool_result_event(
+            {"memories": [], "count": 0, "query": "话题"},
+            display_output="LEGACY_RECALL_SUMMARY Found 0 memories",
+        )
+        yield AgentEventData(
+            event=AgentEvent.LOOP_END, data={"stopped_reason": "completed"}
+        )
+
+    log_payloads = await _chat_log_payloads(client, fake_stream)
+    results = _recall_result_payloads(log_payloads)
+    assert len(results) == 1
+    payload = results[0]
+    assert payload["detail"] == "未召回记忆"
+    assert "display_output" not in payload
+    assert "LEGACY_RECALL_SUMMARY" not in json.dumps(payload, ensure_ascii=False)
+
+
+async def test_chat_recall_activity_failure_shows_error_only(client):
+    async def fake_stream(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.LOOP_START)
+        yield _recall_tool_result_event(
+            {"memories": [{"content": "诱饵正文"}]},
+            success=False,
+            error="模拟失败",
+        )
+        yield AgentEventData(
+            event=AgentEvent.LOOP_END, data={"stopped_reason": "completed"}
+        )
+
+    log_payloads = await _chat_log_payloads(client, fake_stream)
+    results = _recall_result_payloads(log_payloads)
+    assert len(results) == 1
+    payload = results[0]
+    assert payload["detail"] == "FAILED: 模拟失败"
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "诱饵正文" not in serialized
+    assert "LEGACY_RECALL_SUMMARY" not in serialized
+    assert "display_output" not in payload
+
+
+async def test_chat_recall_activity_failure_without_error_shows_plain_failed(client):
+    async def fake_stream(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.LOOP_START)
+        yield _recall_tool_result_event(
+            {"memories": [{"content": "诱饵正文"}]},
+            success=False,
+            error=None,
+        )
+        yield AgentEventData(
+            event=AgentEvent.LOOP_END, data={"stopped_reason": "completed"}
+        )
+
+    log_payloads = await _chat_log_payloads(client, fake_stream)
+    results = _recall_result_payloads(log_payloads)
+    assert len(results) == 1
+    payload = results[0]
+    assert payload["detail"] == "FAILED"
+    assert "display_output" not in payload
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        None,
+        {},
+        {"memories": "not-a-list"},
+        {"memories": ["not-an-object"]},
+        {"memories": [{"content": 123}]},
+    ],
+    ids=[
+        "output_null",
+        "missing_memories",
+        "memories_not_list",
+        "item_not_object",
+        "content_not_string",
+    ],
+)
+async def test_chat_recall_activity_malformed_output_shows_structure_error(
+    client, output
+):
+    async def fake_stream(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.LOOP_START)
+        yield _recall_tool_result_event(output)
+        yield AgentEventData(
+            event=AgentEvent.LOOP_END, data={"stopped_reason": "completed"}
+        )
+
+    log_payloads = await _chat_log_payloads(client, fake_stream)
+    results = _recall_result_payloads(log_payloads)
+    assert len(results) == 1
+    payload = results[0]
+    assert payload["detail"] == "Recall 返回结构异常：无法读取记忆正文"
+    assert payload["detail"] != "未召回记忆"
+    assert "display_output" not in payload
+    assert "LEGACY_RECALL_SUMMARY" not in json.dumps(payload, ensure_ascii=False)
+
+
+async def test_chat_recall_activity_two_calls_stay_isolated(client):
+    async def fake_stream(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.LOOP_START)
+        yield _recall_tool_result_event({"memories": [{"content": "本次A"}]})
+        yield _recall_tool_result_event({"memories": [{"content": "本次B"}]})
+        yield AgentEventData(
+            event=AgentEvent.LOOP_END, data={"stopped_reason": "completed"}
+        )
+
+    log_payloads = await _chat_log_payloads(client, fake_stream)
+    results = _recall_result_payloads(log_payloads)
+    assert len(results) == 2
+    assert results[0]["detail"] == "1. 本次A"
+    assert results[1]["detail"] == "1. 本次B"
+    assert "本次B" not in results[0]["detail"]
+    assert "本次A" not in results[1]["detail"]
+
+
+async def test_chat_recall_activity_non_recall_tool_keeps_summary_behavior(client):
+    long_display = "概" * 1500
+
+    async def fake_stream(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.LOOP_START)
+        yield AgentEventData(
+            event=AgentEvent.TOOL_RESULT,
+            data={
+                "tool_name": "search_web",
+                "success": True,
+                "error": None,
+                "output": {"results": []},
+                "display_output": long_display,
+            },
+        )
+        yield AgentEventData(
+            event=AgentEvent.LOOP_END, data={"stopped_reason": "completed"}
+        )
+
+    log_payloads = await _chat_log_payloads(client, fake_stream)
+    results = [
+        payload
+        for payload in log_payloads
+        if payload.get("kind") == "tool_result"
+        and payload.get("title") == "search_web"
+    ]
+    assert len(results) == 1
+    payload = results[0]
+    assert payload["detail"] == "概" * 1000
+    assert payload["display_output"] == long_display
+
+
 async def test_web_inbox_reply_answers_async_question_without_generic_requeue(
     client, db_pool
 ):

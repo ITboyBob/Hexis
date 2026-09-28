@@ -3246,6 +3246,29 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 }
                 if isinstance(ui_payload, dict):
                     payload["ui"] = ui_payload
+                if tool_name == "recall":
+                    payload.pop("display_output", None)
+                    if not success or error:
+                        payload["detail"] = f"FAILED: {error}" if error else "FAILED"
+                    else:
+                        memories = (
+                            output.get("memories") if isinstance(output, dict) else None
+                        )
+                        if not isinstance(memories, list) or any(
+                            not isinstance(memory, dict)
+                            or not isinstance(memory.get("content"), str)
+                            for memory in memories
+                        ):
+                            payload["detail"] = "Recall 返回结构异常：无法读取记忆正文"
+                        else:
+                            payload["detail"] = (
+                                "\n\n".join(
+                                    f"{index}. {memory['content']}"
+                                    for index, memory in enumerate(memories, 1)
+                                )
+                                if memories
+                                else "未召回记忆"
+                            )
                 yield _sse_event("log", payload)
 
             elif event.event == AgentEvent.UI_ARTIFACT:
