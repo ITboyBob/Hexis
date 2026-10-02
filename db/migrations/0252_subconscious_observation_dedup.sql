@@ -608,6 +608,610 @@ END;
 $$;
 
 
+-- mirror: 17_functions_subconscious_observations.sql::apply_subconscious_observations
+CREATE OR REPLACE FUNCTION apply_subconscious_observations(p_payload JSONB)
+RETURNS JSONB AS $$
+DECLARE
+    obs JSONB;
+    obs_type TEXT;
+    conf FLOAT;
+    evidence_raw JSONB;
+    evidence_ids UUID[];
+    evidence_id UUID;
+    summary TEXT;
+    suggested_name TEXT;
+    rel_entity TEXT;
+    rel_strength FLOAT;
+    rel_change TEXT;
+    rel_magnitude FLOAT;
+    contra_a UUID;
+    contra_b UUID;
+    tension TEXT;
+    worldview_id UUID;
+    pattern TEXT;
+    freq INT;
+    unprocessed BOOLEAN;
+    concept TEXT;
+    cluster_id UUID;
+    rationale TEXT;
+    i INT;
+    filed JSONB;
+    min_conf FLOAT := 0.6;
+    person_belief_id UUID;
+    person_belief_conf FLOAT;
+    person_belief_content TEXT;
+    applied_narrative INT := 0;
+    applied_relationships INT := 0;
+    applied_contradictions INT := 0;
+    applied_emotional INT := 0;
+    applied_consolidation INT := 0;
+    emotional_items JSONB;
+    consolidation_items JSONB;
+BEGIN
+    IF p_payload IS NULL OR jsonb_typeof(p_payload) <> 'object' THEN
+        RETURN jsonb_build_object('applied', false, 'reason', 'empty');
+    END IF;
+    -- One batch-wide orchestration gate: all observation dedup scans and writes
+    -- serialize against user decisions and imports. Held only for this SQL
+    -- transaction (never across the external LLM call); low frequency (~300s).
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('hexis:memory_observation_orchestration', 0)
+    );
+    FOR obs IN SELECT * FROM jsonb_array_elements(COALESCE(p_payload->'narrative_observations', '[]'::jsonb))
+    LOOP
+        obs_type := lower(COALESCE(obs->>'type', obs->>'kind', ''));
+        conf := NULLIF(obs->>'confidence', '')::float;
+        IF conf IS NULL OR conf >= min_conf THEN
+            evidence_raw := COALESCE(obs->'evidence', obs->'evidence_ids', obs->'memory_ids', '[]'::jsonb);
+            BEGIN
+                SELECT COALESCE(ARRAY(
+                    SELECT value::uuid
+                    FROM jsonb_array_elements_text(evidence_raw) val(value)
+                    WHERE value ~* '^[0-9a-f-]{36}$'
+                ), ARRAY[]::uuid[]) INTO evidence_ids;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    evidence_ids := ARRAY[]::uuid[];
+            END;
+
+            summary := COALESCE(obs->>'summary', obs->>'rationale', obs->>'evidence_summary', '');
+            IF obs_type IN ('chapter_transition', 'chapter_start', 'chapter_begin', 'begin_chapter') THEN
+                suggested_name := COALESCE(obs->>'suggested_name', obs->>'name', obs->>'chapter_name', 'Foundations');
+                PERFORM ensure_current_life_chapter(suggested_name);
+                PERFORM create_strategic_memory(
+                    COALESCE(NULLIF(summary, ''), format('Chapter transition: %s', suggested_name)),
+                    'Narrative transition',
+                    COALESCE(conf, 0.8),
+                    jsonb_build_object(
+                        'kind', 'narrative',
+                        'type', obs_type,
+                        'evidence_memory_ids', evidence_ids,
+                        'confidence', conf
+                    ),
+                    NULL,
+                    0.6
+                );
+                applied_narrative := applied_narrative + 1;
+            ELSIF obs_type IN ('turning_point', 'turning-point', 'turningpoint') THEN
+                evidence_id := NULL;
+                BEGIN
+                    evidence_id := NULLIF(obs->>'memory_id', '')::uuid;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        evidence_id := NULL;
+                END;
+                IF evidence_id IS NULL THEN
+                    BEGIN
+                        evidence_id := NULLIF(obs->>'evidence_memory_id', '')::uuid;
+                    EXCEPTION
+                        WHEN OTHERS THEN
+                            evidence_id := NULL;
+                    END;
+                END IF;
+                IF evidence_id IS NULL AND array_length(evidence_ids, 1) > 0 THEN
+                    evidence_id := evidence_ids[1];
+                END IF;
+
+                IF evidence_id IS NOT NULL THEN
+                    UPDATE memories
+                    SET importance = GREATEST(importance, 0.9),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = evidence_id;
+                END IF;
+
+                PERFORM create_strategic_memory(
+                    COALESCE(NULLIF(summary, ''), 'Turning point detected'),
+                    'Narrative turning point',
+                    COALESCE(conf, 0.85),
+                    jsonb_build_object(
+                        'kind', 'narrative',
+                        'type', 'turning_point',
+                        'memory_id', evidence_id,
+                        'evidence_memory_ids', evidence_ids,
+                        'confidence', conf
+                    ),
+                    NULL,
+                    0.6
+                );
+                applied_narrative := applied_narrative + 1;
+            ELSIF obs_type IN ('theme_emergence', 'theme', 'theme_emergent') THEN
+                PERFORM create_strategic_memory(
+                    COALESCE(
+                        NULLIF(summary, ''),
+                        COALESCE(obs->>'theme', obs->>'pattern', 'Theme emerging')
+                    ),
+                    'Theme emergence',
+                    COALESCE(conf, 0.7),
+                    jsonb_build_object(
+                        'kind', 'narrative',
+                        'type', obs_type,
+                        'evidence_memory_ids', evidence_ids,
+                        'confidence', conf
+                    ),
+                    NULL,
+                    0.5
+                );
+                applied_narrative := applied_narrative + 1;
+            END IF;
+        END IF;
+    END LOOP;
+    FOR obs IN SELECT * FROM jsonb_array_elements(COALESCE(p_payload->'relationship_observations', '[]'::jsonb))
+    LOOP
+        rel_entity := btrim(COALESCE(obs->>'entity', obs->>'name', ''));
+        IF rel_entity = '' THEN
+            CONTINUE;
+        END IF;
+
+        conf := NULLIF(obs->>'confidence', '')::float;
+        IF conf IS NOT NULL AND conf < min_conf THEN
+            CONTINUE;
+        END IF;
+
+        rel_change := lower(COALESCE(obs->>'change_type', obs->>'type', ''));
+        rel_magnitude := NULLIF(obs->>'magnitude', '')::float;
+        rel_strength := NULLIF(obs->>'strength', '')::float;
+        IF rel_strength IS NULL THEN
+            rel_strength := NULLIF(obs->>'new_strength', '')::float;
+        END IF;
+        IF rel_strength IS NULL THEN
+            IF rel_magnitude IS NOT NULL THEN
+                IF rel_change LIKE '%decrease%' OR rel_change LIKE '%lower%' THEN
+                    rel_strength := 0.6 - rel_magnitude;
+                ELSIF rel_change LIKE '%increase%' OR rel_change LIKE '%higher%' THEN
+                    rel_strength := 0.6 + rel_magnitude;
+                ELSE
+                    rel_strength := 0.6 + rel_magnitude * 0.5;
+                END IF;
+            ELSE
+                rel_strength := 0.6;
+            END IF;
+        END IF;
+        rel_strength := LEAST(1.0, GREATEST(0.0, rel_strength));
+
+        evidence_raw := COALESCE(obs->'evidence', obs->'evidence_ids', obs->'memory_ids', '[]'::jsonb);
+        BEGIN
+            SELECT COALESCE(ARRAY(
+                SELECT value::uuid
+                FROM jsonb_array_elements_text(evidence_raw) val(value)
+                WHERE value ~* '^[0-9a-f-]{36}$'
+            ), ARRAY[]::uuid[]) INTO evidence_ids;
+        EXCEPTION
+            WHEN OTHERS THEN
+                evidence_ids := ARRAY[]::uuid[];
+        END;
+        evidence_id := NULL;
+        BEGIN
+            evidence_id := NULLIF(obs->>'evidence_memory_id', '')::uuid;
+        EXCEPTION
+            WHEN OTHERS THEN
+                evidence_id := NULL;
+        END;
+        IF evidence_id IS NULL AND array_length(evidence_ids, 1) > 0 THEN
+            evidence_id := evidence_ids[1];
+        END IF;
+
+        PERFORM upsert_self_concept_edge('relationship', rel_entity, rel_strength, evidence_id);
+
+        IF array_length(evidence_ids, 1) > 0 THEN
+            FOR i IN 1..LEAST(array_length(evidence_ids, 1), 3) LOOP
+                PERFORM link_memory_to_concept(evidence_ids[i], rel_entity, 0.6);
+            END LOOP;
+        END IF;
+
+        person_belief_id := NULL;
+        person_belief_conf := NULL;
+        BEGIN
+            SELECT id, (metadata->>'confidence')::float
+            INTO person_belief_id, person_belief_conf
+            FROM memories
+            WHERE type = 'worldview'
+              AND status = 'active'
+              AND metadata->>'category' = 'other'
+              AND content ILIKE ('%' || rel_entity || '%')
+            ORDER BY importance DESC, updated_at DESC
+            LIMIT 1;
+        EXCEPTION
+            WHEN OTHERS THEN
+                person_belief_id := NULL;
+        END;
+
+        IF person_belief_id IS NOT NULL THEN
+            UPDATE memories
+            SET metadata = jsonb_set(
+                    metadata,
+                    '{confidence}',
+                    to_jsonb(LEAST(1.0, GREATEST(0.0, COALESCE(rel_strength, person_belief_conf, 0.6))))
+                ),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = person_belief_id;
+        ELSE
+            person_belief_content := COALESCE(
+                NULLIF(obs->>'belief', ''),
+                NULLIF(obs->>'summary', ''),
+                format('I have a relationship with %s.', rel_entity)
+            );
+            PERFORM create_worldview_memory(
+                person_belief_content,
+                'other',
+                COALESCE(rel_strength, 0.6),
+                0.6,
+                0.6,
+                'observed'
+            );
+        END IF;
+
+        summary := COALESCE(obs->>'summary', format('Relationship update: %s', rel_entity));
+        -- A relationship_change strategic record is deduped per normalized
+        -- entity within a one-hour record window (created_at based, so touch
+        -- never extends it). The graph/current-worldview updates above still
+        -- reflect the newest observed state.
+        DECLARE
+            v_rel_window_hours FLOAT := COALESCE(
+                get_config_float('maintenance.subconscious_relationship_dedup_hours'), 1
+            );
+            v_rel_existing UUID;
+        BEGIN
+            IF v_rel_window_hours IS NULL
+               OR v_rel_window_hours <> v_rel_window_hours
+               OR v_rel_window_hours IN ('Infinity'::float, '-Infinity'::float)
+               OR v_rel_window_hours <= 0 THEN
+                RAISE EXCEPTION
+                    'maintenance.subconscious_relationship_dedup_hours must be a positive finite number, got %',
+                    v_rel_window_hours;
+            END IF;
+            SELECT id INTO v_rel_existing
+            FROM memories
+            WHERE type = 'strategic'
+              AND status = 'active'
+              AND metadata->'supporting_evidence'->>'kind' = 'relationship_change'
+              AND lower(btrim(metadata->'supporting_evidence'->>'entity')) = lower(btrim(rel_entity))
+              AND created_at >= CURRENT_TIMESTAMP - make_interval(secs => v_rel_window_hours * 3600)
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1;
+
+            IF v_rel_existing IS NULL THEN
+                PERFORM create_strategic_memory(
+                    summary,
+                    'Relationship change',
+                    COALESCE(conf, 0.7),
+                    jsonb_build_object(
+                        'kind', 'relationship_change',
+                        'change_type', rel_change,
+                        'entity', rel_entity,
+                        'evidence_memory_ids', evidence_ids,
+                        'confidence', conf
+                    ),
+                    NULL,
+                    0.5
+                );
+                applied_relationships := applied_relationships + 1;
+            ELSE
+                PERFORM touch_memories(ARRAY[v_rel_existing]);
+            END IF;
+        END;
+    END LOOP;
+    FOR obs IN SELECT * FROM jsonb_array_elements(COALESCE(p_payload->'contradiction_observations', '[]'::jsonb))
+    LOOP
+        conf := NULLIF(obs->>'confidence', '')::float;
+        IF conf IS NOT NULL AND conf < min_conf THEN
+            CONTINUE;
+        END IF;
+
+        contra_a := NULL;
+        contra_b := NULL;
+        BEGIN
+            contra_a := NULLIF(obs->>'memory_a', '')::uuid;
+        EXCEPTION
+            WHEN OTHERS THEN
+                contra_a := NULL;
+        END;
+        BEGIN
+            contra_b := NULLIF(obs->>'memory_b', '')::uuid;
+        EXCEPTION
+            WHEN OTHERS THEN
+                contra_b := NULL;
+        END;
+        IF contra_a IS NULL THEN
+            BEGIN
+                contra_a := NULLIF(obs->>'belief_a_id', '')::uuid;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    contra_a := NULL;
+            END;
+        END IF;
+        IF contra_b IS NULL THEN
+            BEGIN
+                contra_b := NULLIF(obs->>'belief_b_id', '')::uuid;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    contra_b := NULL;
+            END;
+        END IF;
+
+        worldview_id := NULL;
+        BEGIN
+            worldview_id := NULLIF(obs->>'worldview_id', '')::uuid;
+        EXCEPTION
+            WHEN OTHERS THEN
+                worldview_id := NULL;
+        END;
+        IF worldview_id IS NULL THEN
+            BEGIN
+                worldview_id := NULLIF(obs->>'belief_id', '')::uuid;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    worldview_id := NULL;
+            END;
+        END IF;
+
+        tension := COALESCE(obs->>'tension', obs->>'summary', '');
+        IF contra_a IS NULL OR contra_b IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        -- The ledger is authoritative. A terminal pair or an already-pending
+        -- pair must not create another observation strategic/edge/drive change;
+        -- the file call only returns created=true on a genuinely new case.
+        filed := file_contradiction_case(
+            contra_a,
+            contra_b,
+            NULL,
+            tension,
+            COALESCE(conf, 0.7),
+            'subconscious',
+            '{}'::jsonb
+        );
+        IF NOT COALESCE((filed->>'created')::boolean, FALSE) THEN
+            CONTINUE;
+        END IF;
+
+        PERFORM create_strategic_memory(
+            COALESCE(NULLIF(tension, ''), 'Contradiction detected'),
+            'Unresolved tension between beliefs',
+            COALESCE(conf, 0.7),
+            jsonb_build_object(
+                'kind', 'contradiction',
+                'memory_a', contra_a,
+                'memory_b', contra_b,
+                'tension', tension,
+                'evidence', COALESCE(obs->'evidence', '[]'::jsonb)
+            ),
+            NULL,
+            0.5
+        );
+
+        IF worldview_id IS NOT NULL THEN
+            UPDATE memories
+            SET metadata = jsonb_set(
+                    metadata,
+                    '{stability}',
+                    to_jsonb(LEAST(1.0, GREATEST(0.0, COALESCE((metadata->>'stability')::float, 0.7) * 0.8)))
+                ),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = worldview_id AND type = 'worldview';
+        END IF;
+
+        applied_contradictions := applied_contradictions + 1;
+    END LOOP;
+    emotional_items := COALESCE(p_payload->'emotional_observations', p_payload->'emotional_patterns', '[]'::jsonb);
+    FOR obs IN SELECT * FROM jsonb_array_elements(emotional_items)
+    LOOP
+        conf := NULLIF(obs->>'confidence', '')::float;
+        IF conf IS NOT NULL AND conf < min_conf THEN
+            CONTINUE;
+        END IF;
+
+        pattern := btrim(COALESCE(obs->>'pattern', obs->>'summary', obs->>'theme', ''));
+        IF pattern = '' THEN
+            CONTINUE;
+        END IF;
+        freq := NULLIF(obs->>'frequency', '')::int;
+        unprocessed := NULLIF(obs->>'unprocessed', '')::boolean;
+
+        PERFORM create_strategic_memory(
+            format('Emotional pattern: %s', pattern),
+            'Emotional pattern',
+            COALESCE(conf, 0.7),
+            jsonb_build_object(
+                'kind', 'emotional_pattern',
+                'pattern', pattern,
+                'frequency', COALESCE(freq, 0),
+                'unprocessed', COALESCE(unprocessed, FALSE),
+                'evidence', COALESCE(obs->'evidence', '[]'::jsonb)
+            ),
+            NULL,
+            0.5
+        );
+        UPDATE drives SET current_level = LEAST(1.0, current_level + 0.1) WHERE name = 'coherence';
+        applied_emotional := applied_emotional + 1;
+    END LOOP;
+    consolidation_items := COALESCE(p_payload->'consolidation_observations', p_payload->'consolidation_suggestions', '[]'::jsonb);
+    FOR obs IN SELECT * FROM jsonb_array_elements(consolidation_items)
+    LOOP
+        evidence_raw := COALESCE(obs->'memory_ids', obs->'memories', '[]'::jsonb);
+        BEGIN
+            SELECT COALESCE(ARRAY(
+                SELECT DISTINCT value::uuid
+                FROM jsonb_array_elements_text(evidence_raw) val(value)
+                WHERE value ~* '^[0-9a-f-]{36}$'
+                ORDER BY value::uuid
+            ), ARRAY[]::uuid[]) INTO evidence_ids;
+        EXCEPTION
+            WHEN OTHERS THEN
+                evidence_ids := ARRAY[]::uuid[];
+        END;
+        IF array_length(evidence_ids, 1) IS NULL OR array_length(evidence_ids, 1) < 2 THEN
+            CONTINUE;
+        END IF;
+
+        conf := NULLIF(obs->>'confidence', '')::float;
+        IF conf IS NOT NULL AND conf < min_conf THEN
+            CONTINUE;
+        END IF;
+
+        concept := btrim(COALESCE(obs->>'concept', obs->>'suggested_concept', ''));
+        rationale := COALESCE(obs->>'rationale', obs->>'summary', '');
+
+        cluster_id := NULL;
+        BEGIN
+            cluster_id := NULLIF(obs->>'cluster_id', '')::uuid;
+        EXCEPTION
+            WHEN OTHERS THEN
+                cluster_id := NULL;
+        END;
+        IF cluster_id IS NULL THEN
+            BEGIN
+                cluster_id := NULLIF(obs->>'suggested_cluster_id', '')::uuid;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    cluster_id := NULL;
+            END;
+        END IF;
+
+        -- A consolidation signature is the unordered set of valid memory UUIDs.
+        -- Permanent dedup: an active record is touched; an archived/invalid
+        -- record suppresses the repeat without reviving it. If an archived
+        -- record points at a same-signature active retained row, that row is
+        -- touched instead.
+        DECLARE
+            v_hist RECORD;
+            v_hist_ids UUID[];
+            v_active_id UUID;
+            v_any_match BOOLEAN := FALSE;
+        BEGIN
+            FOR v_hist IN
+                SELECT id, status, superseded_by,
+                       metadata->'supporting_evidence'->'memory_ids' AS stored_ids
+                FROM memories
+                WHERE type = 'strategic'
+                  AND metadata->'supporting_evidence'->>'kind' = 'consolidation'
+                ORDER BY created_at, id
+            LOOP
+                BEGIN
+                    SELECT COALESCE(ARRAY(
+                        SELECT DISTINCT value::uuid
+                        FROM jsonb_array_elements_text(COALESCE(v_hist.stored_ids, '[]'::jsonb)) val(value)
+                        WHERE value ~* '^[0-9a-f-]{36}$'
+                        ORDER BY value::uuid
+                    ), ARRAY[]::uuid[]) INTO v_hist_ids;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        v_hist_ids := ARRAY[]::uuid[];
+                END;
+                IF array_length(v_hist_ids, 1) IS NULL OR array_length(v_hist_ids, 1) < 2 THEN
+                    CONTINUE;
+                END IF;
+                IF v_hist_ids <> evidence_ids THEN
+                    CONTINUE;
+                END IF;
+                v_any_match := TRUE;
+                IF v_hist.status = 'active' THEN
+                    v_active_id := v_hist.id;
+                    EXIT;
+                ELSIF v_active_id IS NULL
+                      AND v_hist.superseded_by IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1 FROM memories repl
+                          WHERE repl.id = v_hist.superseded_by
+                            AND repl.status = 'active'
+                            AND (
+                                SELECT COALESCE(ARRAY(
+                                    SELECT DISTINCT value::uuid
+                                    FROM jsonb_array_elements_text(
+                                        COALESCE(repl.metadata->'supporting_evidence'->'memory_ids', '[]'::jsonb)
+                                    ) val(value)
+                                    WHERE value ~* '^[0-9a-f-]{36}$'
+                                    ORDER BY value::uuid
+                                ), ARRAY[]::uuid[])
+                            ) = evidence_ids
+                      ) THEN
+                    v_active_id := v_hist.superseded_by;
+                END IF;
+            END LOOP;
+
+            IF v_any_match THEN
+                IF v_active_id IS NOT NULL THEN
+                    PERFORM touch_memories(ARRAY[v_active_id]);
+                END IF;
+            ELSE
+                FOR i IN 1..LEAST(array_length(evidence_ids, 1) - 1, 8) LOOP
+                    BEGIN
+                        PERFORM create_memory_relationship(
+                            evidence_ids[i],
+                            evidence_ids[i + 1],
+                            'ASSOCIATED',
+                            jsonb_build_object('source', 'subconscious', 'rationale', rationale)
+                        );
+                    EXCEPTION
+                        WHEN OTHERS THEN
+                            NULL;
+                    END;
+                END LOOP;
+
+                IF concept <> '' THEN
+                    FOR i IN 1..LEAST(array_length(evidence_ids, 1), 5) LOOP
+                        PERFORM link_memory_to_concept(evidence_ids[i], concept, 0.7);
+                    END LOOP;
+                END IF;
+
+                IF cluster_id IS NOT NULL THEN
+                    FOR i IN 1..LEAST(array_length(evidence_ids, 1), 5) LOOP
+                        PERFORM link_memory_to_cluster_graph(evidence_ids[i], cluster_id, COALESCE(conf, 0.6));
+                    END LOOP;
+                END IF;
+
+                IF rationale <> '' THEN
+                    PERFORM create_strategic_memory(
+                        format('Consolidation suggested: %s', rationale),
+                        'Consolidation opportunity',
+                        COALESCE(conf, 0.6),
+                        jsonb_build_object(
+                            'kind', 'consolidation',
+                            'memory_ids', evidence_ids,
+                            'concept', NULLIF(concept, ''),
+                            'cluster_id', cluster_id,
+                            'confidence', conf
+                        ),
+                        NULL,
+                        0.5
+                    );
+                END IF;
+                applied_consolidation := applied_consolidation + 1;
+            END IF;
+        END;
+    END LOOP;
+
+    RETURN jsonb_build_object(
+        'narrative', applied_narrative,
+        'relationships', applied_relationships,
+        'contradictions', applied_contradictions,
+        'emotional', applied_emotional,
+        'consolidation', applied_consolidation
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+
 -- mirror: 17_functions_subconscious_observations.sql::execute_heartbeat_actions_batch
 CREATE OR REPLACE FUNCTION execute_heartbeat_actions_batch(
     p_heartbeat_id UUID,

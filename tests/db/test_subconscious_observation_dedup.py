@@ -361,7 +361,7 @@ async def test_relationship_window_and_touch(db_pool):
                         CURRENT_TIMESTAMP - INTERVAL '61 minutes',
                         CURRENT_TIMESTAMP - INTERVAL '61 minutes',
                         jsonb_build_object('supporting_evidence',
-                            jsonb_build_object('kind', 'relationship_change', 'entity', $1)),
+                            jsonb_build_object('kind', 'relationship_change', 'entity', $1::text)),
                         0.5, 0.7, '{}'::jsonb)
                 """,
                 e3,
@@ -1147,7 +1147,7 @@ async def test_concurrent_observations(db_pool):
             await conn.execute(
                 "DELETE FROM memories WHERE type='strategic' AND content IN ('note','conc')"
             )
-            await conn.execute("DELETE FROM drives WHERE name='coherence'")
+            await conn.execute("UPDATE drives SET current_level = baseline WHERE name='coherence'")
 
 
 async def test_file_created_and_drive_committed(db_pool):
@@ -1181,7 +1181,7 @@ async def test_file_created_and_drive_committed(db_pool):
     finally:
         async with db_pool.acquire() as conn:
             await _cleanup_memories(conn, [a, b])
-            await conn.execute("DELETE FROM drives WHERE name='coherence'")
+            await conn.execute("UPDATE drives SET current_level = baseline WHERE name='coherence'")
 
 
 async def test_concurrent_case_file_decide(db_pool):
@@ -1238,7 +1238,7 @@ async def test_concurrent_case_file_decide(db_pool):
     finally:
         async with db_pool.acquire() as conn:
             await _cleanup_memories(conn, [a, b])
-            await conn.execute("DELETE FROM drives WHERE name='coherence'")
+            await conn.execute("UPDATE drives SET current_level = baseline WHERE name='coherence'")
 
 
 async def test_heartbeat_batch_gate(db_pool):
@@ -1299,7 +1299,7 @@ async def test_heartbeat_batch_gate(db_pool):
     finally:
         async with db_pool.acquire() as conn:
             await _cleanup_memories(conn, [a, b])
-            await conn.execute("DELETE FROM drives WHERE name='coherence'")
+            await conn.execute("UPDATE drives SET current_level = baseline WHERE name='coherence'")
 
 
 async def test_embedding_alignment_concurrent_decide(db_pool):
@@ -1352,7 +1352,7 @@ async def test_embedding_alignment_concurrent_decide(db_pool):
     finally:
         async with db_pool.acquire() as conn:
             await _cleanup_memories(conn, [a, b])
-            await conn.execute("DELETE FROM drives WHERE name='coherence'")
+            await conn.execute("UPDATE drives SET current_level = baseline WHERE name='coherence'")
 
 
 async def test_weekly_correction_concurrent_decide(db_pool):
@@ -1420,7 +1420,7 @@ async def test_weekly_correction_concurrent_decide(db_pool):
             await _cleanup_memories(conn, [source, other])
             await conn.execute("DELETE FROM learning_review_items WHERE review_id=$1", review["review_id"])
             await conn.execute("DELETE FROM learning_reviews WHERE id=$1", review["review_id"])
-            await conn.execute("DELETE FROM drives WHERE name='coherence'")
+            await conn.execute("UPDATE drives SET current_level = baseline WHERE name='coherence'")
 
 
 async def test_hmx_import_concurrent_decide(db_pool):
@@ -1504,5 +1504,5 @@ async def test_hmx_import_concurrent_decide(db_pool):
         async with db_pool.acquire() as conn:
             await _cleanup_memories(conn, [a, b])
             await conn.execute("DELETE FROM memories WHERE content=$1", content)
-            await conn.execute("DELETE FROM drives WHERE name='coherence'")
+            await conn.execute("UPDATE drives SET current_level = baseline WHERE name='coherence'")
 
