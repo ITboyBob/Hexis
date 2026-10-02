@@ -1539,6 +1539,13 @@ async def import_authoritative_hmx(
     operation_results: list[ProtectedReplacementResult] = []
     override_authorization: _OperatorOverrideAuthorization | None = None
     async with conn.transaction():
+        # Acquire the shared orchestration gate before the protected-replacement
+        # business locks (and the inner ordinary import) so the strategic
+        # contradiction trigger cannot invert lock order.
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock("
+            "hashtextextended('hexis:memory_observation_orchestration', 0))"
+        )
         if force_replace:
             await conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtext('hmx_protected_replacement'))"

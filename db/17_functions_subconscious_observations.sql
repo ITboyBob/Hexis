@@ -1513,6 +1513,13 @@ BEGIN
         );
     END IF;
 
+    -- The built-in batch can file/decide contradictions, so it enters the same
+    -- orchestration gate before touching any resource. Re-entrant with the
+    -- per-action wrapper.
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('hexis:memory_observation_orchestration', 0)
+    );
+
     FOR action_spec, ord IN
         SELECT value, ordinality
         FROM jsonb_array_elements(p_actions) WITH ORDINALITY

@@ -1899,25 +1899,50 @@ CREATE OR REPLACE FUNCTION create_memory_relationship(
     p_relationship_type graph_edge_type,
     p_properties JSONB DEFAULT '{}'
 ) RETURNS VOID AS $$
+DECLARE
+    v_from UUID := p_from_id;
+    v_to UUID := p_to_id;
+    v_props JSONB := COALESCE(p_properties, '{}'::jsonb);
+    v_set_clauses TEXT;
 BEGIN
+    -- CONTRADICTS is a semantic, unordered relation: normalize the endpoint pair
+    -- so a reverse-order report updates the same edge identity instead of
+    -- creating a second one. Other relationship types keep their direction.
+    IF p_relationship_type = 'CONTRADICTS' THEN
+        v_from := LEAST(p_from_id, p_to_id);
+        v_to := GREATEST(p_from_id, p_to_id);
+    END IF;
+
+    -- The relational natural-key upsert runs first and takes the same-key row
+    -- lock; the AGE write rides the same transaction so the two substrates
+    -- cannot diverge. A CONTRADICTS report also clears any legacy reverse key.
+    IF p_relationship_type = 'CONTRADICTS' THEN
+        PERFORM delete_memory_edge('memory', p_to_id::text, 'CONTRADICTS', 'memory', p_from_id::text);
+        PERFORM delete_memory_edge('memory', p_from_id::text, 'CONTRADICTS', 'memory', p_to_id::text);
+    END IF;
+    PERFORM upsert_memory_edge(v_from, v_to, p_relationship_type, v_props);
+
+    -- Edge identity is (endpoints, type); properties are applied per key so a
+    -- repeated call merges instead of duplicating. Empty properties emit no SET.
+    SELECT string_agg(
+               format('r.`%s` = %s', replace(key, '`', ''), value::text),
+               ', '
+           )
+    INTO v_set_clauses
+    FROM jsonb_each(v_props);
+
     EXECUTE format(
         'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
             MATCH (a:MemoryNode {memory_id: %L}), (b:MemoryNode {memory_id: %L})
-            CREATE (a)-[r:%s %s]->(b)
+            MERGE (a)-[r:%s]->(b)
+            %s
             RETURN r
         $q$) as (result ag_catalog.agtype)',
-        p_from_id,
-        p_to_id,
+        v_from,
+        v_to,
         p_relationship_type,
-        CASE WHEN p_properties = '{}'::jsonb 
-             THEN '' 
-             ELSE format('{%s}',
-                  (SELECT string_agg(format('%I: %s', key, value), ', ')
-                   FROM jsonb_each(p_properties)))
-        END
+        CASE WHEN v_set_clauses IS NULL THEN '' ELSE 'SET ' || v_set_clauses END
     );
-    -- Dual-write to the relational edge substrate (db/44) for subgraph reasoning.
-    PERFORM upsert_memory_edge(p_from_id, p_to_id, p_relationship_type, p_properties);
 END;
 $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION auto_check_worldview_alignment()
@@ -1980,6 +2005,11 @@ CREATE OR REPLACE FUNCTION link_memory_to_concept(
     p_strength FLOAT DEFAULT 1.0
 ) RETURNS BOOLEAN AS $$
 BEGIN
+    -- Take the relational natural-key lock first so concurrent links to the
+    -- same (memory, concept) serialize before the graph write. Failure rolls
+    -- the whole function back and reports false.
+    PERFORM upsert_memory_edge('memory', p_memory_id::text, 'INSTANCE_OF', 'concept', p_concept_name,
+                               p_strength, NULL, NULL, jsonb_build_object('strength', p_strength));
     EXECUTE format(
         'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
             MERGE (c:ConceptNode {name: %L})
@@ -1991,15 +2021,14 @@ BEGIN
         'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
             MATCH (m:MemoryNode {memory_id: %L})
             MATCH (c:ConceptNode {name: %L})
-            CREATE (m)-[:INSTANCE_OF {strength: %s}]->(c)
+            MERGE (m)-[r:INSTANCE_OF]->(c)
+            SET r.strength = %s
             RETURN m
         $q$) as (result ag_catalog.agtype)',
         p_memory_id,
         p_concept_name,
         p_strength
     );
-    PERFORM upsert_memory_edge('memory', p_memory_id::text, 'INSTANCE_OF', 'concept', p_concept_name,
-                               p_strength, NULL, NULL, jsonb_build_object('strength', p_strength));
     RETURN TRUE;
 EXCEPTION
     WHEN OTHERS THEN

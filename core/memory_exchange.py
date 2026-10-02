@@ -2464,6 +2464,13 @@ async def import_hmx(
                     warnings.extend(provenance_warnings)
 
     async with conn.transaction():
+        # Shared memory-observation orchestration gate first, before any HMX
+        # business lock, so a contradiction filed by the strategic trigger
+        # during import cannot invert lock order against a concurrent decision.
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock("
+            "hashtextextended('hexis:memory_observation_orchestration', 0))"
+        )
         await conn.execute("SELECT pg_advisory_xact_lock(hashtext('hmx_import'))")
         target_state = _coerce_json(
             await conn.fetchval("SELECT hexis_instance_is_empty()")
@@ -2704,6 +2711,10 @@ async def accept_staged_import(
 
     unsupported = {"raw_units", "config", "in_flight_work", "audit_records"}
     async with conn.transaction():
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock("
+            "hashtextextended('hexis:memory_observation_orchestration', 0))"
+        )
         row = await conn.fetchrow(
             "SELECT s.*, b.envelope, b.export_intent FROM hmx_import_staging s "
             "JOIN hmx_import_batches b ON b.id=s.batch_id "
@@ -2892,6 +2903,10 @@ async def quote_staged_import(
     if not rationale.strip():
         raise HmxPolicyError("quote rationale is required")
     async with conn.transaction():
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock("
+            "hashtextextended('hexis:memory_observation_orchestration', 0))"
+        )
         row = await conn.fetchrow(
             "SELECT s.*, b.envelope FROM hmx_import_staging s "
             "JOIN hmx_import_batches b ON b.id=s.batch_id "

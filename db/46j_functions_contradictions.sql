@@ -371,8 +371,14 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     v_case contradiction_cases%ROWTYPE;
+    v_terminal contradiction_cases%ROWTYPE;
+    v_pending contradiction_cases%ROWTYPE;
     v_confidence FLOAT := LEAST(1.0, GREATEST(0.0, COALESCE(p_confidence, 0.0)));
     v_threshold FLOAT := COALESCE(get_config_float('contradictions.minimum_confidence'), 0.78);
+    v_pair_low UUID;
+    v_pair_high UUID;
+    v_created BOOLEAN := FALSE;
+    v_new_memory UUID;
 BEGIN
     IF p_memory_a IS NULL OR p_memory_b IS NULL OR p_memory_a = p_memory_b THEN
         RETURN jsonb_build_object('created', FALSE, 'reason', 'invalid_pair');
@@ -383,10 +389,12 @@ BEGIN
     IF NULLIF(btrim(COALESCE(p_tension, '')), '') IS NULL THEN
         RETURN jsonb_build_object('created', FALSE, 'reason', 'missing_tension');
     END IF;
+    -- Episodic memories participate in the same user-adjudicated ledger; the
+    -- detection queue/bootstrap stay semantic/worldview only.
     IF NOT EXISTS (
         SELECT 1 FROM memories
         WHERE id IN (p_memory_a, p_memory_b)
-          AND type IN ('semantic', 'worldview')
+          AND type IN ('semantic', 'worldview', 'episodic')
           AND status = 'active'
           AND (valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP)
         HAVING count(*) = 2
@@ -394,24 +402,93 @@ BEGIN
         RETURN jsonb_build_object('created', FALSE, 'reason', 'memory_not_found');
     END IF;
 
-    INSERT INTO contradiction_cases (
-        memory_a, memory_b, new_memory_id, tension, confidence, detected_by, metadata
-    ) VALUES (
-        p_memory_a, p_memory_b,
-        CASE WHEN p_new_memory_id IN (p_memory_a, p_memory_b) THEN p_new_memory_id ELSE NULL END,
-        btrim(p_tension), v_confidence,
-        COALESCE(NULLIF(btrim(p_detected_by), ''), 'model'),
-        COALESCE(p_metadata, '{}'::jsonb)
-    )
-    ON CONFLICT (LEAST(memory_a, memory_b), GREATEST(memory_a, memory_b))
-        WHERE status = 'pending'
-    DO UPDATE SET
-        tension = EXCLUDED.tension,
-        confidence = GREATEST(contradiction_cases.confidence, EXCLUDED.confidence),
-        new_memory_id = COALESCE(EXCLUDED.new_memory_id, contradiction_cases.new_memory_id),
-        metadata = contradiction_cases.metadata || EXCLUDED.metadata,
-        updated_at = CURRENT_TIMESTAMP
-    RETURNING * INTO v_case;
+    -- One shared orchestration gate protects case creation and the terminal
+    -- check for the whole transaction. It is re-entrant, so nested callers
+    -- (the strategic AFTER INSERT trigger, imports) do not deadlock.
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('hexis:memory_observation_orchestration', 0)
+    );
+
+    v_pair_low := LEAST(p_memory_a, p_memory_b);
+    v_pair_high := GREATEST(p_memory_a, p_memory_b);
+    v_new_memory := CASE WHEN p_new_memory_id IN (p_memory_a, p_memory_b) THEN p_new_memory_id ELSE NULL END;
+
+    -- A terminal case (user decision or accepted tension) is permanent for
+    -- this unordered pair: report it, never reopen, never add side effects.
+    SELECT * INTO v_terminal
+    FROM contradiction_cases
+    WHERE LEAST(memory_a, memory_b) = v_pair_low
+      AND GREATEST(memory_a, memory_b) = v_pair_high
+      AND status IN ('resolved', 'tension')
+    ORDER BY resolved_at DESC NULLS LAST, detected_at DESC, id DESC
+    LIMIT 1;
+    IF FOUND THEN
+        RETURN jsonb_build_object(
+            'created', FALSE,
+            'reason', 'already_decided',
+            'case_id', v_terminal.id,
+            'code', contradiction_case_code(v_terminal.id),
+            'status', v_terminal.status,
+            'confidence', v_terminal.confidence
+        );
+    END IF;
+
+    SELECT * INTO v_pending
+    FROM contradiction_cases
+    WHERE LEAST(memory_a, memory_b) = v_pair_low
+      AND GREATEST(memory_a, memory_b) = v_pair_high
+      AND status = 'pending'
+    FOR UPDATE;
+
+    IF FOUND THEN
+        UPDATE contradiction_cases
+        SET tension = btrim(p_tension),
+            confidence = GREATEST(contradiction_cases.confidence, v_confidence),
+            new_memory_id = COALESCE(v_new_memory, contradiction_cases.new_memory_id),
+            metadata = contradiction_cases.metadata || COALESCE(p_metadata, '{}'::jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = v_pending.id
+        RETURNING * INTO v_case;
+    ELSE
+        INSERT INTO contradiction_cases (
+            memory_a, memory_b, new_memory_id, tension, confidence, detected_by, metadata
+        ) VALUES (
+            p_memory_a, p_memory_b, v_new_memory,
+            btrim(p_tension), v_confidence,
+            COALESCE(NULLIF(btrim(p_detected_by), ''), 'model'),
+            COALESCE(p_metadata, '{}'::jsonb)
+        )
+        ON CONFLICT (LEAST(memory_a, memory_b), GREATEST(memory_a, memory_b))
+            WHERE status = 'pending'
+        DO NOTHING
+        RETURNING * INTO v_case;
+        v_created := FOUND;
+
+        IF NOT v_created THEN
+            -- Lost a concurrent race: the peer committed a pending case, so
+            -- refresh it rather than attempting a second insert.
+            SELECT * INTO v_pending
+            FROM contradiction_cases
+            WHERE LEAST(memory_a, memory_b) = v_pair_low
+              AND GREATEST(memory_a, memory_b) = v_pair_high
+              AND status = 'pending'
+            FOR UPDATE;
+            IF FOUND THEN
+                UPDATE contradiction_cases
+                SET tension = btrim(p_tension),
+                    confidence = GREATEST(contradiction_cases.confidence, v_confidence),
+                    new_memory_id = COALESCE(v_new_memory, contradiction_cases.new_memory_id),
+                    metadata = contradiction_cases.metadata || COALESCE(p_metadata, '{}'::jsonb),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = v_pending.id
+                RETURNING * INTO v_case;
+            END IF;
+        END IF;
+    END IF;
+
+    IF v_case.id IS NULL THEN
+        RETURN jsonb_build_object('created', FALSE, 'reason', 'existing_case');
+    END IF;
 
     BEGIN
         PERFORM create_memory_relationship(
@@ -427,17 +504,24 @@ BEGIN
         );
     EXCEPTION WHEN OTHERS THEN
         -- The relational case is authoritative; AGE availability is advisory.
-        NULL;
+        RAISE WARNING 'contradiction edge sync failed for case %: %', v_case.id, SQLERRM;
     END;
-    UPDATE drives SET current_level = LEAST(1.0, current_level + 0.15)
-    WHERE name = 'coherence';
-    RETURN jsonb_build_object(
-        'created', TRUE,
+
+    -- Only a genuinely new case raises coherence. Pending refreshes and trigger
+    -- re-entry must not keep inflating the drive.
+    IF v_created THEN
+        UPDATE drives SET current_level = LEAST(1.0, current_level + 0.15)
+        WHERE name = 'coherence';
+    END IF;
+
+    RETURN jsonb_strip_nulls(jsonb_build_object(
+        'created', v_created,
+        'reason', CASE WHEN v_created THEN NULL ELSE 'existing_case' END,
         'case_id', v_case.id,
         'code', contradiction_case_code(v_case.id),
         'status', v_case.status,
         'confidence', v_case.confidence
-    );
+    ));
 END;
 $$;
 
@@ -505,6 +589,11 @@ BEGIN
     IF v_outcome NOT IN ('new_right', 'old_right', 'tension') THEN
         RETURN jsonb_build_object('ok', FALSE, 'error', 'invalid_outcome');
     END IF;
+    -- Same orchestration gate as file/review/import entry points: a user
+    -- decision can never interleave with a concurrent file of the same pair.
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('hexis:memory_observation_orchestration', 0)
+    );
     SELECT * INTO v_case
     FROM contradiction_cases
     WHERE id = p_case_id
@@ -859,8 +948,7 @@ BEGIN
             WHERE NOT EXISTS (
                 SELECT 1
                 FROM contradiction_cases c
-                WHERE c.status = 'pending'
-                  AND LEAST(c.memory_a, c.memory_b) = p.a_uuid
+                WHERE LEAST(c.memory_a, c.memory_b) = p.a_uuid
                   AND GREATEST(c.memory_a, c.memory_b) = p.b_uuid
             )
         $query$, v_filter);
@@ -895,16 +983,30 @@ DECLARE
     v_memory_a UUID := _db_brain_try_uuid(p_params->>'memory_a');
     v_memory_b UUID := _db_brain_try_uuid(p_params->>'memory_b');
     v_filed JSONB;
+    v_pair_low UUID;
+    v_pair_high UUID;
+    v_status TEXT;
 BEGIN
     IF p_action NOT IN ('resolve_contradiction', 'accept_tension') THEN
         RETURN execute_heartbeat_action_legacy_contradictions(p_heartbeat_id, p_action, p_params);
     END IF;
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('hexis:memory_observation_orchestration', 0)
+    );
+
     IF v_case_id IS NULL AND v_memory_a IS NOT NULL AND v_memory_b IS NOT NULL THEN
-        SELECT id INTO v_case_id
+        v_pair_low := LEAST(v_memory_a, v_memory_b);
+        v_pair_high := GREATEST(v_memory_a, v_memory_b);
+        -- Terminal first: a decided pair is surfaced as already handled and is
+        -- never re-proposed just because it is the newest ledger row.
+        SELECT id, status INTO v_case_id, v_status
         FROM contradiction_cases
-        WHERE status = 'pending'
-          AND LEAST(memory_a, memory_b) = LEAST(v_memory_a, v_memory_b)
-          AND GREATEST(memory_a, memory_b) = GREATEST(v_memory_a, v_memory_b)
+        WHERE LEAST(memory_a, memory_b) = v_pair_low
+          AND GREATEST(memory_a, memory_b) = v_pair_high
+        ORDER BY (status = 'pending') DESC,
+                 resolved_at DESC NULLS LAST,
+                 detected_at DESC,
+                 id DESC
         LIMIT 1;
     END IF;
     IF v_case_id IS NULL AND v_memory_a IS NOT NULL AND v_memory_b IS NOT NULL THEN
@@ -916,6 +1018,7 @@ BEGIN
             jsonb_build_object('heartbeat_id', p_heartbeat_id)
         );
         v_case_id := _db_brain_try_uuid(v_filed->>'case_id');
+        v_status := v_filed->>'status';
     END IF;
     IF v_case_id IS NULL THEN
         RETURN jsonb_build_object(
@@ -926,6 +1029,40 @@ BEGIN
             'energy_remaining', get_current_energy()
         );
     END IF;
+
+    -- Re-read the true status for every branch (explicit id, pair lookup, or
+    -- just-filed) so a terminal case is never marked decision_required.
+    IF v_status IS NULL THEN
+        SELECT status INTO v_status FROM contradiction_cases WHERE id = v_case_id;
+    END IF;
+    IF v_status IS NULL THEN
+        RETURN jsonb_build_object(
+            'success', FALSE,
+            'error', 'No pending contradiction case was found. Detection must file a case before review.',
+            'action', p_action,
+            'cost', 0,
+            'energy_remaining', get_current_energy()
+        );
+    END IF;
+
+    IF v_status <> 'pending' THEN
+        RETURN jsonb_build_object(
+            'success', TRUE,
+            'action', p_action,
+            'cost', 0,
+            'energy_remaining', get_current_energy(),
+            'result', jsonb_build_object(
+                'case_id', v_case_id,
+                'decision_required', FALSE,
+                'changed_memories', FALSE,
+                'status', v_status,
+                'next_step', 'This contradiction was already decided; the recorded decision stands.'
+            ),
+            'external_calls', '[]'::jsonb,
+            'outbox_messages', '[]'::jsonb
+        );
+    END IF;
+
     UPDATE contradiction_cases
     SET proposed_at = COALESCE(proposed_at, CURRENT_TIMESTAMP),
         metadata = metadata || jsonb_build_object('noticed_by_heartbeat_id', p_heartbeat_id),

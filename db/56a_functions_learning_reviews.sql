@@ -305,6 +305,12 @@ BEGIN
     IF v_action = 'correct' AND v_correction IS NULL THEN
         RETURN jsonb_build_object('ok', FALSE, 'error', 'correction_required');
     END IF;
+    -- The weekly correction path can create/file contradictions after locking
+    -- its own rows, so it takes the same orchestration gate before its first
+    -- business lock to keep one global lock order.
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('hexis:memory_observation_orchestration', 0)
+    );
     SELECT * INTO v_item
     FROM learning_review_items
     WHERE id = p_item_id

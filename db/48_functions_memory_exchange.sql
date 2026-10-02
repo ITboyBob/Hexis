@@ -467,6 +467,12 @@ DECLARE
     errors JSONB := '[]'::jsonb;
     inserted_count INT := 0;
 BEGIN
+    -- The strategic AFTER INSERT trigger can file a contradiction mid-import;
+    -- take the shared orchestration gate before any record is processed so
+    -- this import cannot invert lock order against a concurrent decision.
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('hexis:memory_observation_orchestration', 0)
+    );
     FOR item IN SELECT value FROM jsonb_array_elements(COALESCE(p_records, '[]'::jsonb))
     LOOP
         BEGIN

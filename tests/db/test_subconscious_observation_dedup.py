@@ -14,6 +14,7 @@ the whole-database counts.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -595,6 +596,74 @@ async def test_contradiction_threshold_and_invalid_inputs(db_pool):
             b = await _make_memory(conn)
             before_drive = await _coherence(conn)
 
+            below = _json(
+                await conn.fetchval(
+                    "SELECT file_contradiction_case($1,$2,NULL,'x',0.77,'test','{}'::jsonb)",
+                    a,
+                    b,
+                )
+            )
+            above = _json(
+                await conn.fetchval(
+                    "SELECT file_contradiction_case($1,$2,NULL,'x',0.78,'test','{}'::jsonb)",
+                    a,
+                    b,
+                )
+            )
+            assert below == {"created": False, "reason": "below_threshold", "confidence": 0.77}
+            assert above["created"] is True
+            assert await _case_count(conn, a, b) == 1
+
+            # A missing confidence reaches the ledger as the caller's default,
+            # not a fabricated pass. Direct call with 0.7 is rejected.
+            c = await _make_memory(conn)
+            d = await _make_memory(conn)
+            low = _json(
+                await conn.fetchval(
+                    "SELECT file_contradiction_case($1,$2,NULL,'y',0.7,'test','{}'::jsonb)",
+                    c,
+                    d,
+                )
+            )
+            assert low["created"] is False
+            assert low["reason"] == "below_threshold"
+            assert await _case_count(conn, c, d) == 0
+
+            # Invalid / same / missing memory ids are inert.
+            invalid = _json(
+                await conn.fetchval(
+                    "SELECT file_contradiction_case($1,$1,NULL,'self',0.9,'test','{}'::jsonb)",
+                    a,
+                )
+            )
+            assert invalid["created"] is False
+            assert invalid["reason"] == "invalid_pair"
+            ghost = _json(
+                await conn.fetchval(
+                    "SELECT file_contradiction_case($1,$2,NULL,'ghost',0.9,'test','{}'::jsonb)",
+                    uuid.uuid4(),
+                    b,
+                )
+            )
+            assert ghost["created"] is False
+            assert ghost["reason"] == "memory_not_found"
+            assert await _coherence(conn) == pytest.approx(before_drive + 0.15, abs=1e-9)
+        finally:
+            await transaction.rollback()
+
+
+async def test_contradiction_observation_no_side_effects_for_rejected(db_pool):
+    """Phase 3 gate: a rejected observation must not write a strategic row."""
+    async with db_pool.acquire() as conn:
+        transaction = conn.transaction()
+        await transaction.start()
+        try:
+            await conn.execute(
+                "SELECT set_config('contradictions.minimum_confidence','0.78'::jsonb)"
+            )
+            a = await _make_memory(conn)
+            b = await _make_memory(conn)
+            before_drive = await _coherence(conn)
             await _apply(
                 conn,
                 {
@@ -605,50 +674,6 @@ async def test_contradiction_threshold_and_invalid_inputs(db_pool):
             )
             assert await _case_count(conn, a, b) == 0
             assert await _contradiction_rows(conn, a, b) == []
-
-            await _apply(
-                conn,
-                {
-                    "contradiction_observations": [
-                        {"memory_a": str(a), "memory_b": str(b), "tension": "x", "confidence": 0.78}
-                    ]
-                },
-            )
-            assert await _case_count(conn, a, b) == 1
-
-            # Missing confidence falls back to 0.7 and is below the fixture threshold.
-            c = await _make_memory(conn)
-            d = await _make_memory(conn)
-            await _apply(
-                conn,
-                {
-                    "contradiction_observations": [
-                        {"memory_a": str(c), "memory_b": str(d), "tension": "y"}
-                    ]
-                },
-            )
-            assert await _case_count(conn, c, d) == 0
-            assert await _contradiction_rows(conn, c, d) == []
-            # No side effects from any rejected observation.
-            assert await _coherence(conn) == pytest.approx(before_drive, abs=1e-9)
-
-            # Invalid / same / missing memory ids are inert.
-            await _apply(
-                conn,
-                {
-                    "contradiction_observations": [
-                        {"memory_a": str(a), "memory_b": str(a), "tension": "self", "confidence": 0.9},
-                        {"memory_a": "not-a-uuid", "memory_b": str(b), "tension": "bad", "confidence": 0.9},
-                        {
-                            "memory_a": str(uuid.uuid4()),
-                            "memory_b": str(b),
-                            "tension": "ghost",
-                            "confidence": 0.9,
-                        },
-                    ]
-                },
-            )
-            assert await _case_count(conn, a, b) == 1
             assert await _coherence(conn) == pytest.approx(before_drive, abs=1e-9)
         finally:
             await transaction.rollback()
@@ -691,26 +716,30 @@ async def test_terminal_case_not_reopened(db_pool):
             assert decided["status"] == "tension"
 
             drive_after_decision = await _coherence(conn)
-            applied = await _apply(conn, payload)
-            assert applied["contradictions"] == 0, applied
+            # Direct ledger/idempotent entry is phase 2: a decided pair is never
+            # reopened and never adds drive or a second case.
+            refiled = _json(
+                await conn.fetchval(
+                    "SELECT file_contradiction_case($1,$2,NULL,'terminal conflict',0.8,'subconscious','{}'::jsonb)",
+                    a,
+                    b,
+                )
+            )
+            assert refiled["created"] is False
+            assert refiled.get("reason") == "already_decided"
             assert await _case_count(conn, a, b) == 1
             assert await _coherence(conn) == pytest.approx(drive_after_decision, abs=1e-9)
             assert len(await _contradiction_rows(conn, a, b)) == 1
 
             # Reverse-order re-report is the same unordered pair.
-            await _apply(
-                conn,
-                {
-                    "contradiction_observations": [
-                        {
-                            "memory_a": str(b),
-                            "memory_b": str(a),
-                            "tension": "terminal conflict reversed",
-                            "confidence": 0.8,
-                        }
-                    ]
-                },
+            refiled_reverse = _json(
+                await conn.fetchval(
+                    "SELECT file_contradiction_case($1,$2,NULL,'terminal conflict reversed',0.8,'subconscious','{}'::jsonb)",
+                    b,
+                    a,
+                )
             )
+            assert refiled_reverse["created"] is False
             assert await _case_count(conn, a, b) == 1
 
             found = await conn.fetch("SELECT * FROM find_contradictions()")
@@ -1034,3 +1063,446 @@ async def test_age_capability(db_pool):
             assert "empty" in props2
         finally:
             await transaction.rollback()
+
+
+# ---------------------------------------------------------------------------
+# Concurrency: two independent connections / transactions
+# ---------------------------------------------------------------------------
+async def _seed_memories(conn, count: int, *, mtype: str = "semantic"):
+    ids = []
+    for i in range(count):
+        ids.append(await _make_memory(conn, mtype=mtype, content=f"{mtype}-{uuid.uuid4().hex}"))
+    return ids
+
+
+async def _cleanup_memories(conn, ids):
+    await conn.execute(
+        "DELETE FROM learning_review_items WHERE source_memory_id = ANY($1::uuid[])",
+        ids,
+    )
+    await conn.execute(
+        """
+        DELETE FROM contradiction_cases
+        WHERE memory_a = ANY($1::uuid[]) OR memory_b = ANY($1::uuid[])
+        """,
+        ids,
+    )
+    await conn.execute("DELETE FROM memories WHERE id = ANY($1::uuid[])", ids)
+
+
+async def test_concurrent_observations(db_pool):
+    """Simultaneous same-signature re-report must not create two cases/edges."""
+    async with db_pool.acquire() as setup:
+        a = await _make_memory(setup, content=f"conc-a-{uuid.uuid4().hex}")
+        b = await _make_memory(setup, content=f"conc-b-{uuid.uuid4().hex}")
+        entity = f"conc-rel-{uuid.uuid4().hex[:8]}"
+        await _set_config(setup, "contradictions.minimum_confidence", 0.78)
+
+    async def worker(conn):
+        await conn.execute("LOAD 'age';")
+        await conn.execute("SET search_path = public, ag_catalog;")
+        payload = {
+            "relationship_observations": [
+                {"entity": entity, "change_type": "note", "confidence": 0.9}
+            ],
+            "contradiction_observations": [
+                {
+                    "memory_a": str(a),
+                    "memory_b": str(b),
+                    "tension": "conc",
+                    "confidence": 0.8,
+                }
+            ],
+            "consolidation_observations": [
+                {"memory_ids": [str(a), str(b)], "rationale": "conc", "confidence": 0.8}
+            ],
+        }
+        async with conn.transaction():
+            return await _apply(conn, payload)
+
+    try:
+        c1 = await db_pool.acquire()
+        c2 = await db_pool.acquire()
+        try:
+            r1, r2 = await asyncio.wait_for(
+                asyncio.gather(worker(c1), worker(c2)), timeout=30
+            )
+        finally:
+            await db_pool.release(c1)
+            await db_pool.release(c2)
+
+        async with db_pool.acquire() as conn:
+            await _load_age(conn)
+            assert await _case_count(conn, a, b) == 1
+            assert len(await _contradiction_rows(conn, a, b)) == 1
+            assert len(await _relationship_rows(conn, entity)) == 1
+            assert len(await _consolidation_rows(conn, [a, b])) == 1
+            # Exactly one side created the pair; the other reported existing.
+            assert sorted([r1["contradictions"], r2["contradictions"]]) == [0, 1]
+            assert await _age_edge_count(conn, "CONTRADICTS", a, b, directed=False) == 1
+            assert await _rel_edge_count(conn, "CONTRADICTS", a, b, directed=False) == 1
+    finally:
+        async with db_pool.acquire() as conn:
+            await _cleanup_memories(conn, [a, b])
+            await conn.execute(
+                "DELETE FROM memories WHERE type='strategic' AND content IN ('note','conc')"
+            )
+            await conn.execute("DELETE FROM drives WHERE name='coherence'")
+
+
+async def test_file_created_and_drive_committed(db_pool):
+    """Same-pair file twice across commits: created then existing, drive once."""
+    async with db_pool.acquire() as conn:
+        a = await _make_memory(conn, content=f"file-a-{uuid.uuid4().hex}")
+        b = await _make_memory(conn, content=f"file-b-{uuid.uuid4().hex}")
+    try:
+        async with db_pool.acquire() as conn:
+            before = await _coherence(conn)
+            first = _json(
+                await conn.fetchval(
+                    "SELECT file_contradiction_case($1,$2,NULL,'t','0.9'::float,'test','{}'::jsonb)",
+                    a,
+                    b,
+                )
+            )
+            after_first = await _coherence(conn)
+            second = _json(
+                await conn.fetchval(
+                    "SELECT file_contradiction_case($1,$2,NULL,'t','0.9'::float,'test','{}'::jsonb)",
+                    a,
+                    b,
+                )
+            )
+            after_second = await _coherence(conn)
+        assert first["created"] is True
+        assert second["created"] is False
+        assert after_first - before == pytest.approx(0.15, abs=1e-9)
+        assert after_second == pytest.approx(after_first, abs=1e-9)
+    finally:
+        async with db_pool.acquire() as conn:
+            await _cleanup_memories(conn, [a, b])
+            await conn.execute("DELETE FROM drives WHERE name='coherence'")
+
+
+async def test_concurrent_case_file_decide(db_pool):
+    """file(commit) then decide concurrently on the same new pair is safe."""
+    async with db_pool.acquire() as conn:
+        a = await _make_memory(conn, content=f"fd-a-{uuid.uuid4().hex}")
+        b = await _make_memory(conn, content=f"fd-b-{uuid.uuid4().hex}")
+    try:
+        async with db_pool.acquire() as conn:
+            filed = _json(
+                await conn.fetchval(
+                    "SELECT file_contradiction_case($1,$2,NULL,'t','0.9'::float,'test','{}'::jsonb)",
+                    a,
+                    b,
+                )
+            )
+        case_id = filed["case_id"]
+
+        async def decide(conn):
+            async with conn.transaction():
+                return _json(
+                    await conn.fetchval(
+                        "SELECT decide_contradiction($1::uuid,'tension',NULL,'web','op')",
+                        case_id,
+                    )
+                )
+
+        async def refile(conn):
+            async with conn.transaction():
+                return _json(
+                    await conn.fetchval(
+                        "SELECT file_contradiction_case($1,$2,NULL,'t','0.9'::float,'test','{}'::jsonb)",
+                        a,
+                        b,
+                    )
+                )
+
+        c1 = await db_pool.acquire()
+        c2 = await db_pool.acquire()
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(decide(c1), refile(c2)), timeout=30
+            )
+        finally:
+            await db_pool.release(c1)
+            await db_pool.release(c2)
+        # Never two cases and never a reopened terminal pair.
+        async with db_pool.acquire() as conn:
+            assert await _case_count(conn, a, b) == 1
+            status = await conn.fetchval(
+                "SELECT status FROM contradiction_cases WHERE id=$1::uuid", case_id
+            )
+            assert status == "tension"
+    finally:
+        async with db_pool.acquire() as conn:
+            await _cleanup_memories(conn, [a, b])
+            await conn.execute("DELETE FROM drives WHERE name='coherence'")
+
+
+async def test_heartbeat_batch_gate(db_pool):
+    """Batch containing resolve must serialize with a concurrent decide."""
+    async with db_pool.acquire() as conn:
+        a = await _make_memory(conn, content=f"hb-a-{uuid.uuid4().hex}")
+        b = await _make_memory(conn, content=f"hb-b-{uuid.uuid4().hex}")
+        filed = _json(
+            await conn.fetchval(
+                "SELECT file_contradiction_case($1,$2,NULL,'t','0.9'::float,'test','{}'::jsonb)",
+                a,
+                b,
+            )
+        )
+    case_id = filed["case_id"]
+    try:
+        async def batch(conn):
+            async with conn.transaction():
+                return _json(
+                    await conn.fetchval(
+                        """
+                        SELECT execute_heartbeat_actions_batch(
+                            gen_random_uuid(),
+                            jsonb_build_array(jsonb_build_object(
+                                'action','resolve_contradiction',
+                                'params', jsonb_build_object('case_id',$1::uuid)
+                            ))
+                        )
+                        """,
+                        case_id,
+                    )
+                )
+
+        async def decide(conn):
+            async with conn.transaction():
+                return _json(
+                    await conn.fetchval(
+                        "SELECT decide_contradiction($1::uuid,'tension',NULL,'web','op')",
+                        case_id,
+                    )
+                )
+
+        c1 = await db_pool.acquire()
+        c2 = await db_pool.acquire()
+        try:
+            await asyncio.wait_for(asyncio.gather(batch(c1), decide(c2)), timeout=30)
+        finally:
+            await db_pool.release(c1)
+            await db_pool.release(c2)
+        async with db_pool.acquire() as conn:
+            assert await _case_count(conn, a, b) == 1
+            assert (
+                await conn.fetchval(
+                    "SELECT status FROM contradiction_cases WHERE id=$1::uuid", case_id
+                )
+                == "tension"
+            )
+    finally:
+        async with db_pool.acquire() as conn:
+            await _cleanup_memories(conn, [a, b])
+            await conn.execute("DELETE FROM drives WHERE name='coherence'")
+
+
+async def test_embedding_alignment_concurrent_decide(db_pool):
+    """An embedding-triggered graph primitive must not invert lock order."""
+    async with db_pool.acquire() as conn:
+        await _load_age(conn)
+        a = await _make_memory(conn, content=f"em-a-{uuid.uuid4().hex}")
+        b = await _make_memory(conn, content=f"em-b-{uuid.uuid4().hex}")
+        filed = _json(
+            await conn.fetchval(
+                "SELECT file_contradiction_case($1,$2,NULL,'t','0.9'::float,'test','{}'::jsonb)",
+                a,
+                b,
+            )
+        )
+    case_id = filed["case_id"]
+    try:
+        async def touch_embedding(conn):
+            async with conn.transaction():
+                # Triggers auto_check_worldview_alignment -> create_memory_relationship.
+                await conn.execute(
+                    """
+                    UPDATE memories
+                    SET embedding = array_fill(0.2::float, ARRAY[embedding_dimension()])::vector,
+                        embedding_status='embedded'
+                    WHERE id = $1
+                    """,
+                    a,
+                )
+                return True
+
+        async def decide(conn):
+            async with conn.transaction():
+                return _json(
+                    await conn.fetchval(
+                        "SELECT decide_contradiction($1::uuid,'tension',NULL,'web','op')",
+                        case_id,
+                    )
+                )
+
+        c1 = await db_pool.acquire()
+        c2 = await db_pool.acquire()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(touch_embedding(c1), decide(c2)), timeout=30
+            )
+        finally:
+            await db_pool.release(c1)
+            await db_pool.release(c2)
+    finally:
+        async with db_pool.acquire() as conn:
+            await _cleanup_memories(conn, [a, b])
+            await conn.execute("DELETE FROM drives WHERE name='coherence'")
+
+
+async def test_weekly_correction_concurrent_decide(db_pool):
+    """A weekly correction and a same-source decision must not deadlock."""
+    async with db_pool.acquire() as conn:
+        source = await _make_memory(conn, content=f"wk-src-{uuid.uuid4().hex}")
+        other = await _make_memory(conn, content=f"wk-other-{uuid.uuid4().hex}")
+        review = _json(
+            await conn.fetchval(
+                """
+                SELECT create_learning_review(
+                    CURRENT_TIMESTAMP - INTERVAL '7 days', CURRENT_TIMESTAMP,
+                    'week', ARRAY[$1]::uuid[]
+                )
+                """,
+                source,
+            )
+        )
+        item_id = await conn.fetchval(
+            "SELECT id FROM learning_review_items WHERE review_id=$1::uuid",
+            review["review_id"],
+        )
+        filed = _json(
+            await conn.fetchval(
+                "SELECT file_contradiction_case($1,$2,NULL,'t','0.9'::float,'test','{}'::jsonb)",
+                source,
+                other,
+            )
+        )
+    case_id = filed["case_id"]
+    try:
+        async def correct(conn):
+            async with conn.transaction():
+                return _json(
+                    await conn.fetchval(
+                        """
+                        SELECT decide_learning_review_item(
+                            $1::uuid, 'correct', 'corrected content', 'web', 'op'
+                        )
+                        """,
+                        item_id,
+                    )
+                )
+
+        async def decide(conn):
+            async with conn.transaction():
+                return _json(
+                    await conn.fetchval(
+                        "SELECT decide_contradiction($1::uuid,'tension',NULL,'web','op')",
+                        case_id,
+                    )
+                )
+
+        c1 = await db_pool.acquire()
+        c2 = await db_pool.acquire()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(correct(c1), decide(c2)), timeout=30
+            )
+        finally:
+            await db_pool.release(c1)
+            await db_pool.release(c2)
+    finally:
+        async with db_pool.acquire() as conn:
+            await _cleanup_memories(conn, [source, other])
+            await conn.execute("DELETE FROM learning_review_items WHERE review_id=$1", review["review_id"])
+            await conn.execute("DELETE FROM learning_reviews WHERE id=$1", review["review_id"])
+            await conn.execute("DELETE FROM drives WHERE name='coherence'")
+
+
+async def test_hmx_import_concurrent_decide(db_pool):
+    """The ordinary HMX import entry (Python) serializes with a decision."""
+    from core.digest import content_hash_v1
+    from core.memory_exchange import build_envelope, import_hmx, resolve_export_sections
+
+    async with db_pool.acquire() as conn:
+        a = await _make_memory(conn, content=f"hmx-a-{uuid.uuid4().hex}")
+        b = await _make_memory(conn, content=f"hmx-b-{uuid.uuid4().hex}")
+        filed = _json(
+            await conn.fetchval(
+                "SELECT file_contradiction_case($1,$2,NULL,'t','0.9'::float,'test','{}'::jsonb)",
+                a,
+                b,
+            )
+        )
+    case_id = filed["case_id"]
+
+    plan = resolve_export_sections("telepathy")
+    content = f"imported-{uuid.uuid4().hex}"
+    envelope = build_envelope(
+        intent="telepathy",
+        plan=plan,
+        instance_id="hexis_source",
+        schema_version="0007_hmx_additive_import",
+        embedding_model="embeddinggemma:300m",
+        embedding_dimension=768,
+        lineage_id=str(uuid.uuid4()),
+        relationship_edge_types=["SUPPORTS"],
+    )
+    envelope["sections"]["memories"] = [
+        {
+            "ref": f"{envelope['export_id']}:1",
+            "type": "semantic",
+            "status": "active",
+            "content": content,
+            "content_hash_v1": content_hash_v1(content),
+            "importance": 0.7,
+            "trust_level": 0.8,
+            "metadata": {},
+            "provenance": {
+                "acquisition_mode": "experienced",
+                "origin_instance": "hexis_source",
+                "origin_id": "1",
+                "import_chain": [],
+                "modification_chain": [],
+            },
+        }
+    ]
+
+    try:
+        async def do_import(conn):
+            return await import_hmx(conn, envelope, strategy="additive")
+
+        async def decide(conn):
+            async with conn.transaction():
+                return _json(
+                    await conn.fetchval(
+                        "SELECT decide_contradiction($1::uuid,'tension',NULL,'web','op')",
+                        case_id,
+                    )
+                )
+
+        c1 = await db_pool.acquire()
+        c2 = await db_pool.acquire()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(do_import(c1), decide(c2)), timeout=30
+            )
+        finally:
+            await db_pool.release(c1)
+            await db_pool.release(c2)
+        async with db_pool.acquire() as conn:
+            assert await _case_count(conn, a, b) == 1
+            imported = await conn.fetchval(
+                "SELECT count(*) FROM memories WHERE content=$1", content
+            )
+            assert imported == 1
+    finally:
+        async with db_pool.acquire() as conn:
+            await _cleanup_memories(conn, [a, b])
+            await conn.execute("DELETE FROM memories WHERE content=$1", content)
+            await conn.execute("DELETE FROM drives WHERE name='coherence'")
+
