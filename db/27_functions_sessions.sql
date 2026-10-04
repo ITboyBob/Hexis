@@ -1,6 +1,7 @@
 -- =============================================================
 -- Sub-Agent Session Functions
 -- =============================================================
+-- Background task lifecycle functions live in 27a_functions_background_tasks.sql.
 
 -- Create a new sub-agent session
 -- Each baseline file runs as its own psql session at initdb, so it must pin

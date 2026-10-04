@@ -47,11 +47,23 @@ async def test_migrations_recorded_and_idempotent(db_pool):
         assert "0015_hmx_acceptance_diagnostics" in st["applied"]
         assert "0016_cross_session_fts" in st["applied"]
         assert "0254_behavior_events" in st["applied"]
+        assert "0255_background_tasks" in st["applied"]
         assert await conn.fetchval(
             "SELECT to_regclass('public.behavior_events') IS NOT NULL"
         )
         assert await conn.fetchval(
             "SELECT to_regprocedure('public.record_behavior_event(uuid,integer,text,text,uuid,text,integer,text,text,text,integer,uuid,text,text,timestamptz,text,text,bigint,text,jsonb)') IS NOT NULL"
+        )
+        assert await conn.fetchval(
+            "SELECT to_regclass('public.background_tasks') IS NOT NULL "
+            "AND to_regclass('public.background_task_executions') IS NOT NULL"
+        )
+        assert await conn.fetchval(
+            "SELECT to_regprocedure('public.create_background_task(uuid,uuid,jsonb)') IS NOT NULL "
+            "AND to_regprocedure('public.claim_background_task(uuid)') IS NOT NULL "
+            "AND to_regprocedure('public.complete_background_task(uuid,uuid,jsonb,uuid)') IS NOT NULL "
+            "AND to_regprocedure('public.fail_background_task(uuid,uuid,text,uuid)') IS NOT NULL "
+            "AND to_regprocedure('public.mark_background_task_unknown(uuid,uuid,text,uuid)') IS NOT NULL"
         )
         assert st["pending"] == []
         assert await apply_pending_migrations(conn) == []  # nothing left to do

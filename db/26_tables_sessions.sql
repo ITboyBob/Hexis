@@ -4,6 +4,7 @@
 -- Tracks background tasks spawned by the agent during heartbeat
 -- or chat. Each session runs its own AgentLoop with an energy
 -- budget and stores results back here.
+-- Durable command-id task identity lives in 26a_tables_background_tasks.sql.
 -- =============================================================
 
 -- Each baseline file runs as its own psql session at initdb, so it must pin
