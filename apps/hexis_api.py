@@ -213,6 +213,27 @@ class SpeechSynthesisRequest(BaseModel):
     text: str = Field(min_length=1, max_length=20_000)
 
 
+class PlaybackEventRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["open", "audible", "progress", "end", "interrupt"]
+    session_id: uuid.UUID
+    response_id: str = Field(min_length=1, max_length=200)
+    playback_id: str = Field(min_length=1, max_length=200)
+    output_epoch: int = Field(ge=0)
+    media_session_id: str = Field(min_length=1, max_length=200)
+    turn_id: uuid.UUID | None = None
+    start_ms: int | None = Field(default=None, ge=0)
+    audible_ms: int | None = Field(default=None, ge=0)
+    played_ms: int | None = Field(default=None, ge=0)
+    interval_ms: int | None = Field(default=None, ge=0)
+    phase: str | None = Field(default=None, min_length=1, max_length=40)
+    scope: str | None = Field(
+        default=None, pattern="^(complete|partial|unplayed|unknown)$"
+    )
+    reason: str | None = Field(default=None, min_length=1, max_length=120)
+
+
 class WebPushKeys(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -2513,6 +2534,53 @@ async def transcribe_pwa_voice(
         "outcome": result.outcome,
         "duration_ms": result.duration_ms,
     }
+
+
+@app.post("/api/voice/playback")
+async def record_voice_playback(req: PlaybackEventRequest):
+    """Record one real native playback event through the shared history service."""
+
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
+    from services.playback_history import PlaybackHistory, PlaybackIdentity
+
+    identity = PlaybackIdentity(
+        session_id=req.session_id,
+        response_id=req.response_id,
+        playback_id=req.playback_id,
+        output_epoch=req.output_epoch,
+        media_session_id=req.media_session_id,
+        turn_id=req.turn_id,
+    )
+    history = PlaybackHistory(_pool, identity)
+    if req.action == "open":
+        if req.start_ms is None:
+            raise HTTPException(status_code=422, detail="start_ms is required")
+        return await history.open(start_ms=req.start_ms)
+    if req.action == "audible":
+        if req.audible_ms is None:
+            raise HTTPException(status_code=422, detail="audible_ms is required")
+        return await history.audible(audible_ms=req.audible_ms)
+    if req.action == "progress":
+        if req.played_ms is None or req.interval_ms is None or req.phase is None:
+            raise HTTPException(
+                status_code=422,
+                detail="played_ms, interval_ms and phase are required",
+            )
+        return await history.progress(
+            played_ms=req.played_ms,
+            interval_ms=req.interval_ms,
+            phase=req.phase,
+        )
+    if req.action == "end":
+        if req.scope is None or req.played_ms is None:
+            raise HTTPException(
+                status_code=422, detail="scope and played_ms are required"
+            )
+        return await history.end(scope=req.scope, played_ms=req.played_ms)
+    if req.played_ms is None or req.reason is None:
+        raise HTTPException(status_code=422, detail="played_ms and reason are required")
+    return await history.interrupt(reason=req.reason, played_ms=req.played_ms)
 
 
 @app.get("/api/voice/status")
