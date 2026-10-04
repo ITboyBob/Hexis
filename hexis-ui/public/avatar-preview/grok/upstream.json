@@ -18,8 +18,8 @@
     "tables.js": {
       "source_path": "replica/src/tables.js",
       "upstream_sha256": "ab1a6ce2aeaf13fbc2489fec1bbe10e8f27a55b7d96f32ec949c5425d9d92be3",
-      "adapted_sha256": "ab1a6ce2aeaf13fbc2489fec1bbe10e8f27a55b7d96f32ec949c5425d9d92be3",
-      "adapted": false
+      "adapted_sha256": "52e2d9c670766d8e6579b500eb0a4172b7abb0a022bbc33f578ab9a503cc8e9b",
+      "adapted": true
     },
     "pose.js": {
       "source_path": "replica/src/pose.js",

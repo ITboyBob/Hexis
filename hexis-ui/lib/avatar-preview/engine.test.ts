@@ -97,6 +97,27 @@ describe("Avatar engine resources and loader", () => {
     expect(manifest.commit).toBe("647e9bd7c60290c42a738fad586589b3f36a4680");
   });
 
+  it("keeps the happy > playful > excited eye-shape hold gradient after the high-arousal speed-up", () => {
+    const source = readFileSync(resolve(assetRoot, "tables.js"), "utf8");
+    const block = source.slice(source.indexOf("const EYE_HOLD_MS = {"), source.indexOf("};", source.indexOf("const EYE_HOLD_MS = {")));
+    const hold = (key: string) => {
+      const match = block.match(new RegExp(`${key}:\\s*\\[(\\d+),\\s*(\\d+)\\]`));
+      if (!match) throw new Error(`缺少 ${key} 的眼形停留时长`);
+      return [Number(match[1]), Number(match[2])] as const;
+    };
+    const happy = hold("happy");
+    const playful = hold("playful");
+    const excited = hold("excited");
+    // Slower holds first: happy reads calmer, excited reads most agitated.
+    expect(happy[0]).toBeGreaterThan(playful[0]);
+    expect(playful[0]).toBeGreaterThan(excited[0]);
+    expect(happy[1]).toBeGreaterThan(playful[1]);
+    expect(playful[1]).toBeGreaterThan(excited[1]);
+    // The playful -> excited step is the widest, so excited reads clearly faster.
+    expect(playful[0] - excited[0]).toBeGreaterThan(happy[0] - playful[0]);
+    expect(playful[1] - excited[1]).toBeGreaterThan(happy[1] - playful[1]);
+  });
+
   it("loads scripts once in dependency order and reuses the in-flight promise", async () => {
     const scripts: HTMLScriptElement[] = [];
     const append = document.head.appendChild.bind(document.head);

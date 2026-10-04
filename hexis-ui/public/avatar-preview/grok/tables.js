@@ -22,15 +22,17 @@
     dragging: [3, 15, 0], "powering-down": [13, 22],
   };
 
+  // happy/playful/excited eye-shape hold shortened to read as high-arousal;
+  // keeps the happy > playful > excited speed gradient. Local adaptation (see upstream.json).
   const EYE_HOLD_MS = {
     sleeping: [6000, 10000], waking: [800, 800], idle: [9000, 16000],
     listening: [2800, 5000], thinking: [2000, 3600], searching: [1000, 1800],
-    working: [1800, 3200], excited: [1100, 2000], surprised: [2500, 4000],
+    working: [1800, 3200], excited: [650, 1200], surprised: [2500, 4000],
     suspicious: [2600, 4500], angry: [2200, 3800], drowsy: [4000, 8000],
-    happy: [2500, 4500], curious: [1800, 3200], confused: [2200, 3800],
+    happy: [1200, 2250], curious: [1800, 3200], confused: [2200, 3800],
     bored: [3500, 6000], proud: [3500, 6000], shy: [3000, 5500],
     sad: [4000, 7000], laughing: [1200, 2400], scared: [900, 1800],
-    playful: [1500, 3000], celebrate: [1400, 2600], orbit: [4000, 8000],
+    playful: [1150, 2150], celebrate: [1400, 2600], orbit: [4000, 8000],
     radar: [4000, 8000], progress: [4000, 8000], spawning: [1200, 1200],
     humming: [5000, 9000], loading: [6000, 10000], dictating: [4000, 8000],
     sending: [4000, 8000], receiving: [4000, 8000], uploading: [4000, 8000],
