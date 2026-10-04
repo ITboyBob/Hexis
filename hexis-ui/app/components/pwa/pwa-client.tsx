@@ -1,6 +1,7 @@
 "use client";
 
 import { Bell, Download, X } from "lucide-react";
+import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import {
   displayMode,
@@ -17,6 +18,8 @@ import {
 const DISMISSED_KEY = "hexis:pwa-prompt-dismissed";
 
 export function PwaClient() {
+  const pathname = usePathname();
+  const isolatedRoute = pathname === "/avatar-preview" || pathname.startsWith("/avatar-preview/");
   const [installAvailable, setInstallAvailable] = useState(false);
   const [showPrompt, setShowPrompt] = useState(false);
   const [notificationAvailable, setNotificationAvailable] = useState(false);
@@ -37,6 +40,7 @@ export function PwaClient() {
   }, []);
 
   useEffect(() => {
+    if (isolatedRoute) return;
     const onInstallPrompt = (rawEvent: Event) => {
       const event = rawEvent as InstallPromptEvent;
       event.preventDefault();
@@ -58,9 +62,10 @@ export function PwaClient() {
       window.removeEventListener("appinstalled", onInstalled);
       window.removeEventListener("hexis:install-available", refreshPrompt);
     };
-  }, [refreshPrompt]);
+  }, [isolatedRoute, refreshPrompt]);
 
   useEffect(() => {
+    if (isolatedRoute) return;
     const deviceId = pwaDeviceId();
     const report = (presence: "online" | "offline" | "idle", keepalive = false) => {
       const payload = JSON.stringify({
@@ -94,7 +99,7 @@ export function PwaClient() {
       document.removeEventListener("visibilitychange", reportVisibility);
       window.removeEventListener("pagehide", reportOffline);
     };
-  }, []);
+  }, [isolatedRoute]);
 
   async function install() {
     setBusy("install");
@@ -130,7 +135,7 @@ export function PwaClient() {
     setShowPrompt(false);
   }
 
-  if (!showPrompt) return null;
+  if (isolatedRoute || !showPrompt) return null;
   return (
     <aside
       aria-label="Install Hexis app"

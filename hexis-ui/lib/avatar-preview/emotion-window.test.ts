@@ -88,9 +88,37 @@ describe("单宿主视觉资格裁定", () => {
 
   it("即使调度器尚未触发，单调时钟到期也拒绝接受并裁定关闭", () => {
     let now = 0;
-    const host = new EmotionWindowHost({ owner: "local", now: () => now, schedule: vi.fn(() => 3), cancel: vi.fn() });
+    const cancel = vi.fn();
+    const host = new EmotionWindowHost({ owner: "local", now: () => now, schedule: vi.fn(() => 3), cancel });
     host.open(identity, 10);
     now = 10;
     expect(host.acceptResult(identity)).toMatchObject({ accepted: false, fact: { status: "closed", reason: "model_timeout" } });
+    expect(cancel).toHaveBeenCalledWith(3);
+  });
+
+  it("dispose cancels pending windows and ignores captured late callbacks", () => {
+    let now = 100;
+    const callbacks: Array<() => void> = [];
+    const cancelled: unknown[] = [];
+    const changes: string[] = [];
+    const host = new EmotionWindowHost({
+      owner: "local",
+      now: () => now,
+      schedule: (callback, delay) => {
+        callbacks.push(() => { now += delay; callback(); });
+        return callbacks.length;
+      },
+      cancel: (handle) => cancelled.push(handle),
+      onChange: (_changedIdentity, fact) => changes.push(fact.status),
+    });
+    const pendingIdentity = { ...identity, input_turn_id: "dispose" };
+    host.open(pendingIdentity, 10);
+    const late = callbacks[0];
+    host.dispose();
+    host.dispose();
+    late();
+    expect(cancelled).toEqual([1]);
+    expect(changes).toEqual([]);
+    expect(host.current(pendingIdentity)).toBeUndefined();
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { activeTasks, attention, identityKey, initial, reduce } from "./projection";
+import { activeTasks, applyEvent, attention, eventReceipt, identityKey, initial, reduce } from "./projection";
 import type { Event, Identity, Payload, Task } from "./contracts";
 
 const identity = (input_order: number, stimulus_revision = 1): Identity => ({
@@ -32,6 +32,39 @@ const task = (activity_id: string, phase: Task["phase"], foreground = true): Tas
 });
 
 describe("异步状态投影", () => {
+  it("明确报告旧身份结果被拒，且不把被拒事件标成已接纳", () => {
+    const send = makeStream("receipt");
+    let state = initial("session-a");
+    state = reduce(state, send({ type: "input_committed", identity: identity(1) }));
+    state = reduce(state, send({ type: "input_committed", identity: identity(2) }));
+    const late = send({ type: "emotion", identity: identity(1), wordset_version: "v1", status: "valid", label: "happy", source: "simulated" });
+    expect(eventReceipt(state, late)).toMatchObject({ accepted: false, reason: "拒绝情绪归属或词表版本不匹配" });
+    expect(applyEvent(state, late).receipt.accepted).toBe(false);
+  });
+
+  it("authoritative close receipt优先于普通stream去重，accepted后的pending/error明确拒绝", () => {
+    const send = makeStream("receipt");
+    const first = send({ type: "input_committed", identity: identity(1) });
+    let state = reduce(initial("session-a"), first);
+    const close: Event = { ...first, payload: { type: "visual_window", identity: identity(1), fact: {
+      status: "closed", owner: "local", decision_seq: 1, reason: "model_timeout",
+    } } };
+    expect(eventReceipt(state, close)).toMatchObject({ accepted: true, reason: "model_timeout", fact_applied: true });
+    state = applyEvent(state, close).state;
+    expect(state.visual_windows[identityKey(identity(1))]?.status).toBe("closed");
+
+    let acceptedState = reduce(initial("session-a"), send({ type: "input_committed", identity: identity(1) }));
+    acceptedState = reduce(acceptedState, send({ type: "visual_window", identity: identity(1), fact: {
+      status: "accepted", owner: "local", decision_seq: 1,
+    } }));
+    const pending = send({ type: "emotion", identity: identity(1), wordset_version: "v1", status: "pending", source: "simulated" });
+    const applied = applyEvent(acceptedState, pending);
+    expect(applied.receipt).toMatchObject({ accepted: false, reason: "视觉资格已终结" });
+    expect(applied.state.evaluation).toBe("pending");
+    const error = send({ type: "emotion", identity: identity(1), wordset_version: "v1", status: "error", source: "simulated", reason: "late failure" });
+    expect(eventReceipt(acceptedState, error)).toMatchObject({ accepted: false, reason: "视觉资格已终结" });
+  });
+
   it("keeps_last_valid_on_error", () => {
     const send = makeStream("emotion");
     let state = initial("session-a");
@@ -349,10 +382,18 @@ describe("异步状态投影", () => {
     const afterRevision = reduce(reduced, send({ type: "input_committed", identity: revised, visual_owner: "service" } as never));
 
     expect(state.visual_windows?.[identityKey(current)]?.status).toBe("closed");
+    expect(state.reason).toContain("总期限已到");
     expect(state.visual_windows?.[identityKey(oldIdentity)]?.status).toBe("open");
     expect(reduced.visual_windows?.[identityKey(current)]?.status).toBe("closed");
     expect(afterRevision.visual_windows?.[identityKey(revised)]?.status).toBe("open");
     expect(afterRevision.current).toEqual(revised);
+    const currentReason = state.reason;
+    const closeOld = reduce(state, {
+      event_id: "close-old-identity", session_id: "session-a", stream_id: "old-deadline", producer_seq: 0,
+      payload: { type: "visual_window", identity: oldIdentity,
+        fact: { status: "closed", owner: "service", decision_seq: 1, reason: "model_timeout" } },
+    } as never);
+    expect(closeOld.reason).toBe(currentReason);
     const staleOrdinary = reduce(state, {
       event_id: "older-ordinary-after-close", session_id: "session-a", stream_id: "deadline", producer_seq: 4,
       payload: { type: "task", task: task("stale", "running") },

@@ -54,6 +54,97 @@ export function identityKey(identity: Identity): string {
   return JSON.stringify([identity.session_id, identity.input_turn_id, identity.input_order, identity.stimulus_revision]);
 }
 
+export type ReceiptCode = "duplicate" | "session_mismatch" | "identity_mismatch" | "wordset_mismatch" | "closed" | "missing_window" | "terminal" | "rejected";
+export type EventReceipt = { accepted: boolean; reason: string; fact_applied?: boolean; code?: ReceiptCode };
+
+/** Authoritative event receipt for diagnostics; no UI caller infers acceptance from object identity. */
+export function eventReceipt(state: State, event: Event): EventReceipt {
+  if (state.dead) return { accepted: false, reason: "预览已销毁", code: "terminal" };
+  if (event.session_id !== state.session_id) return { accepted: false, reason: "事件会话与当前预览不匹配", code: "session_mismatch" };
+  const payload = event.payload;
+  const closeFact = payload.type === "visual_window" && payload.fact.status === "closed"
+    ? { identity: payload.identity, fact: payload.fact, carriesEmotion: false }
+    : payload.type === "emotion" && payload.visual_window?.status === "closed"
+      ? { identity: payload.identity, fact: payload.visual_window, carriesEmotion: true }
+      : undefined;
+  if (!closeFact && (state.seen[event.event_id] || event.producer_seq <= (state.seq[event.stream_id] ?? -1))) {
+    return { accepted: false, reason: "重复事件ID或stream序号过旧", code: "duplicate" };
+  }
+  if (closeFact) {
+    const current = state.visual_windows[identityKey(closeFact.identity)];
+    const valid = closeFact.identity.session_id === state.session_id && current
+      && current.owner === closeFact.fact.owner && current.status === "open"
+      && closeFact.fact.decision_seq === current.decision_seq + 1;
+    return valid
+      ? { accepted: !closeFact.carriesEmotion, fact_applied: true, reason: closeFact.fact.reason ?? "视觉资格已关闭" }
+      : { accepted: false, reason: "视觉资格关闭事实与当前开窗不匹配", code: "rejected" };
+  }
+  if (payload.type === "input_committed") {
+    const current = state.current;
+    const identity = payload.identity;
+    const older = current && (identity.input_order < current.input_order
+      || (identity.input_order === current.input_order
+        && (identity.input_turn_id !== current.input_turn_id || identity.stimulus_revision <= current.stimulus_revision)));
+    return identity.session_id === state.session_id && !older
+      ? { accepted: true, reason: "输入已接纳" }
+      : { accepted: false, reason: "拒绝旧输入或相同版本重复提交", code: "identity_mismatch" };
+  }
+  if (payload.type === "emotion") {
+    const key = identityKey(payload.identity);
+    const fact = state.visual_windows[key];
+    if (!sameIdentity(state.current, payload.identity) || payload.wordset_version !== WORDSET_VERSION) {
+      return { accepted: false, reason: "拒绝情绪归属或词表版本不匹配", code: sameIdentity(state.current, payload.identity) ? "wordset_mismatch" : "identity_mismatch" };
+    }
+    if (payload.visual_window?.status === "closed") return { accepted: false, reason: payload.visual_window.reason ?? "视觉资格已关闭", code: "closed" };
+    if (fact?.status === "closed") return { accepted: false, reason: fact.reason ?? "视觉资格已关闭", code: "closed" };
+    if (!fact) return { accepted: false, reason: "输入尚未开视觉资格窗口", code: "missing_window" };
+    if (fact.status === "accepted" && payload.status !== "valid") return { accepted: false, reason: "视觉资格已终结", code: "terminal" };
+    if (payload.status !== "valid") return { accepted: true, reason: payload.reason ?? `已记录${payload.status}` };
+    const supplied = payload.visual_window;
+    const firstAcceptedResult = fact?.status === "accepted" && supplied?.status === "accepted"
+      && supplied.owner === fact.owner && supplied.decision_seq === fact.decision_seq
+      && !state.accepted_results[key];
+    const openWindowResult = fact?.status === "open" && supplied?.status === "accepted"
+      && supplied.owner === fact.owner && supplied.decision_seq === fact.decision_seq + 1;
+    if (!isEmotion(payload.label) || (!firstAcceptedResult && !openWindowResult)) {
+      return { accepted: false, reason: "缺少匹配的accepted视觉资格" };
+    }
+    return { accepted: true, reason: "合法情绪与视觉资格已接纳" };
+  }
+  if (payload.type === "visual_window") {
+    const current = state.visual_windows[identityKey(payload.identity)];
+    const valid = current && current.owner === payload.fact.owner && current.status === "open"
+      && payload.fact.decision_seq === current.decision_seq + 1
+      && (payload.fact.status === "accepted" || payload.fact.status === "closed");
+    return valid ? { accepted: true, reason: payload.fact.status === "closed" ? payload.fact.reason ?? "视觉资格已关闭" : "视觉资格已接纳" }
+      : { accepted: false, reason: "视觉资格事实与当前开窗不匹配", code: "rejected" };
+  }
+  if (payload.type === "task") {
+    const current = state.tasks[payload.task.activity_id];
+    return current && terminalTaskPhases.has(current.phase)
+      ? { accepted: false, reason: "活动实例已终止" }
+      : { accepted: true, reason: "活动状态已记录" };
+  }
+  if (payload.type === "playback_open") {
+    return state.playback && payload.output_epoch <= state.playback.output_epoch
+      ? { accepted: false, reason: "播放窗口须推进epoch" }
+      : { accepted: true, reason: "播放epoch已打开" };
+  }
+  if (payload.type === "playback") {
+    const current = state.playback;
+    const feedback = payload.feedback;
+    return current && !state.playback_closed && current.playback_id === feedback.playback_id
+      && current.output_epoch === feedback.output_epoch
+      ? { accepted: true, reason: "播放反馈已记录" }
+      : { accepted: false, reason: "拒绝旧播放反馈" };
+  }
+  return { accepted: true, reason: payload.type === "control" ? `已执行${payload.action}` : "输入活动已记录" };
+}
+
+export function applyEvent(state: State, event: Event): { state: State; receipt: EventReceipt } {
+  return { state: reduce(state, event), receipt: eventReceipt(state, event) };
+}
+
 export function reduce(state: State, event: Event): State {
   if (state.dead || event.session_id !== state.session_id) return state;
   const payload = event.payload;
@@ -87,7 +178,12 @@ export function reduce(state: State, event: Event): State {
     const diagnosticLabel = "label" in closure ? closure.label : undefined;
     return { ...next, seq: { ...next.seq, [event.stream_id]: seq }, visual_windows,
       evaluation: isCurrent ? "error" : state.evaluation,
-      last_diagnostic: { identity, status: diagnosticStatus, label: diagnosticLabel, accepted: false, reason: fact.reason } };
+      last_diagnostic: { identity, status: diagnosticStatus, label: diagnosticLabel, accepted: false, reason: fact.reason },
+      reason: isCurrent
+        ? fact.reason === "model_timeout"
+          ? "情绪评估期限已到；最近有效情绪保留，可检查设置后显式重试"
+          : "情绪总期限已到；最近有效情绪保留，可检查上下文与设置后显式重试"
+        : state.reason };
   }
 
   if (payload.type === "visual_window") {

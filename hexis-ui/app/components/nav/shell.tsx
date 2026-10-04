@@ -7,7 +7,9 @@ import { Sidebar } from "./sidebar";
 
 export function Shell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const hideNav = pathname.startsWith("/init");
+  const hideNav = pathname.startsWith("/init")
+    || pathname === "/avatar-preview"
+    || pathname.startsWith("/avatar-preview/");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
   useEffect(() => {

@@ -14,6 +14,7 @@ export type EmotionWindowOptions = {
 
 export class EmotionWindowHost {
   private readonly entries = new Map<string, Entry>();
+  private disposed = false;
   private readonly now: () => number;
   private readonly schedule: (callback: () => void, delayMs: number) => unknown;
   private readonly cancel: (handle: unknown) => void;
@@ -25,6 +26,7 @@ export class EmotionWindowHost {
   }
 
   open(identity: Identity, timeoutMs: number): VisualWindowFact {
+    if (this.disposed) throw new Error("视觉资格宿主已销毁；请显式重开预览会话");
     const key = identityKey(identity);
     const existing = this.entries.get(key);
     if (existing) return existing.fact;
@@ -40,6 +42,7 @@ export class EmotionWindowHost {
   }
 
   acceptResult(identity: Identity): { accepted: boolean; fact?: VisualWindowFact } {
+    if (this.disposed) return { accepted: false };
     const key = identityKey(identity);
     const entry = this.entries.get(key);
     if (!entry || entry.fact.status !== "open") return { accepted: false, fact: entry?.fact };
@@ -54,7 +57,7 @@ export class EmotionWindowHost {
   }
 
   private expire(key: string, entry: Entry): void {
-    if (this.entries.get(key) !== entry || entry.fact.status !== "open") return;
+    if (this.disposed || this.entries.get(key) !== entry || entry.fact.status !== "open") return;
     const remaining = entry.deadline - this.now();
     if (remaining > 0) {
       entry.timer = this.schedule(() => this.expire(key, entry), remaining);
@@ -64,9 +67,19 @@ export class EmotionWindowHost {
   }
 
   private close(key: string, entry: Entry): void {
-    if (this.entries.get(key) !== entry || entry.fact.status !== "open") return;
+    if (this.disposed || this.entries.get(key) !== entry || entry.fact.status !== "open") return;
+    if (entry.timer !== undefined) this.cancel(entry.timer);
     entry.fact = { status: "closed", owner: this.options.owner, decision_seq: entry.fact.decision_seq + 1, reason: "model_timeout" };
     entry.timer = undefined;
     this.options.onChange?.(entry.identity, entry.fact);
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const entry of this.entries.values()) {
+      if (entry.timer !== undefined) this.cancel(entry.timer);
+    }
+    this.entries.clear();
   }
 }
