@@ -1,10 +1,13 @@
 import { isEmotion, WORDSET_VERSION } from "./contracts";
-import type { Emotion, Event, Identity, Playback, Source, Task } from "./contracts";
+import type { Emotion, Event, Identity, Playback, Source, Task, VisualWindowFact } from "./contracts";
 
 export type State = {
   session_id: string;
   current?: Identity;
   last_valid?: { label: Emotion; identity: Identity; source: Source };
+  visual_windows: Record<string, VisualWindowFact>;
+  accepted_results: Record<string, { label: Emotion; source: Source }>;
+  last_diagnostic?: { identity: Identity; status: "pending" | "valid" | "error"; label?: Emotion; accepted: boolean; reason?: string };
   evaluation: "unassessed" | "pending" | "valid" | "error";
   tasks: Record<string, Task>;
   inputs: Record<string, Source>;
@@ -25,6 +28,8 @@ export function initial(session_id: string): State {
   return {
     session_id,
     evaluation: "unassessed",
+    visual_windows: {},
+    accepted_results: {},
     tasks: {},
     inputs: {},
     playback_closed: true,
@@ -45,9 +50,20 @@ function sameIdentity(a: Identity | undefined, b: Identity): boolean {
     && a.stimulus_revision === b.stimulus_revision;
 }
 
+export function identityKey(identity: Identity): string {
+  return JSON.stringify([identity.session_id, identity.input_turn_id, identity.input_order, identity.stimulus_revision]);
+}
+
 export function reduce(state: State, event: Event): State {
   if (state.dead || event.session_id !== state.session_id) return state;
-  if (state.seen[event.event_id] || event.producer_seq <= (state.seq[event.stream_id] ?? -1)) {
+  const payload = event.payload;
+  const closure = payload.type === "visual_window" && payload.fact.status === "closed"
+    ? { identity: payload.identity, fact: payload.fact, status: "error" as const }
+    : payload.type === "emotion" && payload.visual_window?.status === "closed"
+      ? { identity: payload.identity, fact: payload.visual_window, status: payload.status, label: payload.label }
+      : undefined;
+  const authoritativeClose = !!closure;
+  if (!authoritativeClose && (state.seen[event.event_id] || event.producer_seq <= (state.seq[event.stream_id] ?? -1))) {
     return state;
   }
 
@@ -56,7 +72,31 @@ export function reduce(state: State, event: Event): State {
     seen: { ...state.seen, [event.event_id]: true },
     seq: { ...state.seq, [event.stream_id]: event.producer_seq },
   };
-  const payload = event.payload;
+
+  if (authoritativeClose) {
+    if (!closure || closure.identity.session_id !== state.session_id) return state;
+    const { identity, fact } = closure;
+    const key = identityKey(identity);
+    const currentFact = state.visual_windows[key];
+    if (!currentFact || currentFact.owner !== fact.owner || currentFact.status !== "open"
+      || fact.decision_seq !== currentFact.decision_seq + 1) return state;
+    const visual_windows = { ...state.visual_windows, [key]: fact };
+    const isCurrent = sameIdentity(state.current, identity);
+    const seq = Math.max(state.seq[event.stream_id] ?? -1, event.producer_seq);
+    const diagnosticStatus = closure.status;
+    const diagnosticLabel = "label" in closure ? closure.label : undefined;
+    return { ...next, seq: { ...next.seq, [event.stream_id]: seq }, visual_windows,
+      evaluation: isCurrent ? "error" : state.evaluation,
+      last_diagnostic: { identity, status: diagnosticStatus, label: diagnosticLabel, accepted: false, reason: fact.reason } };
+  }
+
+  if (payload.type === "visual_window") {
+    const key = identityKey(payload.identity);
+    const existing = state.visual_windows[key];
+    if (!existing || existing.owner !== payload.fact.owner || existing.status !== "open"
+      || payload.fact.status !== "accepted" || payload.fact.decision_seq !== existing.decision_seq + 1) return state;
+    return { ...next, visual_windows: { ...state.visual_windows, [key]: payload.fact } };
+  }
 
   if (payload.type === "input_committed") {
     const current = state.current;
@@ -71,24 +111,47 @@ export function reduce(state: State, event: Event): State {
     if (incoming.session_id !== state.session_id || isOlder) {
       return { ...next, reason: "拒绝旧输入或相同版本重复提交" };
     }
-    return { ...next, current: incoming, evaluation: "pending", reason: "已接纳新输入" };
+    const key = identityKey(incoming);
+    const owner = payload.visual_owner ?? "local";
+    return { ...next, current: incoming, evaluation: "pending",
+      visual_windows: { ...state.visual_windows, [key]: state.visual_windows[key] ?? { status: "open", owner, decision_seq: 0 } },
+      reason: "已接纳新输入" };
   }
 
   if (payload.type === "emotion") {
+    const key = identityKey(payload.identity);
+    const fact = payload.visual_window;
+    const currentFact = state.visual_windows[key];
     if (!sameIdentity(state.current, payload.identity) || payload.wordset_version !== WORDSET_VERSION) {
       return { ...next, reason: "拒绝情绪归属或词表版本不匹配" };
     }
-    if (payload.status === "valid" && isEmotion(payload.label)) {
+    if (payload.status === "valid" && isEmotion(payload.label) && fact?.status === "accepted"
+      && currentFact !== undefined && currentFact.owner === fact.owner
+      && ((currentFact.status === "open" && fact.decision_seq === currentFact.decision_seq + 1)
+        || (currentFact.status === "accepted" && fact.decision_seq === currentFact.decision_seq))) {
+      const previouslyAccepted = state.accepted_results[key];
+      if (currentFact.status === "accepted" && previouslyAccepted) {
+        const sameResult = previouslyAccepted.label === payload.label && previouslyAccepted.source === payload.source;
+        return { ...next, last_diagnostic: { identity: payload.identity, status: "valid", label: payload.label,
+          accepted: false, reason: sameResult ? "重复结果" : "已裁定结果不可替换" } };
+      }
       return {
         ...next,
+        visual_windows: { ...state.visual_windows, [key]: fact },
+        accepted_results: { ...state.accepted_results, [key]: { label: payload.label, source: payload.source } },
         last_valid: { label: payload.label, identity: payload.identity, source: payload.source },
         evaluation: "valid",
+        last_diagnostic: { identity: payload.identity, status: "valid", label: payload.label, accepted: true },
         reason: "已接纳合法情绪",
       };
     }
+    if (currentFact?.status === "accepted") return { ...next, last_diagnostic: { identity: payload.identity,
+      status: payload.status, accepted: false, reason: "视觉资格已终结" } };
+    if (currentFact?.status === "closed") return { ...next, last_diagnostic: { identity: payload.identity, status: payload.status, accepted: false, reason: payload.reason } };
     return {
       ...next,
       evaluation: payload.status === "pending" ? "pending" : "error",
+      last_diagnostic: { identity: payload.identity, status: payload.status, accepted: false, reason: payload.reason },
       reason: payload.reason ?? "本次评估失败；保留最近有效情绪",
     };
   }

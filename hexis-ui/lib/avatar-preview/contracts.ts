@@ -35,6 +35,16 @@ export type Identity = {
   stimulus_revision: number;
 };
 
+export type VisualWindowOwner = "local" | "service";
+export type VisualWindowStatus = "open" | "accepted" | "closed";
+export type VisualWindowReason = "model_timeout" | "total_deadline";
+export type VisualWindowFact = {
+  status: VisualWindowStatus;
+  owner: VisualWindowOwner;
+  decision_seq: number;
+  reason?: VisualWindowReason;
+};
+
 export type Source = "manual" | "simulated" | "real";
 export type TaskPhase =
   | "queued"
@@ -66,7 +76,7 @@ export type Playback = {
 };
 
 export type Payload =
-  | { type: "input_committed"; identity: Identity }
+  | { type: "input_committed"; identity: Identity; visual_owner?: VisualWindowOwner }
   | {
       type: "emotion";
       identity: Identity;
@@ -75,7 +85,9 @@ export type Payload =
       label?: Emotion;
       source: Source;
       reason?: string;
+      visual_window?: VisualWindowFact;
     }
+  | { type: "visual_window"; identity: Identity; fact: VisualWindowFact }
   | { type: "input_activity"; activity_id: string; speaking: boolean; source: Source }
   | { type: "task"; task: Task }
   | { type: "playback_open"; playback_id: string; output_epoch: number; source: Source }

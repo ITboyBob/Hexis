@@ -34,6 +34,14 @@ CONTEXT_KEYS = ("identity", "worldview", "goals", "relationships")
 WORDSET_VERSION = "v1"
 
 
+class InvalidEmotionLabel(ValueError):
+    """An exact machine response that does not match the closed emotion set."""
+
+    def __init__(self, raw_business_value: Any) -> None:
+        super().__init__("模型业务内容不是一个精确的 v1 情绪标签")
+        self.raw_business_value = raw_business_value
+
+
 def select_context(raw: Any) -> dict[str, Any]:
     """Decode context and return only the four approved categories."""
     value = json.loads(raw) if isinstance(raw, str) else raw
@@ -45,7 +53,7 @@ def select_context(raw: Any) -> dict[str, Any]:
 def validate_label(content: Any) -> str:
     """Accept only one exact machine label; do not normalize or parse aliases."""
     if not isinstance(content, str) or content not in EMOTIONS:
-        raise ValueError("模型未返回一个精确的 v1 情绪标签")
+        raise InvalidEmotionLabel(content)
     return content
 
 
@@ -77,19 +85,20 @@ async def evaluate(
     temperature = (
         inspect.signature(llm.chat_completion).parameters["temperature"].default
     )
-    response = await asyncio.wait_for(
-        completion(
-            provider=config["provider"],
-            model=config["model"],
-            endpoint=config["endpoint"],
-            api_key=config["resolved_api_key"],
-            messages=messages,
-            tools=None,
-            temperature=temperature,
-            response_format=None,
-        ),
-        timeout=config["timeout_seconds"],
+    request = completion(
+        provider=config["provider"],
+        model=config["model"],
+        endpoint=config["endpoint"],
+        api_key=config["resolved_api_key"],
+        messages=messages,
+        tools=None,
+        temperature=temperature,
+        response_format=None,
     )
+    if config.get("host_managed_timeout"):
+        response = await request
+    else:
+        response = await asyncio.wait_for(request, timeout=config["timeout_seconds"])
     if response.get("tool_calls"):
         raise ValueError("情绪输出不能包含工具调用")
     content = response.get("content")

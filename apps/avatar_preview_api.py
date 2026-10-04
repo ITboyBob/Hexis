@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import sys
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -127,15 +128,154 @@ async def _connect(dsn: str, *, timeout: float) -> asyncpg.Connection:
 
 
 def _consume_task_result(task: asyncio.Task[Any]) -> None:
-    if not task.cancelled():
-        task.exception()
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.warning(
+            "Avatar preview background cleanup failed error_type=%s",
+            type(error).__name__,
+        )
 
 
-def _remaining_timeout(deadline: float, stage_limit: float) -> float:
-    remaining = deadline - asyncio.get_running_loop().time()
-    if remaining <= 0:
-        raise asyncio.TimeoutError
-    return min(stage_limit, remaining)
+def _detach_task(
+    task: asyncio.Future[Any],
+    *,
+    on_result: Callable[[Any], None] | None = None,
+    on_error: Callable[[BaseException], None] | None = None,
+) -> None:
+    task.cancel()
+
+    def consume(done: asyncio.Future[Any]) -> None:
+        if done.cancelled():
+            return
+        try:
+            value = done.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            if on_error is not None:
+                try:
+                    on_error(exc)
+                except Exception as callback_error:
+                    logger.warning(
+                        "Avatar preview detached error handling failed error_type=%s",
+                        type(callback_error).__name__,
+                    )
+            else:
+                logger.warning(
+                    "Avatar preview detached operation failed error_type=%s",
+                    type(exc).__name__,
+                )
+            return
+        if on_result is not None:
+            try:
+                on_result(value)
+            except Exception as exc:
+                logger.warning(
+                    "Avatar preview detached result handling failed error_type=%s",
+                    type(exc).__name__,
+                )
+
+    task.add_done_callback(consume)
+
+
+def _late_connection_cleanup(connection: Any) -> None:
+    if _terminate_connection(connection):
+        return
+    close = getattr(connection, "close", None)
+    if close is None:
+        logger.warning("Avatar preview late connection has no cleanup method")
+        return
+    try:
+        task = asyncio.create_task(close())
+        task.add_done_callback(_consume_task_result)
+    except Exception as exc:
+        logger.warning(
+            "Avatar preview late connection close could not start error_type=%s",
+            type(exc).__name__,
+        )
+
+
+def _terminate_connection(connection: Any) -> bool:
+    terminate = getattr(connection, "terminate", None)
+    if terminate is None:
+        return False
+    try:
+        terminate()
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Avatar preview connection termination failed error_type=%s",
+            type(exc).__name__,
+        )
+        return False
+
+
+def _deadline_reason(
+    now: float, stage_deadline: float, total_deadline: float
+) -> str | None:
+    limiting_deadline = min(stage_deadline, total_deadline)
+    if now < limiting_deadline:
+        return None
+    return "total_deadline" if total_deadline <= stage_deadline else "stage_timeout"
+
+
+async def _await_until_deadline(
+    awaitable: Awaitable[Any],
+    *,
+    stage: str,
+    stage_deadline: float,
+    total_deadline: float,
+    cleanup_result: Callable[[Any], None] | None = None,
+    on_deadline_result: Callable[[Any], None] | None = None,
+    on_deadline_error: Callable[[BaseException], None] | None = None,
+) -> Any:
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(awaitable)
+
+    def timeout_failure(reason: str) -> EvaluationTimeout:
+        if stage == "model" and reason == "stage_timeout":
+            reason = "model_timeout"
+        closes_window = reason in {"model_timeout", "total_deadline"}
+        return EvaluationTimeout(
+            stage,
+            reason,
+            closes_window=closes_window,
+        )
+
+    while True:
+        reason = _deadline_reason(loop.time(), stage_deadline, total_deadline)
+        if reason is not None:
+            _detach_task(
+                task,
+                on_result=on_deadline_result or cleanup_result,
+                on_error=on_deadline_error,
+            )
+            raise timeout_failure(reason)
+        timeout = min(stage_deadline, total_deadline) - loop.time()
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=max(0, timeout))
+        except asyncio.CancelledError:
+            _detach_task(task, on_result=cleanup_result)
+            raise
+        reason = _deadline_reason(loop.time(), stage_deadline, total_deadline)
+        if reason is not None:
+            _detach_task(
+                task,
+                on_result=on_deadline_result or cleanup_result,
+                on_error=on_deadline_error,
+            )
+            raise timeout_failure(reason)
+        if done:
+            try:
+                return task.result()
+            except asyncio.TimeoutError as exc:
+                if stage.startswith("context_"):
+                    raise EvaluationTimeout(
+                        stage, "context_stage_timeout", closes_window=False
+                    ) from exc
+                raise
 
 
 def _identity_json(value: IdentityDTO | Mapping[str, Any]) -> dict[str, Any]:
@@ -208,6 +348,8 @@ class Evaluations:
                 "wordset_version": avatar_emotion.WORDSET_VERSION,
                 "emotion_source": "real",
                 "context_source": canonical["context_source"],
+                "visual_owner": "service",
+                "visual_window": _window_fact("open"),
             },
         )
         return await asyncio.shield(future)
@@ -252,6 +394,25 @@ class EvaluationFailure(Exception):
         self.cause = cause
 
 
+class EvaluationTimeout(Exception):
+    def __init__(self, stage: str, reason: str, *, closes_window: bool) -> None:
+        super().__init__(stage)
+        self.stage = stage
+        self.reason = reason
+        self.closes_window = closes_window
+
+
+def _window_fact(status: str, *, reason: str | None = None) -> dict[str, Any]:
+    fact: dict[str, Any] = {
+        "status": status,
+        "owner": "service",
+        "decision_seq": 0 if status == "open" else 1,
+    }
+    if reason is not None:
+        fact["reason"] = reason
+    return fact
+
+
 def _error_result(
     identity: Mapping[str, Any],
     context_source: str,
@@ -259,22 +420,31 @@ def _error_result(
     error_code: str,
     *,
     logical_call_count: int = 0,
+    visual_window: Mapping[str, Any] | None = None,
+    transport_status: str | None = None,
+    late_diagnostics: list[dict[str, Any]] | None = None,
+    cleanup_diagnostics: list[dict[str, Any]] | None = None,
+    raw_business_value: Any = None,
 ) -> dict[str, Any]:
     if error_code == "ConfigurationUnavailable":
         message = "所选模型凭据不可用；请检查配置中指定的环境变量。"
     elif error_code == "ContextSourceUnavailable":
         message = "所选上下文来源不可用；请选择已配置来源后用新输入重试。"
-    elif error_code == "TimeoutError":
+    elif error_code in {"ModelEvaluationTimeout", "TotalDeadlineExceeded"}:
         message = "本次评估超时，最近有效情绪保持不变；请检查服务与网络后用新输入重试。"
-    elif stage == "context":
+    elif error_code == "ContextStageTimeout":
+        message = (
+            "读取所选上下文超时；最近有效情绪保持不变，请检查上下文来源后用新输入重试。"
+        )
+    elif stage == "context" or stage.startswith("context_"):
         message = "所选上下文缺失或格式无效，最近有效情绪保持不变；请检查上下文来源后用新输入重试。"
-    elif error_code == "ValueError":
+    elif error_code == "ValueError" or error_code == "InvalidEmotionLabel":
         message = "模型结果不符合情绪标签协议，最近有效情绪保持不变；请检查诊断后用新输入重试。"
     else:
         message = (
             "本次评估失败，最近有效情绪保持不变；请检查所选配置与来源后用新输入重试。"
         )
-    return {
+    result = {
         "identity": dict(identity),
         "status": "error",
         "wordset_version": avatar_emotion.WORDSET_VERSION,
@@ -286,6 +456,18 @@ def _error_result(
         "transport_attempts": None,
         "message": message,
     }
+    if visual_window is not None:
+        result["visual_window"] = dict(visual_window)
+    if transport_status is not None:
+        result["transport_status"] = transport_status
+    if late_diagnostics is not None:
+        result["late_diagnostics"] = late_diagnostics
+    if cleanup_diagnostics is not None:
+        result["cleanup_diagnostics"] = cleanup_diagnostics
+    if error_code == "InvalidEmotionLabel":
+        result["raw_business_value"] = raw_business_value
+        result["rejection_reason"] = "not_exact_v1_emotion_label"
+    return result
 
 
 async def run_evaluation(
@@ -302,8 +484,10 @@ async def run_evaluation(
     context_source = canonical["context_source"]
     stage = "configuration"
     model_started = False
+    late_diagnostics: list[dict[str, Any]] = []
+    cleanup_diagnostics: list[dict[str, Any]] = []
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + (config.total_timeout_seconds if config else 1)
+    total_deadline = loop.time() + (config.total_timeout_seconds if config else 1)
 
     if config is None:
         return _error_result(
@@ -329,9 +513,14 @@ async def run_evaluation(
                         "Selected database DSN environment variable is unavailable"
                     ),
                 )
-            connection = await asyncio.wait_for(
+            stage = "context_connect"
+            connect_deadline = loop.time() + config.timeout_seconds
+            connection = await _await_until_deadline(
                 conn_factory(resolved_db_dsn, timeout=config.timeout_seconds),
-                timeout=_remaining_timeout(deadline, config.timeout_seconds),
+                stage=stage,
+                stage_deadline=connect_deadline,
+                total_deadline=total_deadline,
+                cleanup_result=_late_connection_cleanup,
             )
             cancelled_during_read = False
             try:
@@ -340,66 +529,186 @@ async def run_evaluation(
                     async with connection.transaction(readonly=True):
                         return await avatar_emotion.read_db_context(connection)
 
-                context = await asyncio.wait_for(
+                stage = "context_read"
+                read_deadline = loop.time() + config.timeout_seconds
+                context = await _await_until_deadline(
                     read_context(),
-                    timeout=_remaining_timeout(deadline, config.timeout_seconds),
+                    stage=stage,
+                    stage_deadline=read_deadline,
+                    total_deadline=total_deadline,
                 )
             except asyncio.CancelledError:
                 cancelled_during_read = True
                 raise
             finally:
+                original_exception = sys.exc_info()[1]
+                original_stage = stage
+                stage = "context_close"
+                close_deadline = loop.time() + config.timeout_seconds
                 close_task = asyncio.create_task(connection.close())
-                remaining = min(config.timeout_seconds, deadline - loop.time())
-                if cancelled_during_read:
-                    await asyncio.sleep(0)
-                    if not close_task.done():
-                        close_task.cancel()
-                        close_task.add_done_callback(_consume_task_result)
-                        connection.terminate()
+                try:
+                    if cancelled_during_read:
+                        await asyncio.sleep(0)
+                        if not close_task.done():
+                            close_task.cancel()
+                            close_task.add_done_callback(_consume_task_result)
+                            _terminate_connection(connection)
+                        else:
+                            close_task.result()
                     else:
-                        close_task.result()
-                else:
-                    try:
-                        done, pending = await asyncio.wait(
-                            {close_task}, timeout=max(0, remaining)
+                        if loop.time() >= total_deadline:
+                            await asyncio.sleep(0)
+                            if not close_task.done():
+                                close_task.cancel()
+                                close_task.add_done_callback(_consume_task_result)
+                                _terminate_connection(connection)
+                            else:
+                                _consume_task_result(close_task)
+                            failure_stage = (
+                                original_exception.stage
+                                if isinstance(original_exception, EvaluationTimeout)
+                                and original_exception.reason == "total_deadline"
+                                else stage
+                            )
+                            raise EvaluationTimeout(
+                                failure_stage, "total_deadline", closes_window=True
+                            )
+                        await _await_until_deadline(
+                            close_task,
+                            stage=stage,
+                            stage_deadline=close_deadline,
+                            total_deadline=total_deadline,
                         )
-                    except asyncio.CancelledError:
-                        close_task.cancel()
-                        close_task.add_done_callback(_consume_task_result)
-                        connection.terminate()
+                except BaseException as cleanup_error:
+                    cleanup_diagnostics.append(
+                        {
+                            "stage": "context_close",
+                            "error_type": type(cleanup_error).__name__,
+                        }
+                    )
+                    logger.warning(
+                        "Avatar preview DB cleanup failed stage=context_close error_type=%s",
+                        type(cleanup_error).__name__,
+                    )
+                    _terminate_connection(connection)
+                    if isinstance(cleanup_error, asyncio.CancelledError):
                         raise
-                    if pending:
-                        close_task.cancel()
-                        close_task.add_done_callback(_consume_task_result)
-                        connection.terminate()
-                        raise asyncio.TimeoutError
-                    elif close_task.exception() is not None:
-                        raise close_task.exception()
+                    if original_exception is not None and not (
+                        isinstance(cleanup_error, EvaluationTimeout)
+                        and cleanup_error.reason == "total_deadline"
+                    ):
+                        stage = original_stage
+                        raise original_exception.with_traceback(
+                            original_exception.__traceback__
+                        )
+                    raise
+                if original_exception is not None:
+                    stage = original_stage
 
-        if deadline - loop.time() <= 0:
-            raise asyncio.TimeoutError
+        if loop.time() >= total_deadline:
+            raise EvaluationTimeout(stage, "total_deadline", closes_window=True)
         stage = "model"
         model_started = True
+        model_deadline = loop.time() + config.timeout_seconds
         llm_config = {
             "provider": config.provider,
             "model": config.model,
             "endpoint": config.endpoint,
             "resolved_api_key": api_key,
             "timeout_seconds": config.timeout_seconds,
+            "host_managed_timeout": True,
         }
-        result = await evaluator(canonical["message"], context, llm_config)
+
+        def record_late_result(value: Any) -> None:
+            if not isinstance(value, Mapping):
+                return
+            diagnostic: dict[str, Any] = {
+                "identity": identity,
+                "status": "valid" if isinstance(value.get("label"), str) else "error",
+                "accepted": False,
+            }
+            if "label" in value:
+                diagnostic["label"] = value["label"]
+            if "raw_business_value" in value:
+                diagnostic["raw_business_value"] = value["raw_business_value"]
+            late_diagnostics.append(diagnostic)
+
+        def record_late_error(error: BaseException) -> None:
+            diagnostic: dict[str, Any] = {
+                "identity": identity,
+                "status": "error",
+                "accepted": False,
+                "error_type": type(error).__name__,
+            }
+            if not isinstance(error, avatar_emotion.InvalidEmotionLabel):
+                late_diagnostics.append(diagnostic)
+                logger.warning(
+                    "Avatar preview detached model operation failed error_type=%s",
+                    type(error).__name__,
+                )
+                return
+            diagnostic["raw_business_value"] = error.raw_business_value
+            diagnostic["rejection_reason"] = "not_exact_v1_emotion_label"
+            late_diagnostics.append(diagnostic)
+
+        result = await _await_until_deadline(
+            evaluator(canonical["message"], context, llm_config),
+            stage="model",
+            stage_deadline=model_deadline,
+            total_deadline=total_deadline,
+            on_deadline_result=record_late_result,
+            on_deadline_error=record_late_error,
+        )
+        expired = _deadline_reason(loop.time(), model_deadline, total_deadline)
+        if expired is not None:
+            raise EvaluationTimeout(
+                "model",
+                expired if expired == "total_deadline" else "model_timeout",
+                closes_window=True,
+            )
         return {
             "identity": identity,
             **result,
             "status": "valid",
             "emotion_source": "real",
             "context_source": context_source,
+            "visual_window": _window_fact("accepted"),
         }
 
     try:
-        return await asyncio.wait_for(perform(), timeout=config.total_timeout_seconds)
+        return await perform()
     except asyncio.CancelledError:
         raise
+    except EvaluationTimeout as failure:
+        logger.warning(
+            "Avatar preview evaluation failed stage=%s error_type=%s",
+            failure.stage,
+            type(failure).__name__,
+        )
+        code = (
+            "TotalDeadlineExceeded"
+            if failure.reason == "total_deadline"
+            else (
+                "ModelEvaluationTimeout"
+                if failure.reason == "model_timeout"
+                else "ContextStageTimeout"
+            )
+        )
+        return _error_result(
+            identity,
+            context_source,
+            failure.stage,
+            code,
+            logical_call_count=int(model_started),
+            visual_window=(
+                _window_fact("closed", reason=failure.reason)
+                if failure.closes_window
+                else None
+            ),
+            transport_status="unknown" if model_started else None,
+            late_diagnostics=late_diagnostics if model_started else None,
+            cleanup_diagnostics=cleanup_diagnostics or None,
+        )
     except asyncio.TimeoutError:
         logger.warning(
             "Avatar preview evaluation failed stage=%s error_type=TimeoutError", stage
@@ -410,6 +719,9 @@ async def run_evaluation(
             stage,
             "TimeoutError",
             logical_call_count=int(model_started),
+            transport_status="unknown" if model_started else None,
+            late_diagnostics=late_diagnostics if model_started else None,
+            cleanup_diagnostics=cleanup_diagnostics or None,
         )
     except EvaluationFailure as failure:
         logger.warning(
@@ -422,19 +734,28 @@ async def run_evaluation(
             if failure.stage == "configuration"
             else "ContextSourceUnavailable"
         )
-        return _error_result(identity, context_source, failure.stage, code)
+        return _error_result(
+            identity,
+            context_source,
+            failure.stage,
+            code,
+            cleanup_diagnostics=cleanup_diagnostics or None,
+        )
     except Exception as exc:
         logger.warning(
             "Avatar preview evaluation failed stage=%s error_type=%s",
             stage,
             type(exc).__name__,
         )
+        invalid = isinstance(exc, avatar_emotion.InvalidEmotionLabel)
         return _error_result(
             identity,
             context_source,
             stage,
             type(exc).__name__,
             logical_call_count=int(model_started),
+            raw_business_value=exc.raw_business_value if invalid else None,
+            cleanup_diagnostics=cleanup_diagnostics or None,
         )
 
 

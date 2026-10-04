@@ -208,3 +208,24 @@ async def test_evaluate_timeout_is_one_failed_logical_operation():
     with pytest.raises(asyncio.TimeoutError):
         await evaluate("问题", BASE_CONTEXT, config, call=blocked_call)
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_host_managed_timeout_branch_does_not_start_a_nested_deadline():
+    started = asyncio.Event()
+
+    async def slow_call(**_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+        return {"content": "happy"}
+
+    config = {**CONFIG, "timeout_seconds": 0.01, "host_managed_timeout": True}
+    task = asyncio.create_task(
+        avatar_emotion.evaluate("问题", BASE_CONTEXT, config, call=slow_call)
+    )
+    await started.wait()
+    await asyncio.sleep(0.02)
+    assert not task.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

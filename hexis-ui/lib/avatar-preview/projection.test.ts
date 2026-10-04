@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { activeTasks, attention, initial, reduce } from "./projection";
+import { activeTasks, attention, identityKey, initial, reduce } from "./projection";
 import type { Event, Identity, Payload, Task } from "./contracts";
 
 const identity = (input_order: number, stimulus_revision = 1): Identity => ({
@@ -16,7 +16,9 @@ const makeStream = (stream_id: string) => {
     session_id,
     stream_id,
     producer_seq: seq,
-    payload,
+    payload: payload.type === "emotion" && payload.status === "valid" && !payload.visual_window
+      ? { ...payload, visual_window: { status: "accepted", owner: "local", decision_seq: 1 } }
+      : payload,
   });
 };
 
@@ -199,13 +201,13 @@ describe("异步状态投影", () => {
     state = reduce(state, send({
       type: "emotion", identity: current, wordset_version: "v1", status: "pending", source: "real",
     }));
-    expect(state.evaluation).toBe("pending");
+    expect(state.evaluation).toBe("valid");
     expect(state.last_valid?.label).toBe("happy");
     state = reduce(state, send({
       type: "emotion", identity: current, wordset_version: "v1", status: "valid",
       label: "joy" as never, source: "real",
     }));
-    expect(state.evaluation).toBe("error");
+    expect(state.evaluation).toBe("valid");
     expect(state.last_valid?.label).toBe("happy");
     state = reduce(state, send({
       type: "emotion", identity: current, wordset_version: "v2", status: "valid",
@@ -271,5 +273,183 @@ describe("异步状态投影", () => {
     expect(attention(state)).toBe("idle");
     state = reduce(state, send({ type: "task", task: task("background", "running", false) }));
     expect(attention(state)).toBe("idle");
+  });
+
+  it("closes complete-identity visual eligibility on timeout and treats late valid as diagnostic", () => {
+    const send = makeStream("projection");
+    let state = initial("session-a");
+    const prior = identity(4, 1);
+    const current = identity(5, 1);
+    state = reduce(state, send({ type: "input_committed", identity: prior, visual_owner: "local" } as never));
+    state = reduce(state, send({
+      type: "emotion", identity: prior, wordset_version: "v1", status: "valid", label: "sad", source: "real",
+      visual_window: { status: "accepted", owner: "local", decision_seq: 1 },
+    } as never));
+    state = reduce(state, send({ type: "input_committed", identity: current, visual_owner: "local" } as never));
+
+    const timeoutValid: Event = {
+      event_id: "late-valid-first",
+      session_id: "session-a",
+      stream_id: "emotion-result",
+      producer_seq: 0,
+      payload: {
+        type: "emotion", identity: current, wordset_version: "v1", status: "valid",
+        label: "angry", source: "real",
+        visual_window: { status: "closed", owner: "local", decision_seq: 1, reason: "model_timeout" },
+      },
+    };
+    state = reduce(state, timeoutValid);
+    const afterLatePending = reduce(state, {
+      ...timeoutValid,
+      event_id: "late-pending",
+      stream_id: "query",
+      payload: {
+        type: "emotion", identity: current, wordset_version: "v1", status: "pending", source: "real",
+        visual_window: { status: "open", owner: "local", decision_seq: 0 },
+      },
+    } as never);
+
+    expect(state.last_valid?.label).toBe("sad");
+    expect(state.evaluation).toBe("error");
+    expect(state.visual_windows?.[identityKey(current)]).toMatchObject({
+      status: "closed", owner: "local", reason: "model_timeout",
+    });
+    expect(state.last_diagnostic).toMatchObject({ status: "valid", label: "angry", accepted: false });
+    expect(afterLatePending.evaluation).toBe("error");
+    expect(afterLatePending.last_valid?.label).toBe("sad");
+  });
+
+  it("does not let producer sequence filtering swallow a closed fact or let it cross identities", () => {
+    const send = makeStream("projection");
+    let state = initial("session-a");
+    const oldIdentity = identity(1, 1);
+    const current = identity(2, 1);
+    state = reduce(state, send({ type: "input_committed", identity: oldIdentity, visual_owner: "service" } as never));
+    state = reduce(state, send({ type: "input_committed", identity: current, visual_owner: "service" } as never));
+    state = reduce(state, {
+      event_id: "stream-newer",
+      session_id: "session-a",
+      stream_id: "deadline",
+      producer_seq: 5,
+      payload: { type: "emotion", identity: oldIdentity, wordset_version: "v1", status: "error", source: "real" },
+    } as never);
+    state = reduce(state, {
+      event_id: "close-stale-stream-seq",
+      session_id: "session-a",
+      stream_id: "deadline",
+      producer_seq: 1,
+      payload: {
+        type: "visual_window", identity: current,
+        fact: { status: "closed", owner: "service", decision_seq: 1, reason: "total_deadline" },
+      },
+    } as never);
+    const reset = reduce(state, send({ type: "control", action: "reset" }));
+    const reduced = reduce(reset, send({ type: "control", action: "reduced_motion", enabled: true }));
+    const revised = { ...current, stimulus_revision: current.stimulus_revision + 1 };
+    const afterRevision = reduce(reduced, send({ type: "input_committed", identity: revised, visual_owner: "service" } as never));
+
+    expect(state.visual_windows?.[identityKey(current)]?.status).toBe("closed");
+    expect(state.visual_windows?.[identityKey(oldIdentity)]?.status).toBe("open");
+    expect(reduced.visual_windows?.[identityKey(current)]?.status).toBe("closed");
+    expect(afterRevision.visual_windows?.[identityKey(revised)]?.status).toBe("open");
+    expect(afterRevision.current).toEqual(revised);
+    const staleOrdinary = reduce(state, {
+      event_id: "older-ordinary-after-close", session_id: "session-a", stream_id: "deadline", producer_seq: 4,
+      payload: { type: "task", task: task("stale", "running") },
+    });
+    expect(staleOrdinary.tasks.stale).toBeUndefined();
+  });
+
+  it.each(["error", "pending"] as const)("首次收到 %s + closed 仍执行权威闭窗", (status) => {
+    const send = makeStream("projection");
+    const current = identity(1);
+    let state = reduce(initial("session-a"), send({ type: "input_committed", identity: current }));
+    state = reduce(state, { event_id: `first-${status}`, session_id: "session-a", stream_id: "late", producer_seq: 0,
+      payload: { type: "emotion", identity: current, wordset_version: "v1", status, source: "real",
+        visual_window: { status: "closed", owner: "local", decision_seq: 1, reason: "total_deadline" } } });
+    expect(state.visual_windows[identityKey(current)]).toMatchObject({ status: "closed", decision_seq: 1 });
+    expect(state.evaluation).toBe("error");
+    expect(state.last_valid).toBeUndefined();
+  });
+
+  it("keeps accepted terminal against a late timeout and does not bind a new owner", () => {
+    const send = makeStream("projection");
+    let state = initial("session-a");
+    const current = identity(1, 1);
+    state = reduce(state, send({ type: "input_committed", identity: current, visual_owner: "local" } as never));
+    state = reduce(state, send({
+      type: "emotion", identity: current, wordset_version: "v1", status: "valid", label: "curious", source: "manual",
+      visual_window: { status: "accepted", owner: "local", decision_seq: 1 },
+    } as never));
+    const afterLateClose = reduce(state, {
+      event_id: "late-timer",
+      session_id: "session-a",
+      stream_id: "timeout",
+      producer_seq: 0,
+      payload: {
+        type: "visual_window", identity: current,
+        fact: { status: "closed", owner: "local", decision_seq: 2, reason: "model_timeout" },
+      },
+    } as never);
+    const wrongOwner = reduce(state, {
+      event_id: "other-owner",
+      session_id: "session-a",
+      stream_id: "service",
+      producer_seq: 0,
+      payload: {
+        type: "emotion", identity: current, wordset_version: "v1", status: "valid", label: "sad", source: "real",
+        visual_window: { status: "accepted", owner: "service", decision_seq: 99 },
+      },
+    } as never);
+
+    expect(afterLateClose.visual_windows?.[identityKey(current)]?.status).toBe("accepted");
+    expect(afterLateClose.last_valid?.label).toBe("curious");
+    expect(wrongOwner.last_valid?.label).toBe("curious");
+  });
+
+  it("accepted同身份重复标签幂等，但不同业务结果不能替换首次裁定", () => {
+    const send = makeStream("projection");
+    const current = identity(1);
+    let state = initial("session-a");
+    state = reduce(state, send({ type: "input_committed", identity: current }));
+    state = reduce(state, send({ type: "emotion", identity: current, wordset_version: "v1", status: "valid",
+      label: "curious", source: "real", visual_window: { status: "accepted", owner: "local", decision_seq: 1 } }));
+    const first = state.last_valid;
+    state = reduce(state, send({ type: "emotion", identity: current, wordset_version: "v1", status: "valid",
+      label: "curious", source: "real", visual_window: { status: "accepted", owner: "local", decision_seq: 1 } }));
+    expect(state.last_valid).toEqual(first);
+    state = reduce(state, send({ type: "emotion", identity: current, wordset_version: "v1", status: "valid",
+      label: "sad", source: "real", visual_window: { status: "accepted", owner: "local", decision_seq: 1 } }));
+    expect(state.last_valid).toEqual(first);
+    expect(state.last_diagnostic).toMatchObject({ accepted: false, reason: "已裁定结果不可替换" });
+  });
+
+  it("accepted通知先到时只允许首个同裁定结果填入一次", () => {
+    const send = makeStream("projection");
+    const current = identity(1);
+    let state = reduce(initial("session-a"), send({ type: "input_committed", identity: current }));
+    state = reduce(state, send({ type: "visual_window", identity: current,
+      fact: { status: "accepted", owner: "local", decision_seq: 1 } }));
+    state = reduce(state, send({ type: "emotion", identity: current, wordset_version: "v1", status: "valid",
+      label: "happy", source: "real", visual_window: { status: "accepted", owner: "local", decision_seq: 1 } }));
+    const first = state.last_valid;
+    state = reduce(state, send({ type: "emotion", identity: current, wordset_version: "v1", status: "valid",
+      label: "sad", source: "real", visual_window: { status: "accepted", owner: "local", decision_seq: 1 } }));
+    expect(state.last_valid).toEqual(first);
+    expect(state.last_diagnostic).toMatchObject({ accepted: false, reason: "已裁定结果不可替换" });
+  });
+
+  it("embedded close sequence必须是open后的下一序号", () => {
+    const send = makeStream("projection");
+    const current = identity(1);
+    let state = reduce(initial("session-a"), send({ type: "input_committed", identity: current }));
+    const rejected = reduce(state, { event_id: "bad-seq-close", session_id: "session-a", stream_id: "result", producer_seq: 0,
+      payload: { type: "emotion", identity: current, wordset_version: "v1", status: "error", source: "real",
+        visual_window: { status: "closed", owner: "local", decision_seq: 9, reason: "model_timeout" } } });
+    expect(rejected.visual_windows[identityKey(current)]?.status).toBe("open");
+    state = reduce(state, { event_id: "good-seq-close", session_id: "session-a", stream_id: "result", producer_seq: 0,
+      payload: { type: "emotion", identity: current, wordset_version: "v1", status: "error", source: "real",
+        visual_window: { status: "closed", owner: "local", decision_seq: 1, reason: "model_timeout" } } });
+    expect(state.visual_windows[identityKey(current)]?.status).toBe("closed");
   });
 });

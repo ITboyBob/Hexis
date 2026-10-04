@@ -1,0 +1,55 @@
+{
+  "repository": "https://github.com/blessonism/grok-icon-study",
+  "commit": "647e9bd7c60290c42a738fad586589b3f36a4680",
+  "source_directory": "replica",
+  "files": {
+    "geometry-data.js": {
+      "source_path": "replica/geometry-data.js",
+      "upstream_sha256": "ef9ed55e5d4c6ce3212c34a67d3e322211d8c772c2598d86096ea5c861319225",
+      "adapted_sha256": "ef9ed55e5d4c6ce3212c34a67d3e322211d8c772c2598d86096ea5c861319225",
+      "adapted": false
+    },
+    "math.js": {
+      "source_path": "replica/src/math.js",
+      "upstream_sha256": "1e298d552c5287c8aef9a3e76926f4bd45f3e3813f730d59d1009052fd0dd710",
+      "adapted_sha256": "1e298d552c5287c8aef9a3e76926f4bd45f3e3813f730d59d1009052fd0dd710",
+      "adapted": false
+    },
+    "tables.js": {
+      "source_path": "replica/src/tables.js",
+      "upstream_sha256": "ab1a6ce2aeaf13fbc2489fec1bbe10e8f27a55b7d96f32ec949c5425d9d92be3",
+      "adapted_sha256": "ab1a6ce2aeaf13fbc2489fec1bbe10e8f27a55b7d96f32ec949c5425d9d92be3",
+      "adapted": false
+    },
+    "pose.js": {
+      "source_path": "replica/src/pose.js",
+      "upstream_sha256": "12e9893b9b369c5fe5f28775f736e7d3659ad4567890fc709ad346e61170dac7",
+      "adapted_sha256": "12e9893b9b369c5fe5f28775f736e7d3659ad4567890fc709ad346e61170dac7",
+      "adapted": false
+    },
+    "tricks.js": {
+      "source_path": "replica/src/tricks.js",
+      "upstream_sha256": "621de780502f221be27054f88098e169b06497983d02ccafceac72fffd279db7",
+      "adapted_sha256": "621de780502f221be27054f88098e169b06497983d02ccafceac72fffd279db7",
+      "adapted": false
+    },
+    "fx.js": {
+      "source_path": "replica/src/fx.js",
+      "upstream_sha256": "976e70d51beeed743b56f4a5cacb118a398204fc3dbc223e9f668a14f7a28418",
+      "adapted_sha256": "976e70d51beeed743b56f4a5cacb118a398204fc3dbc223e9f668a14f7a28418",
+      "adapted": false
+    },
+    "eyes.js": {
+      "source_path": "replica/src/eyes.js",
+      "upstream_sha256": "f3ae7b8ae8fd4da587996b7f40c026ad8fac2a48ebea6bae0ac09ca9a8bdff1e",
+      "adapted_sha256": "f3ae7b8ae8fd4da587996b7f40c026ad8fac2a48ebea6bae0ac09ca9a8bdff1e",
+      "adapted": false
+    },
+    "character.js": {
+      "source_path": "replica/src/character.js",
+      "upstream_sha256": "7f01ded5e21d6977653ceed645574be66b2dd44f809acda89fdeed0b0cb2b154",
+      "adapted_sha256": "e57f33491345f624bb385ce4d9c74148620969f7e4717fda7eff165583eec2f1",
+      "adapted": true
+    }
+  }
+}
