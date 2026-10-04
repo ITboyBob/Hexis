@@ -135,6 +135,7 @@ export function eventReceipt(state: State, event: Event): EventReceipt {
     const feedback = payload.feedback;
     return current && !state.playback_closed && current.playback_id === feedback.playback_id
       && current.output_epoch === feedback.output_epoch
+      && current.source === feedback.source
       ? { accepted: true, reason: "播放反馈已记录" }
       : { accepted: false, reason: "拒绝旧播放反馈" };
   }
@@ -293,6 +294,7 @@ export function reduce(state: State, event: Event): State {
       || state.playback_closed
       || active.playback_id !== feedback.playback_id
       || active.output_epoch !== feedback.output_epoch
+      || active.source !== feedback.source
     ) {
       return { ...next, reason: "拒绝旧播放反馈" };
     }

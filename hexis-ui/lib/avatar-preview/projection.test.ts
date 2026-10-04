@@ -190,6 +190,18 @@ describe("异步状态投影", () => {
     expect(afterOtherSession.playback?.playback_id).toBe("p2");
   });
 
+  it("拒绝模拟来源伪造当前真实播放器epoch", () => {
+    const send = makeStream("player");
+    let state = initial("session-a");
+    state = reduce(state, send({ type: "playback_open", playback_id: "real-1", output_epoch: 1, source: "real" }));
+    const forged = send({ type: "playback", feedback: {
+      playback_id: "real-1", output_epoch: 1, phase: "playing", progress: 2, amplitude: 1, source: "simulated",
+    } });
+    expect(eventReceipt(state, forged).accepted).toBe(false);
+    const next = reduce(state, forged);
+    expect(next.playback).toMatchObject({ playback_id: "real-1", phase: "buffering", source: "real" });
+  });
+
   it("does_not_compare_sequences_across_streams", () => {
     const emotion = makeStream("emotion");
     const tasks = makeStream("tasks");

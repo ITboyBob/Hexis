@@ -1,5 +1,5 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Avatar } from "./avatar";
 import Page from "./page";
 
@@ -18,6 +18,7 @@ async function renderPage() {
 
 describe("独立 Avatar 预览页面", () => {
   beforeEach(() => vi.mocked(Avatar).mockClear());
+  afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
   it("区分未评估与合法neutral，并展示全部14项中文语义标签", async () => {
     await renderPage();
@@ -85,6 +86,174 @@ describe("独立 Avatar 预览页面", () => {
     expect(screen.getByText(/需显式配置预览服务/)).toBeInTheDocument();
     expect(fetchSpy).not.toHaveBeenCalled();
     fetchSpy.mockRestore();
+  });
+
+  it("真实POST成功后以服务端身份和来源事实更新标签并显示实际计数", async () => {
+    let exported: Blob | undefined;
+    const createObjectURL = vi.fn((blob: Blob) => { exported = blob; return "blob:service-evidence"; });
+    vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL: vi.fn() });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    const fetcher = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const request = init?.body ? JSON.parse(String(init.body)) : JSON.parse(String(fetcher.mock.calls[0][1]?.body));
+      return Response.json({ identity: request.identity, status: "valid", label: "curious", raw_business_value: "curious",
+        wordset_version: "v1", emotion_source: "real", context_source: request.context_source,
+        logical_call_count: 1, transport_attempts: null,
+        visual_window: { status: "accepted", owner: "service", decision_seq: 1 } });
+    });
+    vi.stubGlobal("fetch", fetcher);
+    await renderPage();
+    fireEvent.change(screen.getByLabelText("消息文本"), { target: { value: "这次请求只发一次" } });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "使用合成fixture评估（真实服务）" })); });
+    await waitFor(() => expect(screen.getByTestId("emotion-current")).toHaveTextContent("curious"));
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(fetcher.mock.calls.filter((call) => call[1]?.method === "POST")).toHaveLength(1);
+    expect(fetcher.mock.calls[0][0]).toBe("/api/avatar-preview/evaluate");
+    expect(screen.getByTestId("visual-qualification")).toHaveTextContent("accepted");
+    expect(screen.getByTestId("emotion-origin")).toHaveTextContent("原输入来源 fixture；逻辑调用 1；传输尝试 未知");
+    const acceptedReason = screen.getByTestId("evaluation-status").textContent;
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "查询原评估（不重放）" })); });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId("emotion-current")).toHaveTextContent("curious");
+    expect(screen.getByTestId("evaluation-status").textContent).toBe(acceptedReason);
+    expect(screen.getByTestId("diagnostics")).toHaveTextContent("原结果已接纳；此查询仅诊断");
+    fireEvent.click(screen.getByRole("button", { name: "导出来源轨迹" }));
+    expect(createObjectURL).toHaveBeenCalledOnce();
+    expect(click).toHaveBeenCalledOnce();
+    const exportedText = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(reader.error ?? new Error("导出Blob读取失败"));
+      reader.onload = () => resolve(String(reader.result));
+      reader.readAsText(exported!);
+    });
+    const evidence = JSON.parse(exportedText);
+    expect(evidence.source_mode).toContain("真实情绪服务上下文:fixture");
+    expect(evidence.service_results).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        context_source: "fixture",
+        logical_call_count: 1,
+        transport_attempts: null,
+        visual_window: { status: "accepted", owner: "service", decision_seq: 1 },
+      }),
+    ]));
+  });
+
+  it("POST断线与404查询保持unknown/open，只执行一次POST", async () => {
+    const fetcher = vi.fn().mockRejectedValueOnce(new TypeError("network down"))
+      .mockResolvedValueOnce(Response.json({ status: "unknown", message: "当前服务进程未找到；不会自动重新调用模型" }, { status: 404 }));
+    vi.stubGlobal("fetch", fetcher);
+    await renderPage();
+    fireEvent.change(screen.getByLabelText("消息文本"), { target: { value: "断线输入" } });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "使用合成fixture评估（真实服务）" })); });
+    expect(screen.getByTestId("visual-qualification")).toHaveTextContent("open");
+    expect(screen.getByTestId("active-tasks")).toHaveTextContent("状态未知");
+    expect(screen.getByRole("alert")).toHaveTextContent("不要重新发送");
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "查询原评估（不重放）" })); });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[0][0]).toBe("/api/avatar-preview/evaluate");
+    expect(String(fetcher.mock.calls[1][0])).toContain("/evaluations/");
+    expect(screen.getByTestId("visual-qualification")).toHaveTextContent("open");
+    expect(screen.getByTestId("active-tasks")).toHaveTextContent("状态未知");
+    expect(screen.getByTestId("service-evidence")).toHaveTextContent("unknown");
+  });
+
+  it("真实服务owner不受本地30秒超时控制，pending查询沿用原来源", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      const request = init?.body ? JSON.parse(String(init.body)) : undefined;
+      return Response.json({ identity: request?.identity ?? JSON.parse(String(fetcher.mock.calls[0][1]?.body)).identity,
+        status: "pending", wordset_version: "v1", emotion_source: "real", context_source: "fixture",
+        visual_owner: "service", visual_window: { status: "open", owner: "service", decision_seq: 0 } });
+    });
+    vi.stubGlobal("fetch", fetcher);
+    await renderPage();
+    fireEvent.change(screen.getByLabelText("消息文本"), { target: { value: "长评估" } });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "使用合成fixture评估（真实服务）" })); });
+    fireEvent.change(screen.getByLabelText("上下文来源"), { target: { value: "db" } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(31000); });
+    expect(screen.getByTestId("visual-qualification")).toHaveTextContent("open");
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "查询原评估（不重放）" })); });
+    expect(screen.getByTestId("visual-qualification")).toHaveTextContent("open");
+    expect(screen.getByTestId("active-tasks")).toHaveTextContent("运行中");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("超时闭窗后reset、角色重建和同身份查询valid均不能复活", async () => {
+    let identity: Record<string, unknown> | undefined;
+    const timeout = () => Response.json({ identity, status: "error", wordset_version: "v1", emotion_source: "real", context_source: "fixture",
+      error_code: "ModelEvaluationTimeout", stage: "model", logical_call_count: 1, transport_attempts: null,
+      message: "模型评估超时", visual_window: { status: "closed", owner: "service", decision_seq: 1, reason: "model_timeout" } });
+    const fetcher = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.body) { identity = JSON.parse(String(init.body)).identity; return timeout(); }
+      return Response.json({ identity, status: "valid", label: "happy", raw_business_value: "happy", wordset_version: "v1", emotion_source: "real",
+        context_source: "fixture", logical_call_count: 1, transport_attempts: null,
+        visual_window: { status: "accepted", owner: "service", decision_seq: 1 } });
+    });
+    vi.stubGlobal("fetch", fetcher);
+    await renderPage();
+    fireEvent.change(screen.getByLabelText("消息文本"), { target: { value: "超时输入" } });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "使用合成fixture评估（真实服务）" })); });
+    expect(screen.getByTestId("visual-qualification")).toHaveTextContent("closed");
+    fireEvent.click(screen.getByRole("button", { name: "重置视觉（保留业务事实）" }));
+    fireEvent.click(screen.getByRole("button", { name: "重建角色（保留输入与资格）" }));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "查询原评估（不重放）" })); });
+    expect(screen.getByTestId("visual-qualification")).toHaveTextContent("closed");
+    expect(screen.getByTestId("emotion-current")).toHaveTextContent("未评估");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("旧请求晚到不会覆盖新输入，但其同会话活动会结束", async () => {
+    const pending: Array<(response: Response) => void> = [];
+    const requests: Array<{ identity: Record<string, unknown>; context_source: string }> = [];
+    const fetcher = vi.fn((_url: RequestInfo | URL, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)); requests.push(request);
+      return new Promise<Response>((resolve) => pending.push(resolve));
+    });
+    vi.stubGlobal("fetch", fetcher);
+    await renderPage();
+    fireEvent.change(screen.getByLabelText("消息文本"), { target: { value: "并发输入" } });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "使用合成fixture评估（真实服务）" })); });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "使用合成fixture评估（真实服务）" })); });
+    const valid = (request: typeof requests[number], label: string) => Response.json({ identity: request.identity, status: "valid", label,
+      raw_business_value: label, wordset_version: "v1", emotion_source: "real", context_source: "fixture", logical_call_count: 1,
+      transport_attempts: null, visual_window: { status: "accepted", owner: "service", decision_seq: 1 } });
+    await act(async () => { pending[0](valid(requests[0], "happy")); await Promise.resolve(); });
+    expect(screen.getByTestId("emotion-current")).toHaveTextContent("未评估");
+    expect(screen.getByTestId("active-tasks")).not.toHaveTextContent(JSON.stringify(Object.values(requests[0].identity)));
+    expect(screen.getByTestId("active-tasks")).toHaveTextContent("运行中");
+    await act(async () => { pending[1](valid(requests[1], "curious")); await Promise.resolve(); });
+    expect(screen.getByTestId("emotion-current")).toHaveTextContent("curious");
+  });
+
+  it("停止后换音频保留明确音量/静音设置并开启新播放epoch", async () => {
+    const players: Array<{ volume: number; muted: boolean; src: string; currentTime: number; play: () => Promise<void>; pause: () => void; addEventListener: EventTarget["addEventListener"]; removeEventListener: EventTarget["removeEventListener"]; removeAttribute: (name: string) => void; load: () => void }> = [];
+    class MockAudio extends EventTarget {
+      volume = 1; muted = false; src = ""; currentTime = 0;
+      play = async () => undefined;
+      pause = () => { this.dispatchEvent(new Event("pause")); };
+      removeAttribute = (name: string) => { if (name === "src") this.src = ""; };
+      load = () => undefined;
+      constructor() { super(); players.push(this); }
+    }
+    const makeContext = () => ({ destination: {}, resume: async () => undefined, close: async () => undefined,
+      createAnalyser: () => ({ fftSize: 32, connect: () => undefined, getByteTimeDomainData: () => undefined }),
+      createMediaElementSource: () => ({ connect: () => undefined }) });
+    const NativeURL = URL;
+    vi.stubGlobal("Audio", MockAudio);
+    vi.stubGlobal("AudioContext", vi.fn(makeContext));
+    vi.stubGlobal("URL", Object.assign(class URLMock extends NativeURL {}, { createObjectURL: vi.fn(() => "blob:local"), revokeObjectURL: vi.fn() }));
+    await renderPage();
+    const picker = screen.getByLabelText("选择本地音频文件");
+    fireEvent.change(picker, { target: { files: [new File(["one"], "one.wav", { type: "audio/wav" })] } });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "播放所选本地音频" })); });
+    fireEvent.change(screen.getByLabelText("播放音量"), { target: { value: "0.25" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "静音实际播放" }));
+    expect(players[0]).toMatchObject({ volume: 0.25, muted: true });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "停止本地播放" })); await Promise.resolve(); });
+    fireEvent.change(picker, { target: { files: [new File(["two"], "two.wav", { type: "audio/wav" })] } });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "播放所选本地音频" })); });
+    expect(players).toHaveLength(2);
+    expect(players[1]).toMatchObject({ volume: 0.25, muted: true });
+    expect(screen.getByTestId("playback-state")).toHaveTextContent("epoch 2");
   });
 
   it("C12用首开期限裁定本地资格，截止后的合法label只记诊断", async () => {

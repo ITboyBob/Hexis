@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Avatar } from "./avatar";
 import { compose } from "../../lib/avatar-preview/composition";
 import { EMOTIONS, WORDSET_VERSION } from "../../lib/avatar-preview/contracts";
-import type { Emotion, Event, Identity, Payload } from "../../lib/avatar-preview/contracts";
+import type { Emotion, Event, Identity, Payload, VisualWindowFact } from "../../lib/avatar-preview/contracts";
 import { EmotionWindowHost } from "../../lib/avatar-preview/emotion-window";
 import { Effects } from "../../lib/avatar-preview/effects";
 import type { Character } from "../../lib/avatar-preview/engine";
@@ -13,6 +13,8 @@ import type { State } from "../../lib/avatar-preview/projection";
 import { parseInjected, eventSchema } from "../../lib/avatar-preview/validation";
 import { scenarioById, scenarios } from "../../lib/avatar-preview/scenarios";
 import type { ScenarioStep } from "../../lib/avatar-preview/scenarios";
+import { getPreviewServiceStatus, queryEmotion, requestEmotion, UnknownEvaluationError, type EvaluationResult, type ServiceStatus } from "../../lib/avatar-preview/client";
+import { LocalPlayer } from "../../lib/avatar-preview/player";
 
 const emotionDescriptions: Record<Emotion, string> = {
   neutral: "本条消息未引起明显主导情绪反应",
@@ -31,6 +33,14 @@ const emotionDescriptions: Record<Emotion, string> = {
   playful: "玩兴、轻松打趣的感受",
 };
 
+type ServiceObservation = {
+  identity: Identity; status: EvaluationResult["status"]; context_source: "fixture" | "db";
+  logical_call_count: number | null; transport_attempts: number | null;
+  visual_window?: VisualWindowFact;
+  label?: string; error_code?: string; stage?: string; raw_business_value?: unknown;
+  transport_status?: string; late_diagnostics?: Array<Record<string, unknown>>;
+  cleanup_diagnostics?: Array<Record<string, unknown>>; message?: string;
+};
 type Diagnostic = { event?: Event; accepted: boolean; reason: string; source: string; time: string };
 const SAMPLE_LIMIT = 250;
 const RECORD_LIMIT = 10000;
@@ -59,6 +69,9 @@ export default function AvatarPreviewPage() {
   const eventNumber = useRef(0);
   const hostRef = useRef<EmotionWindowHost | null>(null);
   const pendingTimeouts = useRef<Map<string, number>>(new Map());
+  const requestSources = useRef<Map<string, "fixture" | "db">>(new Map());
+  const playerRef = useRef<LocalPlayer | null>(null);
+  const playbackEpoch = useRef(0);
   const engineRef = useRef<Character | null>(null);
   const effectsRef = useRef<Effects | null>(null);
   const pendingEffects = useRef<Array<{ id: string; kind: "bounce" | "burst"; duration_ms: number }>>([]);
@@ -71,6 +84,7 @@ export default function AvatarPreviewPage() {
   const [ready, setReady] = useState(false);
   const [avatarMount, setAvatarMount] = useState(0);
   const [diagnostics, setDiagnostics] = useState<Diagnostic[]>([]);
+  const [serviceResults, setServiceResults] = useState<Record<string, ServiceObservation[]>>({});
   const [dropped, setDropped] = useState(0);
   const [recordComplete, setRecordComplete] = useState(false);
   const recordCompleteRef = useRef(false);
@@ -94,6 +108,11 @@ export default function AvatarPreviewPage() {
   const [scenarioSteps, setScenarioSteps] = useState<ScenarioStep[]>([]);
   const [scenarioBusy, setScenarioBusy] = useState(false);
   const [scenarioNotice, setScenarioNotice] = useState("");
+  const [serviceStatus, setServiceStatus] = useState<ServiceStatus | null>(null);
+  const [selectedAudio, setSelectedAudio] = useState<File | null>(null);
+  const [playerBusy, setPlayerBusy] = useState(false);
+  const [audioVolume, setAudioVolume] = useState(1);
+  const [audioMuted, setAudioMuted] = useState(false);
   const [previousFocus, setPreviousFocus] = useState<string | undefined>(undefined);
   const previousFocusRef = useRef<string | undefined>(undefined);
   const [recordingMode, setRecordingMode] = useState("抽样诊断：最近250条");
@@ -120,21 +139,26 @@ export default function AvatarPreviewPage() {
     const initialReceipt = eventReceipt(stateRef.current, event);
     if (payload.type === "input_committed" && initialReceipt.accepted) {
       const windowKey = identityKey(payload.identity);
-      const timeoutMs = pendingTimeouts.current.get(windowKey) ?? 30000;
-      pendingTimeouts.current.delete(windowKey);
-      hostRef.current?.open(payload.identity, timeoutMs);
+      const owner = payload.visual_owner ?? "local";
+      if (owner === "local") {
+        const timeoutMs = pendingTimeouts.current.get(windowKey) ?? 30000;
+        pendingTimeouts.current.delete(windowKey);
+        hostRef.current?.open(payload.identity, timeoutMs);
+      }
       const identity = payload.identity;
-      const generation = stateRef.current.visual_generation;
-      lateVisualCallbacks.current.push(() => {
-        if (stateRef.current.dead || stateRef.current.visual_generation !== generation) return;
-        engineRef.current?.resetVisual();
-      });
-      lateModelCallbacks.current.push(() => {
-        const result = hostRef.current?.acceptResult(identity);
-        const fact = result?.fact ?? hostRef.current?.current(identity);
-        dispatchRef.current({ type: "emotion", identity, wordset_version: WORDSET_VERSION, status: "valid",
-          label: "curious", source: "simulated", visual_window: fact });
-      });
+      if (owner === "local") {
+        const generation = stateRef.current.visual_generation;
+        lateVisualCallbacks.current.push(() => {
+          if (stateRef.current.dead || stateRef.current.visual_generation !== generation) return;
+          engineRef.current?.resetVisual();
+        });
+        lateModelCallbacks.current.push(() => {
+          const result = hostRef.current?.acceptResult(identity);
+          const fact = result?.fact ?? hostRef.current?.current(identity);
+          dispatchRef.current({ type: "emotion", identity, wordset_version: WORDSET_VERSION, status: "valid",
+            label: "curious", source: "simulated", visual_window: fact });
+        });
+      }
     }
     if (payload.type === "emotion" && payload.status === "valid") {
       const identity = payload.identity;
@@ -191,6 +215,163 @@ export default function AvatarPreviewPage() {
     return ingest(event);
   }, [ingest]);
 
+  const sameCurrentIdentity = useCallback((identity: Identity) =>
+    stateRef.current.current !== undefined && identityKey(stateRef.current.current) === identityKey(identity), []);
+
+  const markServiceTask = useCallback((identity: Identity, phase: "running" | "unknown" | "completed" | "failed") => {
+    dispatch({ type: "task", task: { activity_id: identityKey(identity), task_id: null,
+      kind: "emotion_request", foreground: true, phase, source: "real" } }, "avatar-preview-service-task");
+  }, [dispatch]);
+
+  const applyResult = useCallback((identity: Identity, result: EvaluationResult): boolean => {
+    const contextSource = result.status === "unknown" ? requestSources.current.get(identityKey(identity)) : result.context_source;
+    if (contextSource) {
+      const observation: ServiceObservation = {
+        identity, status: result.status, context_source: contextSource,
+        logical_call_count: result.status === "unknown" ? null : result.logical_call_count ?? null,
+        transport_attempts: result.status === "unknown" ? null : result.transport_attempts ?? null,
+        visual_window: result.status === "unknown" ? undefined : result.visual_window,
+        label: result.status === "valid" ? result.label : undefined,
+        error_code: result.status === "error" ? result.error_code : undefined,
+        stage: result.status === "error" ? result.stage : undefined,
+        raw_business_value: result.status === "valid" || result.status === "error" ? result.raw_business_value : undefined,
+        transport_status: result.status === "error" ? result.transport_status : undefined,
+        late_diagnostics: result.status === "error" ? result.late_diagnostics : undefined,
+        cleanup_diagnostics: result.status === "error" ? result.cleanup_diagnostics : undefined,
+        message: result.status === "unknown" || result.status === "error" ? result.message : undefined,
+      };
+      setServiceResults((current) => ({ ...current, [identityKey(identity)]: [...(current[identityKey(identity)] ?? []), observation] }));
+    }
+    if (result.status === "unknown") {
+      appendDiagnostic({ accepted: false, reason: result.message, source: "真实服务查询：unknown", time: new Date().toISOString() });
+      if (!sameCurrentIdentity(identity)) {
+        if (identity.session_id === stateRef.current.session_id) markServiceTask(identity, "unknown");
+        return false;
+      }
+      const currentFact = stateRef.current.visual_windows[identityKey(identity)];
+      if (currentFact?.status === "accepted" || currentFact?.status === "closed") return false;
+      markServiceTask(identity, "unknown");
+      setError("服务端尚未找到这次评估；视觉资格保持原状。可稍后再次查询，不要重新发送消息。");
+      return false;
+    }
+    const expectedSource = requestSources.current.get(identityKey(identity));
+    if (!sameCurrentIdentity(identity) || !expectedSource || result.context_source !== expectedSource) {
+      if (identity.session_id === stateRef.current.session_id && expectedSource === result.context_source) {
+        markServiceTask(identity, result.status === "pending" ? "running" : result.status === "valid" ? "completed" : "failed");
+      }
+      appendDiagnostic({ accepted: false, reason: "结果身份、上下文来源或当前会话已变化；保留当前投影", source: "真实服务迟到结果", time: new Date().toISOString() });
+      return false;
+    }
+    const currentFact = stateRef.current.visual_windows[identityKey(identity)];
+    if (currentFact?.status === "accepted" || currentFact?.status === "closed") {
+      appendDiagnostic({ accepted: false, reason: currentFact.status === "closed"
+        ? "该输入视觉资格已关闭；查询结果仅保留为诊断"
+        : "原结果已接纳；此查询仅诊断，不重复投影", source: "真实服务查询结果", time: new Date().toISOString() });
+      return false;
+    }
+    if (result.status === "pending") {
+      dispatch({ type: "emotion", identity, wordset_version: WORDSET_VERSION, status: "pending", source: "real",
+        reason: "服务端评估仍在进行；查询不会重放输入", visual_window: result.visual_window }, "avatar-preview-service-result");
+      markServiceTask(identity, "running");
+      setError("");
+      return true;
+    }
+    if (result.status === "valid") {
+      dispatch({ type: "emotion", identity, wordset_version: result.wordset_version, status: "valid", label: result.label,
+        source: "real", visual_window: result.visual_window }, "avatar-preview-service-result");
+      markServiceTask(identity, "completed");
+      setError("");
+      return true;
+    }
+    dispatch({ type: "emotion", identity, wordset_version: result.wordset_version, status: "error", source: "real",
+      reason: `${result.error_code}: ${result.message}`, visual_window: result.visual_window }, "avatar-preview-service-result");
+    markServiceTask(identity, "failed");
+    setError(result.message);
+    return true;
+  }, [appendDiagnostic, dispatch, markServiceTask, sameCurrentIdentity]);
+
+  const queryCurrentEmotion = useCallback(async () => {
+    const identity = stateRef.current.current;
+    if (!identity) { setError("当前没有已提交的输入可查询"); return; }
+    const source = requestSources.current.get(identityKey(identity));
+    if (!source) { setError("当前输入没有真实服务请求记录；查询不会创建评估，请先明确发起一次真实评估"); return; }
+    try { applyResult(identity, await queryEmotion(identity, source)); }
+    catch (cause) {
+      const messageText = cause instanceof Error ? cause.message : "查询失败；评估仍未知";
+      if (identity.session_id === stateRef.current.session_id) {
+        markServiceTask(identity, "unknown");
+        setServiceResults((current) => ({ ...current, [identityKey(identity)]: [...(current[identityKey(identity)] ?? []), {
+          identity, status: "unknown", context_source: source, logical_call_count: null,
+          transport_attempts: null, message: messageText,
+        }] }));
+      }
+      if (sameCurrentIdentity(identity)) setError(`${messageText}；视觉资格保持原状，可稍后查询原输入。`);
+      appendDiagnostic({ accepted: false, reason: messageText, source: "真实服务查询失败", time: new Date().toISOString() });
+    }
+  }, [appendDiagnostic, applyResult, markServiceTask, sameCurrentIdentity]);
+
+  const inspectService = useCallback(async () => {
+    try {
+      setServiceStatus(await getPreviewServiceStatus());
+      setError("");
+    } catch (cause) {
+      setServiceStatus(null);
+      setError(cause instanceof Error ? `${cause.message}；可继续离线预览，或检查明确选择的服务地址` : "预览服务状态不可用；离线预览仍可使用");
+    }
+  }, []);
+
+  const startLocalPlayback = useCallback(async () => {
+    if (!selectedAudio) { setError("先选择本地音频文件，再点击播放"); return; }
+    const ownerSession = stateRef.current.session_id;
+    setPlayerBusy(true);
+    let closeWarning = "";
+    try {
+      try { await playerRef.current?.destroy(); }
+      catch (cause) { closeWarning = cause instanceof Error ? cause.message : "旧播放器关闭失败；正在创建新的播放窗口"; }
+      playerRef.current = null;
+      if (stateRef.current.dead || stateRef.current.session_id !== ownerSession) return;
+      const epoch = ++playbackEpoch.current;
+      const playbackId = newId();
+      dispatch({ type: "playback_open", playback_id: playbackId, output_epoch: epoch, source: "real" }, "local-player-open");
+      const player = new LocalPlayer((feedback) => {
+        if (!alive.current || stateRef.current.dead || stateRef.current.session_id !== ownerSession) return;
+        dispatchRef.current({ type: "playback", feedback }, "local-player-feedback");
+      });
+      player.setVolume(audioVolume);
+      player.setMuted(audioMuted);
+      playerRef.current = player;
+      await player.start(selectedAudio, { id: playbackId, epoch });
+      setError(closeWarning);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "本地播放失败；请选择其他音频文件后重试");
+    } finally { setPlayerBusy(false); }
+  }, [audioMuted, audioVolume, dispatch, selectedAudio]);
+
+  const stopLocalPlayback = useCallback(() => {
+    const player = playerRef.current;
+    if (!player) return;
+    player.stop();
+    void player.destroy().then(() => { if (playerRef.current === player) playerRef.current = null; })
+      .catch((cause) => setError(cause instanceof Error ? cause.message : "播放器资源关闭失败；刷新预览后重试"));
+  }, []);
+
+  const pauseLocalPlayback = useCallback(() => playerRef.current?.pause(), []);
+  const resumeLocalPlayback = useCallback(() => {
+    void playerRef.current?.resume().catch((cause) => setError(cause instanceof Error ? cause.message : "播放恢复失败；请停止后重新启动"));
+  }, []);
+
+  const openSimulatedPlayback = useCallback(async () => {
+    const previous = playerRef.current;
+    if (previous) {
+      previous.stop();
+      try { await previous.destroy(); }
+      catch (cause) { setError(cause instanceof Error ? cause.message : "真实播放器资源关闭失败；请检查后再继续"); }
+      if (playerRef.current === previous) playerRef.current = null;
+    }
+    if (stateRef.current.dead) return;
+    dispatch({ type: "playback_open", playback_id: `sim-${newId()}`, output_epoch: ++playbackEpoch.current, source: "simulated" });
+  }, [dispatch]);
+
   useEffect(() => { dispatchRef.current = dispatch; }, [dispatch]);
 
   const createLocalSession = useCallback((sessionId: string) => {
@@ -202,9 +383,11 @@ export default function AvatarPreviewPage() {
     eventsRef.current = [];
     diagnosticsRef.current = [];
     setDiagnostics([]);
+    setServiceResults({});
     setDropped(0);
     hostRef.current?.dispose();
     pendingTimeouts.current.clear();
+    requestSources.current.clear();
     hostRef.current = new EmotionWindowHost({
       owner: "local",
       onChange: (identity, fact) => {
@@ -231,15 +414,17 @@ export default function AvatarPreviewPage() {
       alive.current = false;
       hostRef.current?.dispose();
       hostRef.current = null;
+      void playerRef.current?.destroy();
+      playerRef.current = null;
       effectsRef.current?.destroy();
       effectsRef.current = null;
       engineRef.current = null;
     };
   }, [createLocalSession]);
 
-  const openInput = useCallback((identity: Identity, timeoutMs = 30000) => {
-    pendingTimeouts.current.set(identityKey(identity), timeoutMs);
-    return dispatch({ type: "input_committed", identity, visual_owner: "local" });
+  const openInput = useCallback((identity: Identity, timeoutMs = 30000, owner: "local" | "service" = "local") => {
+    if (owner === "local") pendingTimeouts.current.set(identityKey(identity), timeoutMs);
+    return dispatch({ type: "input_committed", identity, visual_owner: owner });
   }, [dispatch]);
 
   const nextIdentity = useCallback((): Identity => ({
@@ -248,6 +433,35 @@ export default function AvatarPreviewPage() {
     input_order: (stateRef.current.current?.input_order ?? 0) + 1,
     stimulus_revision: 1,
   }), []);
+
+  const evaluateRealMessage = useCallback(async () => {
+    if (!message.trim()) { setError("先输入消息，再明确发起一次真实情绪评估"); return; }
+    const identity = nextIdentity();
+    const source = contextSource;
+    requestSources.current.set(identityKey(identity), source);
+    openInput(identity, 30000, "service");
+    dispatch({ type: "emotion", identity, wordset_version: WORDSET_VERSION, status: "pending", source: "real",
+      reason: "已向明确配置的预览服务提交一次逻辑评估" }, "avatar-preview-service-result");
+    markServiceTask(identity, "running");
+    setError("");
+    try {
+      const result = await requestEmotion(identity, message, source, new AbortController().signal);
+      applyResult(identity, result);
+    } catch (cause) {
+      const unknown = cause instanceof UnknownEvaluationError;
+      if (unknown) setServiceResults((current) => ({ ...current, [identityKey(identity)]: [...(current[identityKey(identity)] ?? []), {
+        identity, status: "unknown", context_source: source, logical_call_count: null, transport_attempts: null,
+        message: cause instanceof Error ? cause.message : "请求状态未知",
+      }] }));
+      if (sameCurrentIdentity(identity)) {
+        markServiceTask(identity, unknown ? "unknown" : "failed");
+        setError(unknown ? `${cause instanceof Error ? cause.message : "请求状态未知"}。可查询原输入，不要重新发送。`
+          : cause instanceof Error ? cause.message : "评估失败；视觉资格保持原状，可检查设置后用新输入重试");
+      }
+      appendDiagnostic({ accepted: false, reason: cause instanceof Error ? cause.message : "请求失败",
+        source: unknown ? "真实服务断线：结果未知" : "真实服务错误", time: new Date().toISOString() });
+    }
+  }, [applyResult, appendDiagnostic, contextSource, dispatch, markServiceTask, message, nextIdentity, openInput, sameCurrentIdentity]);
 
   const sendEmotion = useCallback((identity: Identity, label: Emotion, source: "manual" | "simulated") => {
     const decision = hostRef.current?.acceptResult(identity);
@@ -295,6 +509,8 @@ export default function AvatarPreviewPage() {
 
   const destroyPreview = useCallback(() => {
     hostRef.current?.dispose();
+    void playerRef.current?.destroy().catch((cause) => setError(cause instanceof Error ? cause.message : "播放器关闭失败；刷新预览后重试"));
+    playerRef.current = null;
     effectsRef.current?.destroy();
     effectsRef.current = null;
     dispatch({ type: "control", action: "destroy" });
@@ -302,6 +518,8 @@ export default function AvatarPreviewPage() {
 
   const reopen = useCallback(() => {
     effectsRef.current?.destroy();
+    void playerRef.current?.destroy().catch((cause) => setError(cause instanceof Error ? cause.message : "播放器关闭失败；刷新预览后重试"));
+    playerRef.current = null;
     effectsRef.current = null;
     pendingEffects.current = [];
     hostRef.current?.dispose();
@@ -452,17 +670,36 @@ export default function AvatarPreviewPage() {
   };
 
   const exportEvidence = () => {
+    const recordedSources = new Set<string>();
+    for (const event of eventsRef.current) {
+      const payload = event.payload;
+      if (payload.type === "emotion" && payload.source === "manual") recordedSources.add("手工情绪标签");
+      else if (payload.type === "emotion" && payload.source === "simulated") recordedSources.add("模拟情绪事件");
+      else if (payload.type === "emotion" && payload.source === "real") recordedSources.add("真实情绪服务");
+      else if (payload.type === "task") recordedSources.add(`活动:${taskSource(payload.task.source)}`);
+      else if (payload.type === "playback_open" || payload.type === "playback") {
+        const source = payload.type === "playback_open" ? payload.source : payload.feedback.source;
+        recordedSources.add(source === "real" ? "本地音频播放器" : `${taskSource(source)}播放事件`);
+      } else if (payload.type === "input_activity") recordedSources.add(`${taskSource(payload.source)}输入活动`);
+    }
+    if (state.last_valid?.source === "manual") recordedSources.add("手工情绪标签");
+    if (state.last_valid?.source === "simulated") recordedSources.add("模拟情绪事件");
+    if (state.last_valid?.source === "real") recordedSources.add("真实情绪服务");
+    if (state.playback?.source === "real") recordedSources.add("本地音频播放器");
+    const serviceContexts = new Set(Object.values(serviceResults).flat().map((result) => result.context_source));
+    for (const source of serviceContexts) recordedSources.add(`真实情绪服务上下文:${source}`);
     const evidence = {
       schema_version: "avatar-preview-evidence-v1",
       session_id: stateRef.current.session_id,
       wordset_version: WORDSET_VERSION,
-      source_mode: "手工/模拟离线预览",
+      source_mode: recordedSources.size ? [...recordedSources].join("、") : "无业务事件来源",
       recording_mode: recordComplete ? "完整轨迹（上限10000条）" : recordingMode,
       dropped_event_count: dropped,
       events: eventsRef.current,
       diagnostics: diagnosticsRef.current,
+      service_results: Object.values(serviceResults).flat(),
       projection: stateRef.current,
-      limitation: "当前页面未接入模型服务或真实播放器；不会自动读取数据库或发起网络请求。",
+      limitation: "真实评估只在用户点击后调用显式loopback预览服务；播放只处理用户选定的本地音频。",
     };
     const blob = new Blob([JSON.stringify(evidence, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -475,6 +712,8 @@ export default function AvatarPreviewPage() {
 
   const visibleTasks = activeTasks(state);
   const backgroundCount = visibleTasks.filter((item) => !item.foreground).length;
+  const lastEmotionService = state.last_valid ? serviceResults[identityKey(state.last_valid.identity)]?.filter((item) => item.status === "valid").at(-1) : undefined;
+  const currentServiceResult = state.current ? serviceResults[identityKey(state.current)]?.at(-1) : undefined;
   const selectedScenario = scenarioById(scenarioId);
   const scenarioLength = scenarioSteps.length || selectedScenario?.build({
     session_id: state.session_id, input_turn_id: "preview-placeholder", input_order: 0, stimulus_revision: 0,
@@ -483,7 +722,7 @@ export default function AvatarPreviewPage() {
   return (
     <main className="avatar-preview" lang="zh-CN">
       <h1>二维 Avatar 独立预览</h1>
-      <p>离线预览仅处理手工或模拟事件。服务评估、数据库读取和真实播放器都不会自动启动。</p>
+      <p>离线预览可手工操作；真实评估仅在点击后使用明确配置的独立服务，本地播放仅由用户选择的音频启动。</p>
       {error && <p role="alert">{error}</p>}
       {ready && !state.dead
         ? <Avatar key={`${state.session_id}:${avatarMount}`} value={composition.value} size={size ?? 0} generation={state.visual_generation} onReady={onEngineReady} />
@@ -494,6 +733,9 @@ export default function AvatarPreviewPage() {
         <output data-testid="emotion-current">{state.last_valid?.label ?? "未评估"}</output>
         <p data-testid="evaluation-status">本次评估：{state.evaluation}；{state.reason}</p>
         <output data-testid="emotion-source">{state.last_valid ? taskSource(state.last_valid.source) + "标签" : "无模型结论"}</output>
+        <output data-testid="emotion-origin">{state.last_valid?.source === "real" && lastEmotionService
+          ? `原输入来源 ${lastEmotionService.context_source}；逻辑调用 ${lastEmotionService.logical_call_count ?? "未知"}；传输尝试 ${lastEmotionService.transport_attempts ?? "未知"}`
+          : state.last_valid?.source === "real" ? "真实来源诊断尚未返回" : "无真实服务来源"}</output>
         <p data-testid="session-id">会话：{state.session_id}</p>
         <p>当前身份：{state.current ? `${state.current.input_turn_id} / 输入序号${state.current.input_order} / 修订${state.current.stimulus_revision}` : "尚无有效输入"}</p>
         <p>视觉资格：{state.current ? state.visual_windows[identityKey(state.current)]?.status ?? "未开窗" : "未开窗"}</p>
@@ -511,16 +753,27 @@ export default function AvatarPreviewPage() {
         <textarea id="preview-message" value={message} onChange={(event) => setMessage(event.target.value)} />
         <label htmlFor="context-source">上下文来源</label>
         <select id="context-source" value={contextSource} onChange={(event) => setContextSource(event.target.value as "fixture" | "db")}>
-          <option value="fixture">合成fixture</option><option value="db">已审查上下文来源（服务接入后）</option>
+          <option value="fixture">合成fixture</option><option value="db">当前Hexis数据库四类上下文（只读）</option>
         </select>
         <label htmlFor="simulated-label">本地模拟结果标签（不会读取上下文或调用模型）</label>
         <select id="simulated-label" value={simulatedLabel} onChange={(event) => setSimulatedLabel(event.target.value as Emotion)}>
           {EMOTIONS.map((label) => <option key={label} value={label}>{label} — {emotionDescriptions[label]}</option>)}
         </select>
         <button type="button" onClick={simulateMessage}>在本地模拟消息标签</button>
-        <button type="button" disabled>{contextSource === "fixture" ? "使用合成fixture评估（需显式接入服务）" : "使用四类上下文评估（需显式接入服务）"}</button>
-        <button type="button" disabled>查询原评估（需显式服务配置）</button>
-        <p>provider/model：尚未连接；一次逻辑调用：0。手工消息不会隐式发给模型。</p>
+        <button type="button" onClick={() => void evaluateRealMessage()} disabled={!message.trim() || state.dead}>
+          {contextSource === "fixture" ? "使用合成fixture评估（真实服务）" : "使用四类上下文评估（真实服务）"}
+        </button>
+        <button type="button" onClick={() => void queryCurrentEmotion()} disabled={!state.current || !requestSources.current.has(identityKey(state.current)) || state.dead}>查询原评估（不重放）</button>
+        <button type="button" onClick={() => void inspectService()}>检查预览服务配置</button>
+        <p data-testid="service-summary">{serviceStatus
+          ? serviceStatus.configured
+            ? `服务已配置：${serviceStatus.provider ?? "provider未知"}/${serviceStatus.model ?? "model未知"}；凭据${serviceStatus.credential_available ? "可用" : "不可用"}；fixture ${serviceStatus.context_sources?.fixture ? "可用" : "不可用"}；DB ${serviceStatus.context_sources?.db ? "可用" : "不可用"}；业务预算：无`
+            : "未配置真实服务；可继续离线预览，或显式配置 loopback 预览服务。"
+          : "服务状态尚未检查；当前没有模型请求。"}</p>
+        <output data-testid="service-evidence">{currentServiceResult
+          ? `${currentServiceResult.status}；来源 ${currentServiceResult.context_source}；逻辑调用 ${currentServiceResult.logical_call_count ?? "未知"}；传输尝试 ${currentServiceResult.transport_attempts ?? "未知"}${currentServiceResult.stage ? `；阶段 ${currentServiceResult.stage}` : ""}${currentServiceResult.error_code ? `；错误 ${currentServiceResult.error_code}` : ""}`
+          : "当前身份尚无服务响应记录"}</output>
+        <p>查询按原身份和原上下文来源执行；未知或断线不会重放评估。模型密钥不会从浏览器传入。</p>
       </fieldset>
 
       <fieldset>
@@ -551,13 +804,24 @@ export default function AvatarPreviewPage() {
 
       <fieldset disabled={state.dead}>
         <legend>播放与视觉控制</legend>
-        <label htmlFor="audio-file">选择本地音频（Phase 5接入前不会播放）</label>
-        <input id="audio-file" type="file" accept="audio/*" disabled />
-        <button type="button" disabled>本地播放服务尚未接入</button>
-        <button type="button" onClick={() => dispatch({ type: "playback_open", playback_id: `sim-${newId()}`, output_epoch: (state.playback?.output_epoch ?? 0) + 1, source: "simulated" })}>打开模拟播放</button>
-        <button type="button" onClick={() => state.playback && dispatch({ type: "playback", feedback: { ...state.playback, phase: "buffering", amplitude: 0, source: "simulated" } })}>模拟buffering</button>
-        <button type="button" onClick={() => state.playback && dispatch({ type: "playback", feedback: { ...state.playback, phase: "playing", amplitude: 0.5, source: "simulated" } })}>模拟playing</button>
-        <button type="button" onClick={() => state.playback && dispatch({ type: "playback", feedback: { ...state.playback, phase: "drained", amplitude: 0, source: "simulated" } })}>模拟drained</button>
+        <label htmlFor="audio-file">选择本地音频文件</label>
+        <input id="audio-file" type="file" accept="audio/*" onChange={(event) => setSelectedAudio(event.target.files?.[0] ?? null)} />
+        <button type="button" onClick={() => void startLocalPlayback()} disabled={!selectedAudio || playerBusy || state.dead}>播放所选本地音频</button>
+        <button type="button" onClick={pauseLocalPlayback} disabled={state.playback?.source !== "real" || state.playback.phase !== "playing"}>暂停实际播放</button>
+        <button type="button" onClick={resumeLocalPlayback} disabled={state.playback?.source !== "real" || state.playback.phase !== "buffering" || state.playback_closed}>恢复实际播放</button>
+        <button type="button" onClick={stopLocalPlayback} disabled={state.playback?.source !== "real" || state.playback_closed}>停止本地播放</button>
+        <label htmlFor="audio-volume">播放音量</label>
+        <input id="audio-volume" type="range" min="0" max="1" step="0.05" value={audioVolume} disabled={state.playback?.source !== "real" || state.playback_closed} onChange={(event) => {
+          const value = Number(event.target.value); setAudioVolume(value); playerRef.current?.setVolume(value);
+        }} />
+        <label><input aria-label="静音实际播放" type="checkbox" checked={audioMuted} disabled={state.playback?.source !== "real" || state.playback_closed} onChange={(event) => {
+          setAudioMuted(event.target.checked); playerRef.current?.setMuted(event.target.checked);
+        }} />静音</label>
+        <output data-testid="playback-state">{state.playback ? `${state.playback.phase}；来源 ${taskSource(state.playback.source)}；epoch ${state.playback.output_epoch}；进度 ${state.playback.progress.toFixed(2)}；幅度 ${state.playback.amplitude.toFixed(3)}` : "尚无播放"}</output>
+        <button type="button" onClick={() => void openSimulatedPlayback()}>打开模拟播放</button>
+        <button type="button" disabled={state.playback?.source === "real" && !state.playback_closed} onClick={() => state.playback?.source === "simulated" && dispatch({ type: "playback", feedback: { ...state.playback, phase: "buffering", amplitude: 0, source: "simulated" } })}>模拟buffering</button>
+        <button type="button" disabled={state.playback?.source === "real" && !state.playback_closed} onClick={() => state.playback?.source === "simulated" && dispatch({ type: "playback", feedback: { ...state.playback, phase: "playing", amplitude: 0.5, source: "simulated" } })}>模拟playing</button>
+        <button type="button" disabled={state.playback?.source === "real" && !state.playback_closed} onClick={() => state.playback?.source === "simulated" && dispatch({ type: "playback", feedback: { ...state.playback, phase: "drained", amplitude: 0, source: "simulated" } })}>模拟drained</button>
         <label htmlFor="avatar-size">实际展示尺寸</label>
         <input id="avatar-size" type="number" min="1" value={size ?? ""} onChange={(event) => {
           const value = Number(event.target.value);
