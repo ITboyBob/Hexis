@@ -64,9 +64,13 @@ async def test_record_behavior_event_is_idempotent_and_allocates_stream_seq(db_p
             assert first == {"event_id": str(event_id), "seq": 1, "deduplicated": False}
             assert retry == {"event_id": str(event_id), "seq": 1, "deduplicated": True}
             assert other["seq"] == 2
-            assert await conn.fetchval(
-                "SELECT count(*) FROM behavior_events WHERE session_id=$1", session_id
-            ) == 2
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM behavior_events WHERE session_id=$1",
+                    session_id,
+                )
+                == 2
+            )
         finally:
             await tr.rollback()
 
@@ -104,16 +108,28 @@ async def test_replay_groups_streams_and_reports_sequence_gaps(db_pool):
         try:
             session_id = uuid4()
             await _record(
-                conn, uuid4(), "a", session_id,
-                {"type": "control", "action": "reset"}, producer_seq=0,
+                conn,
+                uuid4(),
+                "a",
+                session_id,
+                {"type": "control", "action": "reset"},
+                producer_seq=0,
             )
             await _record(
-                conn, uuid4(), "a", session_id,
-                {"type": "control", "action": "destroy"}, producer_seq=2,
+                conn,
+                uuid4(),
+                "a",
+                session_id,
+                {"type": "control", "action": "destroy"},
+                producer_seq=2,
             )
             await _record(
-                conn, uuid4(), "b", session_id,
-                {"type": "control", "action": "reset"}, producer_seq=0,
+                conn,
+                uuid4(),
+                "b",
+                session_id,
+                {"type": "control", "action": "reset"},
+                producer_seq=0,
             )
 
             replay = _json(
@@ -126,8 +142,11 @@ async def test_replay_groups_streams_and_reports_sequence_gaps(db_pool):
             assert [item["seq"] for item in streams["a"]["events"]] == [1, 2]
             assert streams["a"]["sequence_gaps"] == []
             assert [item["seq"] for item in streams["b"]["events"]] == [1]
-            assert await conn.fetchval(
-                "SELECT count(*) FROM behavior_events WHERE turn_id IS NOT NULL"
-            ) == 0
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM behavior_events WHERE turn_id IS NOT NULL"
+                )
+                == 0
+            )
         finally:
             await tr.rollback()
