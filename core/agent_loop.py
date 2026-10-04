@@ -935,6 +935,7 @@ class AgentLoop:
                 await self._emit(
                     AgentEvent.TOOL_START,
                     {
+                        "call_id": call_id,
                         "tool_name": tool_name,
                         "arguments": arguments,
                         "iteration": self._iteration_count,
