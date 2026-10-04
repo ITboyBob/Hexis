@@ -311,17 +311,67 @@ async def test_background_executor_real_loop(db_pool):
     assert task is not None
     assert current_execution is not None
     assert turn_id is not None
-    assert task["status"] in {"completed", "failed"}
-    assert current_execution["status"] in {"completed", "failed"}
+    assert task["status"] == "completed"
+    assert current_execution["status"] == "completed"
+
+    assert outcome is not None
+    assert outcome["criteria_met"] is True
+    assert outcome["task_updated"] is True
+    assert outcome["succeeded"] is True
+    assert outcome["task_id"] == str(task["id"])
+    assert outcome["execution_id"] == str(current_execution["id"])
+    assert str(task["current_execution_id"]) == outcome["execution_id"]
+    assert current_execution["turn_id"] == turn_id
+
+    task_result = _json(task["result"])
+    assert isinstance(task_result, dict)
+    assert task_result["text"] == "done"
+
+    raw_tool_results = task_result.get("tool_results")
+    assert isinstance(raw_tool_results, list)
+    successful_recall_results = [
+        item
+        for item in raw_tool_results
+        if isinstance(item, dict)
+        and item.get("name") == "recall"
+        and item.get("success") is True
+        and item.get("id")
+    ]
+    assert successful_recall_results
+    successful_call_ids = {
+        str(item["id"]) for item in successful_recall_results
+    }
 
     event_types = [event["event_type"] for event in evidence["behavior_events"]]
     assert "task_queued" in event_types
     assert "task_started" in event_types
     assert "TOOL_START" in event_types
     assert "TOOL_RESULT" in event_types
-    assert {"task_completed", "task_failed"}.intersection(event_types)
+    assert "task_completed" in event_types
+    assert "task_failed" not in event_types
 
-    assert evidence["tool_summary"]["call_ids"]
-    assert outcome is not None
-    assert outcome["task_id"] == str(task["id"])
-    assert outcome["execution_id"] == str(current_execution["id"])
+    behavior_starts = [
+        event
+        for event in evidence["behavior_events"]
+        if event["event_type"] == "TOOL_START"
+    ]
+    behavior_results = [
+        event
+        for event in evidence["behavior_events"]
+        if event["event_type"] == "TOOL_RESULT"
+    ]
+    behavior_start_ids = {
+        str(event["call_id"])
+        for event in behavior_starts
+        if event.get("call_id")
+    }
+    behavior_result_ids = {
+        str(event["call_id"])
+        for event in behavior_results
+        if event.get("call_id")
+    }
+    assert successful_call_ids.issubset(behavior_start_ids)
+    assert successful_call_ids.issubset(behavior_result_ids)
+    assert successful_call_ids.issubset(
+        set(evidence["tool_summary"]["call_ids"])
+    )
