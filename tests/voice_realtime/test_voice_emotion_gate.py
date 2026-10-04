@@ -55,10 +55,13 @@ async def test_valid_evaluation_and_hydration_run_in_parallel():
 
 
 async def test_model_timeout_releases_and_late_valid_is_diagnostic_only():
+    evaluation_calls = []
+
     async def context_reader(value):
         return {"identity": {}, "worldview": {}, "goals": {}, "relationships": {}}
 
     async def evaluator(message, context):
+        evaluation_calls.append(message)
         await asyncio.sleep(0.05)
         return {"label": "happy", "logical_call_count": 1}
 
@@ -81,7 +84,15 @@ async def test_model_timeout_releases_and_late_valid_is_diagnostic_only():
     assert result.visual_window["reason"] == "model_timeout"
     assert result.metrics["release_reason"] == "model_timeout"
     assert coordinator.window_host.current(value)["status"] == "closed"
-    assert [item.status for item in coordinator.window_host.late_diagnostics] == ["valid"]
+    assert coordinator.last_evaluation_task.cancelled() is True
+    diagnostics = coordinator.window_host.late_diagnostics
+    assert [item.status for item in diagnostics] == ["error"]
+    assert diagnostics[0].error_type == "CancelledError"
+    assert diagnostics[0].accepted is False
+
+    with pytest.raises(RuntimeError, match="already has an evaluation window"):
+        await coordinator.run(value, "请继续")
+    assert evaluation_calls == ["请继续"]
 
 
 async def test_ordinary_evaluation_error_releases_without_closing_window():
@@ -112,6 +123,33 @@ async def test_ordinary_evaluation_error_releases_without_closing_window():
     assert result.visual_window["status"] == "open"
     assert result.evaluation["status"] == "error"
     assert result.metrics["release_reason"] == "evaluation_error"
+
+
+async def test_duplicate_accepted_identity_fails_loud_without_second_evaluation():
+    evaluation_calls = []
+
+    async def context_reader(value):
+        return {"identity": {}, "worldview": {}, "goals": {}, "relationships": {}}
+
+    async def evaluator(message, context):
+        evaluation_calls.append(message)
+        return {"label": "happy", "logical_call_count": 1}
+
+    async def hydrator(value, message):
+        return SimpleNamespace(per_response_instructions="context", hydrate_ms=1.0)
+
+    coordinator = VoiceEmotionCoordinator(
+        context_reader=context_reader,
+        evaluator=evaluator,
+        hydrator=hydrator,
+        emotion_timeout_ms=1000,
+    )
+    value = identity()
+    await coordinator.run(value, "请继续")
+
+    with pytest.raises(RuntimeError, match="already has an evaluation window"):
+        await coordinator.run(value, "请继续")
+    assert evaluation_calls == ["请继续"]
 
 
 class FakeFirstResponse:

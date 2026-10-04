@@ -48,6 +48,7 @@ class VoiceEmotionCoordinator:
         self._hydrator = hydrator
         self._emotion_timeout_ms = emotion_timeout_ms
         self.window_host = window_host or EmotionWindowHost()
+        self.last_evaluation_task: asyncio.Task[Any] | None = None
 
     async def run(
         self, identity: Identity, message: str
@@ -55,12 +56,16 @@ class VoiceEmotionCoordinator:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must not be empty")
 
+        if self.window_host.current(identity) is not None:
+            raise RuntimeError("identity already has an evaluation window")
+
         loop = asyncio.get_running_loop()
         started = loop.time()
         self.window_host.open(identity, self._emotion_timeout_ms)
 
         evaluation_started = loop.time()
         evaluation_task = asyncio.create_task(self._evaluate(identity, message))
+        self.last_evaluation_task = evaluation_task
         hydration_started = loop.time()
         hydration_task = asyncio.create_task(self._hydrate(identity, message))
 
@@ -96,6 +101,7 @@ class VoiceEmotionCoordinator:
             evaluation_task.add_done_callback(
                 lambda task: self._record_late_evaluation(identity, task)
             )
+            evaluation_task.cancel()
 
         context_ready = (
             hydration_task.done()
@@ -135,6 +141,7 @@ class VoiceEmotionCoordinator:
         self, identity: Identity, task: asyncio.Task[Any]
     ) -> None:
         if task.cancelled():
+            self.window_host.record_late_error(identity, asyncio.CancelledError())
             return
         try:
             value = task.result()
