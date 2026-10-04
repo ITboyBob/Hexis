@@ -77,6 +77,7 @@ async def hydrate_voice_context(
                 conn,
                 str(session_id),
                 exclude_sensitive=False,
+                strict=True,
             )
             temporal_raw = await conn.fetchval("SELECT get_temporal_context()")
     except Exception as exc:

@@ -97,3 +97,24 @@ async def test_hydration_failure_is_explicit_not_empty_context(monkeypatch):
             message="请继续",
             stable_instructions_hash="a" * 64,
         )
+
+
+async def test_continuity_failure_is_hydration_unavailable(monkeypatch):
+    connection = FakeConnection()
+    hydrator = FakeHydrator(connection)
+    monkeypatch.setattr(
+        "services.voice_context_hydration.CognitiveMemory",
+        lambda pool: hydrator,
+    )
+    monkeypatch.setattr(
+        "services.voice_context_hydration.render_chat_memory_context_db",
+        lambda conn, context, **kwargs: _fake_render(conn, "memory"),
+    )
+
+    with pytest.raises(HydrationUnavailable):
+        await hydrate_voice_context(
+            connection,
+            session_id=uuid4(),
+            message="请继续",
+            stable_instructions_hash="a" * 64,
+        )

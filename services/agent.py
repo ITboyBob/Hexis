@@ -346,6 +346,7 @@ async def render_chat_continuity_context_db(
     session_id: str | None,
     *,
     exclude_sensitive: bool = False,
+    strict: bool = False,
 ) -> str:
     """Render DB-owned active continuity for chat.
 
@@ -360,6 +361,8 @@ async def render_chat_continuity_context_db(
             bool(exclude_sensitive),
         )
     except Exception:
+        if strict:
+            raise
         logger.debug("Chat continuity context unavailable", exc_info=True)
         return ""
     continuity = str(raw or "").strip()
@@ -367,6 +370,8 @@ async def render_chat_continuity_context_db(
         policy_raw = await conn.fetchval("SELECT render_operator_policy_context()")
         policy_context = str(policy_raw or "").strip()
     except Exception:
+        if strict:
+            raise
         logger.debug("Operator policy context unavailable", exc_info=True)
         policy_context = ""
     return "\n\n".join(part for part in (continuity, policy_context) if part)
