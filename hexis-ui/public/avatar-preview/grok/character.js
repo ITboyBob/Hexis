@@ -75,6 +75,7 @@
       this.eyeTo = 0;
       this.eyeStiffness = 7;
       this.eyeIdx = 0;
+      this.eyeMorphCount = 0;
       this._fromPolys = null;
 
       this.t0 = performance.now();
@@ -391,6 +392,29 @@
       };
     }
 
+    getDiagnostics() {
+      return {
+        destroyed: this._destroyed,
+        composition: this.composition ? {
+          eye: this.composition.eye,
+          pose: this.composition.pose,
+          playing: this.composition.playing,
+          amplitude: this.composition.amplitude,
+          motion_limit_px: this.composition.motion_limit_px,
+          reduced_motion: this.composition.reduced_motion,
+        } : null,
+        eyeFrom: this.eyeFrom,
+        eyeTo: this.eyeTo,
+        eyeMorph: { ...this.eyeMorph },
+        overlay: { ...this.overlay },
+        eyeMorphCount: this.eyeMorphCount,
+        rafAlive: !this._destroyed,
+        eyePathsVisible: !!this.eyeEls
+          && this.eyeEls.length === 2
+          && this.eyeEls.every((element) => element.style.display !== "none" && !!element.getAttribute("d")),
+      };
+    }
+
     spinOnce(turns = 1) {
       this._pn(turns);
     }
@@ -499,6 +523,7 @@
       this.eyeFrom = this.eyeTo;
       this._fromPolys = this._currentPolys(t);
       this.eyeTo = index;
+      this.eyeMorphCount += 1;
       this.eyeMorph.x = 0;
       this.eyeMorph.v = 0;
       this.eyeMorph.t = 1;

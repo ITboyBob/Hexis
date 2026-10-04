@@ -30,8 +30,12 @@ const taskSchema = z.object({
 const playbackSchema = z.object({
   playback_id: z.string().min(1),
   output_epoch: z.number().int().nonnegative(),
+  response_id: z.string().min(1).optional(),
+  media_session_id: z.string().min(1).optional(),
   phase: z.enum(["playing", "buffering", "drained", "cancel", "error"]),
   progress: z.number().finite().min(0),
+  played_ms: z.number().finite().nonnegative(),
+  interval_ms: z.number().finite().nonnegative(),
   amplitude: z.number().finite().min(0).max(1),
   source: sourceSchema,
 }).strict();

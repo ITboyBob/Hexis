@@ -280,6 +280,8 @@ export function reduce(state: State, event: Event): State {
         output_epoch: payload.output_epoch,
         phase: "buffering",
         progress: 0,
+        played_ms: 0,
+        interval_ms: 0,
         amplitude: 0,
         source: payload.source,
       },

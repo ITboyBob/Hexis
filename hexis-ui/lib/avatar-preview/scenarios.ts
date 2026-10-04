@@ -1,5 +1,6 @@
 import type { Effect } from "./effects";
-import type { Identity, Payload } from "./contracts";
+import { EMOTIONS } from "./contracts";
+import type { Emotion, Identity, Payload } from "./contracts";
 
 export type ScenarioStep =
   | { kind: "event"; payload: Payload }
@@ -17,6 +18,13 @@ export type PreviewScenario = {
   build(identity: Identity): ScenarioStep[];
 };
 
+export const transitions: ReadonlyArray<{ from: Emotion; to: Emotion }> = EMOTIONS.flatMap((from) =>
+  EMOTIONS.filter((to) => to !== from).map((to) => ({ from, to })),
+);
+
+export const sameValueUpdates: ReadonlyArray<{ from: Emotion; to: Emotion }> =
+  EMOTIONS.map((emotion) => ({ from: emotion, to: emotion }));
+
 const identityAt = (identity: Identity, order: number, turn: string): Identity => ({
   ...identity,
   input_order: order,
@@ -29,6 +37,10 @@ const task = (activity_id: string, kind: string, foreground: boolean, phase: "ru
   task: { activity_id, task_id: activity_id, kind, foreground, phase, source },
 });
 const input = (identity: Identity): ScenarioStep => event({ type: "input_committed", identity });
+const playback = (playback_id: string, phase: "playing" | "buffering" | "drained", progress: number, amplitude: number): ScenarioStep => event({
+  type: "playback",
+  feedback: { playback_id, output_epoch: 1, phase, progress, played_ms: Math.round(progress * 1000), interval_ms: 0, amplitude, source: "simulated" },
+});
 
 export const scenarios: readonly PreviewScenario[] = [
   {
@@ -40,7 +52,7 @@ export const scenarios: readonly PreviewScenario[] = [
       event({ type: "input_activity", activity_id: "voice-c01", speaking: true, source: "simulated" }),
       task("tool-a", "tool", false), task("tool-b", "tool", false), task("notification-a", "notification", false),
       event({ type: "playback_open", playback_id: "play-c01", output_epoch: 1, source: "simulated" }),
-      event({ type: "playback", feedback: { playback_id: "play-c01", output_epoch: 1, phase: "playing", progress: 0.3, amplitude: 0.6, source: "simulated" } }),
+      playback("play-c01", "playing", 0.3, 0.6),
     ],
   },
   {
@@ -62,11 +74,11 @@ export const scenarios: readonly PreviewScenario[] = [
     id: "C04", title: "播放缓冲、恢复与终止后拒绝旧进度",
     build: () => [
       event({ type: "playback_open", playback_id: "play-c04", output_epoch: 1, source: "simulated" }),
-      event({ type: "playback", feedback: { playback_id: "play-c04", output_epoch: 1, phase: "playing", progress: 0.2, amplitude: 0.8, source: "simulated" } }),
-      event({ type: "playback", feedback: { playback_id: "play-c04", output_epoch: 1, phase: "buffering", progress: 0.2, amplitude: 0.8, source: "simulated" } }),
-      event({ type: "playback", feedback: { playback_id: "play-c04", output_epoch: 1, phase: "playing", progress: 0.4, amplitude: 0.4, source: "simulated" } }),
-      event({ type: "playback", feedback: { playback_id: "play-c04", output_epoch: 1, phase: "drained", progress: 1, amplitude: 0, source: "simulated" } }),
-      event({ type: "playback", feedback: { playback_id: "play-c04", output_epoch: 1, phase: "playing", progress: 0.5, amplitude: 0.8, source: "simulated" } }),
+      playback("play-c04", "playing", 0.2, 0.8),
+      playback("play-c04", "buffering", 0.2, 0.8),
+      playback("play-c04", "playing", 0.4, 0.4),
+      playback("play-c04", "drained", 1, 0),
+      playback("play-c04", "playing", 0.5, 0.8),
     ],
   },
   {
@@ -74,7 +86,7 @@ export const scenarios: readonly PreviewScenario[] = [
     build: () => [
       event({ type: "playback_open", playback_id: "play-new", output_epoch: 2, source: "simulated" }),
       event({ type: "playback_open", playback_id: "play-old", output_epoch: 1, source: "simulated" }),
-      event({ type: "playback", feedback: { playback_id: "play-old", output_epoch: 1, phase: "playing", progress: 0.5, amplitude: 1, source: "simulated" } }),
+      playback("play-old", "playing", 0.5, 1),
     ],
   },
   {

@@ -13,8 +13,22 @@ import type { State } from "../../lib/avatar-preview/projection";
 import { parseInjected, eventSchema } from "../../lib/avatar-preview/validation";
 import { scenarioById, scenarios } from "../../lib/avatar-preview/scenarios";
 import type { ScenarioStep } from "../../lib/avatar-preview/scenarios";
+import { downloadEvidence, makeEvidence } from "../../lib/avatar-preview/evidence";
 import { getPreviewServiceStatus, queryEmotion, requestEmotion, UnknownEvaluationError, type EvaluationResult, type ServiceStatus } from "../../lib/avatar-preview/client";
 import { LocalPlayer } from "../../lib/avatar-preview/player";
+import upstream from "../../public/avatar-preview/grok/upstream.json";
+
+declare global {
+  interface Window {
+    __AVATAR_PREVIEW_DIAGNOSTICS__?: () => import("../../lib/avatar-preview/engine").EngineDiagnostics | null;
+    __AVATAR_EVIDENCE_ARTIFACTS__?: {
+      design: { version: string; sha256: string };
+      plan: { version: string; sha256: string };
+      wordset: { version: string; sha256: string };
+      prompt: { version: string; sha256: string };
+    };
+  }
+}
 
 const emotionDescriptions: Record<Emotion, string> = {
   neutral: "本条消息未引起明显主导情绪反应",
@@ -546,9 +560,13 @@ export default function AvatarPreviewPage() {
       effectsRef.current = null;
       setEffectSnapshot({ queued: [], min_gap_ms: 0 });
       engineRef.current = null;
+      const unavailableDiagnostics = () => null;
+      window.__AVATAR_PREVIEW_DIAGNOSTICS__ = unavailableDiagnostics;
       return;
     }
     engineRef.current = character;
+    const currentDiagnostics = () => character.getDiagnostics();
+    window.__AVATAR_PREVIEW_DIAGNOSTICS__ = currentDiagnostics;
     if (sizeRef.current === null) {
       const geometryWidth = window.GROK_GEO?.viewBox.width;
       if (Number.isFinite(geometryWidth) && geometryWidth > 0) {
@@ -688,26 +706,110 @@ export default function AvatarPreviewPage() {
     if (state.playback?.source === "real") recordedSources.add("本地音频播放器");
     const serviceContexts = new Set(Object.values(serviceResults).flat().map((result) => result.context_source));
     for (const source of serviceContexts) recordedSources.add(`真实情绪服务上下文:${source}`);
+    const artifacts = window.__AVATAR_EVIDENCE_ARTIFACTS__;
+    const serviceObservations = Object.values(serviceResults).flat();
+    const logicalCalls = serviceObservations
+      .map((result) => result.logical_call_count)
+      .filter((value): value is number => value !== null);
+    const transportAttempts = serviceObservations
+      .map((result) => result.transport_attempts)
+      .filter((value): value is number => value !== null);
     const evidence = {
-      schema_version: "avatar-preview-evidence-v1",
+      ...makeEvidence({
+        artifacts: {
+          design: artifacts?.design ?? { version: "v1.7", sha256: "" },
+          plan: artifacts?.plan ?? { version: "v1.3", sha256: "" },
+          wordset: artifacts?.wordset ?? { version: WORDSET_VERSION, sha256: "" },
+          prompt: artifacts?.prompt ?? { version: serviceStatus?.prompt_version ?? "unknown", sha256: "" },
+          hash_note: "为空表示浏览器导出未获得本机设计/计划/提示文件读取权限；验收环境可注入实际哈希",
+        },
+        resources: upstream,
+        runtime: {
+          browser: navigator.userAgent,
+          device: "desktop",
+          viewport: `${window.innerWidth}x${window.innerHeight}`,
+          actual_size_px: sizeRef.current,
+          size_source: sizeSource,
+        },
+        animation: { motion_limit_px: motionLimit, effect_min_gap_ms: Number(effectGap) || 0 },
+        context: {
+          source: contextSource,
+          allowed_categories: ["identity", "worldview", "goals", "relationships"],
+          observed_sources: [...recordedSources],
+        },
+        model: {
+          provider: serviceStatus?.provider ?? null,
+          model: serviceStatus?.model ?? null,
+          credential_source: "服务端环境变量；浏览器不读取密钥",
+          business_budget: "none",
+          timeout_seconds: null,
+        },
+        calls: {
+          logical_call_count: logicalCalls.length ? Math.max(...logicalCalls) : null,
+          transport_attempts: transportAttempts.length ? Math.max(...transportAttempts) : null,
+        },
+        identities: {
+          session_id: stateRef.current.session_id,
+          current: stateRef.current.current ? identityKey(stateRef.current.current) : null,
+          playback: stateRef.current.playback
+            ? `${stateRef.current.playback.playback_id}:${stateRef.current.playback.output_epoch}`
+            : null,
+          activities: visibleTasks.map((task) => task.activity_id),
+        },
+        attribution: {
+          state_projection: stateRef.current,
+          property_owners: {
+            eye: "last_valid emotion",
+            pose: "listening/foreground attention",
+            playback: "actual LocalPlayer feedback",
+            effects: "Effects queue",
+          },
+        },
+        media: { screenshots: [], videos: [] },
+        trajectory: {
+          complete: recordComplete,
+          event_count: eventsRef.current.length,
+          dropped_event_count: recordComplete ? 0 : null,
+          dropped_diagnostic_count: dropped,
+          recording_mode: recordingMode,
+        },
+      }, eventsRef.current, [
+        {
+          claim: "本地播放器实际反馈",
+          status: stateRef.current.playback?.source === "real" ? "pass" : "unknown",
+          reason: stateRef.current.playback?.source === "real"
+            ? "事件来自用户选择的本地音频与浏览器播放反馈"
+            : "当前导出没有本地播放器反馈",
+          event_range: [1, eventsRef.current.length],
+        },
+        {
+          claim: "完整事件轨迹",
+          status: recordComplete ? "pass" : "unknown",
+          reason: recordComplete ? "完整录制模式已开启且未达到10000条上限" : "当前为抽样诊断模式",
+          event_range: [1, eventsRef.current.length],
+        },
+        {
+          claim: "动画参数已记录",
+          status: sizeRef.current !== null && motionLimit >= 0 ? "pass" : "unknown",
+          reason: sizeRef.current !== null && motionLimit >= 0
+            ? `实际尺寸${sizeRef.current}px；微动限幅${motionLimit}px；效果最小间隔${Number(effectGap) || 0}ms`
+            : "实际尺寸尚未确定",
+          event_range: [1, eventsRef.current.length],
+        },
+      ]),
       session_id: stateRef.current.session_id,
       wordset_version: WORDSET_VERSION,
       source_mode: recordedSources.size ? [...recordedSources].join("、") : "无业务事件来源",
       recording_mode: recordComplete ? "完整轨迹（上限10000条）" : recordingMode,
-      dropped_event_count: dropped,
+      dropped_event_count: recordComplete ? 0 : null,
+      dropped_diagnostic_count: dropped,
       events: eventsRef.current,
       diagnostics: diagnosticsRef.current,
-      service_results: Object.values(serviceResults).flat(),
+      service_results: serviceObservations,
       projection: stateRef.current,
       limitation: "真实评估只在用户点击后调用显式loopback预览服务；播放只处理用户选定的本地音频。",
     };
-    const blob = new Blob([JSON.stringify(evidence, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `avatar-preview-${stateRef.current.session_id}.json`;
-    anchor.click();
-    URL.revokeObjectURL(url);
+    downloadEvidence(evidence, `avatar-preview-${stateRef.current.session_id}.json`);
   };
 
   const visibleTasks = activeTasks(state);
@@ -817,7 +919,7 @@ export default function AvatarPreviewPage() {
         <label><input aria-label="静音实际播放" type="checkbox" checked={audioMuted} disabled={state.playback?.source !== "real" || state.playback_closed} onChange={(event) => {
           setAudioMuted(event.target.checked); playerRef.current?.setMuted(event.target.checked);
         }} />静音</label>
-        <output data-testid="playback-state">{state.playback ? `${state.playback.phase}；来源 ${taskSource(state.playback.source)}；epoch ${state.playback.output_epoch}；进度 ${state.playback.progress.toFixed(2)}；幅度 ${state.playback.amplitude.toFixed(3)}` : "尚无播放"}</output>
+        <output data-testid="playback-state" data-phase={state.playback?.phase ?? "none"} data-epoch={state.playback?.output_epoch ?? 0} data-amplitude={state.playback?.amplitude ?? 0} data-played-ms={state.playback?.played_ms ?? 0} data-interval-ms={state.playback?.interval_ms ?? 0}>{state.playback ? `${state.playback.phase}；来源 ${taskSource(state.playback.source)}；epoch ${state.playback.output_epoch}；进度 ${state.playback.progress.toFixed(2)}；幅度 ${state.playback.amplitude.toFixed(3)}` : "尚无播放"}</output>
         <button type="button" onClick={() => void openSimulatedPlayback()}>打开模拟播放</button>
         <button type="button" disabled={state.playback?.source === "real" && !state.playback_closed} onClick={() => state.playback?.source === "simulated" && dispatch({ type: "playback", feedback: { ...state.playback, phase: "buffering", amplitude: 0, source: "simulated" } })}>模拟buffering</button>
         <button type="button" disabled={state.playback?.source === "real" && !state.playback_closed} onClick={() => state.playback?.source === "simulated" && dispatch({ type: "playback", feedback: { ...state.playback, phase: "playing", amplitude: 0.5, source: "simulated" } })}>模拟playing</button>

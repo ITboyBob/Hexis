@@ -323,13 +323,13 @@ describe("独立 Avatar 预览页面", () => {
 
   it("重建角色后已排定的旧视觉回调不能触碰新渲染器", async () => {
     await renderPage();
-    const oldCharacter = { setComposition: vi.fn(), resetVisual: vi.fn(), stopVisualEffect: vi.fn(), destroy: vi.fn(), bounceOnce: vi.fn(), burstOnce: vi.fn() };
+    const oldCharacter = { setComposition: vi.fn(), getDiagnostics: vi.fn(), resetVisual: vi.fn(), stopVisualEffect: vi.fn(), destroy: vi.fn(), bounceOnce: vi.fn(), burstOnce: vi.fn() };
     await act(async () => { vi.mocked(Avatar).mock.calls.at(-1)?.[0]?.onReady?.(oldCharacter); });
     fireEvent.change(screen.getByLabelText("固定场景"), { target: { value: "C07" } });
     const next = screen.getByRole("button", { name: "发送下一条场景事件" });
     await act(async () => { fireEvent.click(next); }); // 排定绑定旧视觉代次的回调
     fireEvent.click(screen.getByRole("button", { name: "重建角色（保留输入与资格）" }));
-    const newCharacter = { setComposition: vi.fn(), resetVisual: vi.fn(), stopVisualEffect: vi.fn(), destroy: vi.fn(), bounceOnce: vi.fn(), burstOnce: vi.fn() };
+    const newCharacter = { setComposition: vi.fn(), getDiagnostics: vi.fn(), resetVisual: vi.fn(), stopVisualEffect: vi.fn(), destroy: vi.fn(), bounceOnce: vi.fn(), burstOnce: vi.fn() };
     await act(async () => { vi.mocked(Avatar).mock.calls.at(-1)?.[0]?.onReady?.(newCharacter); });
     await act(async () => { fireEvent.click(next); }); // 再次推进代次
     const resetCalls = newCharacter.resetVisual.mock.calls.length;
@@ -397,7 +397,7 @@ describe("独立 Avatar 预览页面", () => {
 
   it("C06的效果队列不伪装成业务task，结束A后显示B继续", async () => {
     await renderPage();
-    const character = { setComposition: vi.fn(), resetVisual: vi.fn(), stopVisualEffect: vi.fn(), destroy: vi.fn(), bounceOnce: vi.fn(), burstOnce: vi.fn() };
+    const character = { setComposition: vi.fn(), getDiagnostics: vi.fn(), resetVisual: vi.fn(), stopVisualEffect: vi.fn(), destroy: vi.fn(), bounceOnce: vi.fn(), burstOnce: vi.fn() };
     await act(async () => { vi.mocked(Avatar).mock.calls.at(-1)?.[0]?.onReady?.(character); });
     fireEvent.change(screen.getByLabelText("固定场景"), { target: { value: "C06" } });
     const next = screen.getByRole("button", { name: "发送下一条场景事件" });

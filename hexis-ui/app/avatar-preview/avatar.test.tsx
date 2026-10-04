@@ -10,6 +10,7 @@ vi.mock("@/lib/avatar-preview/engine", () => engine);
 function character(): Character {
   return {
     setComposition: vi.fn(),
+    getDiagnostics: vi.fn(),
     resetVisual: vi.fn(),
     stopVisualEffect: vi.fn(),
     destroy: vi.fn(),

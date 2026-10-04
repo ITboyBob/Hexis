@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { scenarios } from "./scenarios";
+import { sameValueUpdates, scenarios, transitions } from "./scenarios";
 import type { Identity } from "./contracts";
 
 const base: Identity = {
@@ -10,6 +10,14 @@ const base: Identity = {
 };
 
 describe("预览固定场景矩阵", () => {
+  it("生成182个唯一有序不同标签转换和14个同值更新", () => {
+    expect(transitions).toHaveLength(182);
+    expect(new Set(transitions.map(({ from, to }) => `${from}->${to}`)).size).toBe(182);
+    expect(transitions.every(({ from, to }) => from !== to)).toBe(true);
+    expect(sameValueUpdates).toHaveLength(14);
+    expect(sameValueUpdates.every(({ from, to }) => from === to)).toBe(true);
+  });
+
   it("保留C01-C11各自的事件或明确的外部调用限制", () => {
     expect(scenarios.slice(0, 11).map(({ id }) => id)).toEqual(Array.from({ length: 11 }, (_, i) => `C${String(i + 1).padStart(2, "0")}`));
     expect(scenarios.map(({ id }) => id)).toHaveLength(new Set(scenarios.map(({ id }) => id)).size);

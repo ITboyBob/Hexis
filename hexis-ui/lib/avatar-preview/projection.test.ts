@@ -157,10 +157,10 @@ describe("异步状态投影", () => {
     let state = initial("session-a");
     state = reduce(state, send({ type: "playback_open", playback_id: "p", output_epoch: 2, source: "simulated" }));
     state = reduce(state, send({ type: "playback", feedback: {
-      playback_id: "p", output_epoch: 2, phase: "cancel", progress: 0, amplitude: 0, source: "simulated",
+      playback_id: "p", output_epoch: 2, phase: "cancel", progress: 0, played_ms: 0, interval_ms: 0, amplitude: 0, source: "simulated",
     } }));
     state = reduce(state, send({ type: "playback", feedback: {
-      playback_id: "p", output_epoch: 2, phase: "playing", progress: 0.5, amplitude: 1, source: "simulated",
+      playback_id: "p", output_epoch: 2, phase: "playing", progress: 0.5, played_ms: 500, interval_ms: 0, amplitude: 1, source: "simulated",
     } }));
     expect(state.playback?.phase).toBe("cancel");
     expect(state.playback?.amplitude).toBe(0);
@@ -171,11 +171,11 @@ describe("异步状态投影", () => {
     let state = initial("session-a");
     state = reduce(state, send({ type: "playback_open", playback_id: "p", output_epoch: 1, source: "simulated" }));
     state = reduce(state, send({ type: "playback", feedback: {
-      playback_id: "p", output_epoch: 1, phase: "playing", progress: 0.4, amplitude: 4, source: "simulated",
+      playback_id: "p", output_epoch: 1, phase: "playing", progress: 0.4, played_ms: 400, interval_ms: 0, amplitude: 4, source: "simulated",
     } }));
     expect(state.playback?.amplitude).toBe(1);
     state = reduce(state, send({ type: "playback", feedback: {
-      playback_id: "p", output_epoch: 1, phase: "buffering", progress: 0.4, amplitude: 0.7, source: "simulated",
+      playback_id: "p", output_epoch: 1, phase: "buffering", progress: 0.4, played_ms: 400, interval_ms: 0, amplitude: 0.7, source: "simulated",
     } }));
     expect(state.playback?.amplitude).toBe(0);
   });
@@ -195,7 +195,7 @@ describe("异步状态投影", () => {
     let state = initial("session-a");
     state = reduce(state, send({ type: "playback_open", playback_id: "real-1", output_epoch: 1, source: "real" }));
     const forged = send({ type: "playback", feedback: {
-      playback_id: "real-1", output_epoch: 1, phase: "playing", progress: 2, amplitude: 1, source: "simulated",
+      playback_id: "real-1", output_epoch: 1, phase: "playing", progress: 2, played_ms: 2000, interval_ms: 0, amplitude: 1, source: "simulated",
     } });
     expect(eventReceipt(state, forged).accepted).toBe(false);
     const next = reduce(state, forged);

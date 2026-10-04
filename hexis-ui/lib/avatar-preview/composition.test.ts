@@ -53,7 +53,7 @@ describe("合成眼形、活动姿态和播放微动", () => {
     state = reduce(state, send({
       type: "playback", feedback: {
         playback_id: "play-1", output_epoch: 1, phase: "playing", progress: 0.5,
-        amplitude: 0.7, source: "real",
+        played_ms: 500, interval_ms: 0, amplitude: 0.7, source: "real",
       },
     }));
 
@@ -82,7 +82,7 @@ describe("合成眼形、活动姿态和播放微动", () => {
     state = reduce(state, send({
       type: "playback", feedback: {
         playback_id: "p", output_epoch: 1, phase, progress: 0,
-        amplitude: 0.8, source: "simulated",
+        played_ms: 0, interval_ms: 0, amplitude: 0.8, source: "simulated",
       },
     }));
     state = reduce(state, send({ type: "control", action: "reduced_motion", enabled: true }));

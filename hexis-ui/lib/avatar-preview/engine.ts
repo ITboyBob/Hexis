@@ -10,8 +10,28 @@ export type Composition = {
   reduced_motion: boolean;
 };
 
+export type EngineDiagnostics = {
+  destroyed: boolean;
+  composition: {
+    eye: string;
+    pose: string;
+    playing: boolean;
+    amplitude: number;
+    motion_limit_px: number;
+    reduced_motion: boolean;
+  } | null;
+  eyeFrom: number;
+  eyeTo: number;
+  eyeMorph: { x: number; t: number; v: number };
+  overlay: { x: number; t: number; v: number };
+  eyeMorphCount: number;
+  rafAlive: boolean;
+  eyePathsVisible: boolean;
+};
+
 export type Character = {
   setComposition(value: Composition): void;
+  getDiagnostics(): EngineDiagnostics;
   resetVisual(): void;
   stopVisualEffect(): void;
   destroy(): void;
