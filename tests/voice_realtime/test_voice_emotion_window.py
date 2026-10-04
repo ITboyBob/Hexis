@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+import pytest
+
 from services.avatar_emotion import InvalidEmotionLabel
 from services.voice_emotion_window import EmotionWindowHost, TimeoutKind
 
@@ -116,3 +118,43 @@ def test_transport_retries_remain_one_logical_call():
     metrics = host.call_metrics(value)
     assert metrics["logical_call_count"] == 1
     assert metrics["transport_attempts"] == 3
+
+
+def test_identity_rejects_negative_order_and_revision():
+    host = EmotionWindowHost(now=lambda: 0.0)
+    for field in ("input_order", "stimulus_revision"):
+        value = identity()
+        value[field] = -1
+        with pytest.raises(ValueError, match=field):
+            host.open(value, 100)
+
+
+def test_total_deadline_precedes_late_result_and_is_not_reclassified():
+    now = [0.0]
+    host = EmotionWindowHost(now=lambda: now[0])
+    value = identity()
+    host.open(value, 100)
+    host.close_for_timeout(value, TimeoutKind.TOTAL_DEADLINE)
+    now[0] = 100
+
+    rejected = host.accept_result(value)
+    assert rejected["accepted"] is False
+    assert rejected["fact"]["reason"] == "total_deadline"
+
+    host.record_late_result(value, {"label": "happy"}, status="valid")
+    assert host.current(value)["reason"] == "total_deadline"
+    assert host.late_diagnostics[-1].status == "valid"
+    assert host.late_diagnostics[-1].accepted is False
+
+
+def test_accept_result_does_not_close_at_deadline():
+    now = [0.0]
+    host = EmotionWindowHost(now=lambda: now[0])
+    value = identity()
+    host.open(value, 100)
+    now[0] = 100
+
+    rejected = host.accept_result(value)
+
+    assert rejected["accepted"] is False
+    assert rejected["fact"]["status"] == "open"

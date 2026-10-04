@@ -101,7 +101,6 @@ class EmotionWindowHost:
         if entry["fact"]["status"] != "open":
             return {"accepted": False, "fact": dict(entry["fact"])}
         if self._now() >= entry["deadline"]:
-            self._close_entry(entry, "model_timeout")
             return {"accepted": False, "fact": dict(entry["fact"])}
 
         if entry["timer"] is not None:
@@ -228,7 +227,7 @@ class EmotionWindowHost:
                 lambda: self._expire_entry(key, entry), remaining
             )
             return dict(entry["fact"])
-        self._close_entry(entry, "model_timeout")
+        self.close_for_timeout(entry["identity"], TimeoutKind.MODEL_TIMEOUT)
         return dict(entry["fact"])
 
     def _close_entry(self, entry: dict[str, Any], reason: str) -> None:
@@ -271,6 +270,10 @@ class EmotionWindowHost:
             raise ValueError("input_order must be an integer")
         if isinstance(stimulus_revision, bool) or not isinstance(stimulus_revision, int):
             raise ValueError("stimulus_revision must be an integer")
+        if input_order < 0:
+            raise ValueError("input_order must be greater than or equal to 0")
+        if stimulus_revision < 0:
+            raise ValueError("stimulus_revision must be greater than or equal to 0")
         normalized = {
             "session_id": str(identity["session_id"]),
             "input_turn_id": str(identity["input_turn_id"]),
