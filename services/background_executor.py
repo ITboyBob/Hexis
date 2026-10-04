@@ -15,6 +15,9 @@ from core.tools import ToolContext, ToolRegistry, create_default_registry
 from services.agent import build_system_prompt, render_chat_continuity_context_db
 
 
+_SUCCESS_CRITERIA = {"text", "tool", "text_and_tool"}
+
+
 @dataclass(frozen=True)
 class BackgroundTaskRequest:
     session_id: UUID
@@ -59,6 +62,9 @@ class BackgroundExecutor:
         return UUID(str(result.turn_id))
 
     async def run(self, request: BackgroundTaskRequest) -> dict[str, Any]:
+        if request.success_criteria not in _SUCCESS_CRITERIA:
+            raise ValueError("unsupported success criteria")
+
         async with self._pool.acquire() as conn:
             task_id = await conn.fetchval(
                 "SELECT create_background_task($1::uuid, $2::uuid, $3::jsonb)",
@@ -77,6 +83,7 @@ class BackgroundExecutor:
             if execution_id is None:
                 raise RuntimeError("background task could not be claimed")
 
+        turn_id: UUID | None = None
         try:
             llm_config = await self._load_config()
             registry = await self._create_registry()
@@ -132,8 +139,8 @@ class BackgroundExecutor:
                 surface="background",
             )
             result = await AgentLoop(config).run(user_message)
-            succeeded = self._succeeded(result, request.success_criteria)
             turn_id = self._turn_id(result)
+            criteria_met = self._succeeded(result, request.success_criteria)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             async with self._pool.acquire() as conn:
@@ -142,22 +149,25 @@ class BackgroundExecutor:
                     task_id,
                     execution_id,
                     error,
-                    None,
+                    turn_id,
                 )
             raise
 
-        if succeeded:
+        task_updated: bool
+        if criteria_met:
             result_payload = {
                 "text": result.visible_text or result.text,
                 "tool_results": result.tool_results,
             }
             async with self._pool.acquire() as conn:
-                await conn.fetchval(
-                    "SELECT complete_background_task($1::uuid, $2::uuid, $3::jsonb, $4::uuid)",
-                    task_id,
-                    execution_id,
-                    json.dumps(result_payload, default=str),
-                    turn_id,
+                task_updated = bool(
+                    await conn.fetchval(
+                        "SELECT complete_background_task($1::uuid, $2::uuid, $3::jsonb, $4::uuid)",
+                        task_id,
+                        execution_id,
+                        json.dumps(result_payload, default=str),
+                        turn_id,
+                    )
                 )
         else:
             if result.timed_out:
@@ -167,16 +177,22 @@ class BackgroundExecutor:
             else:
                 error = result.stopped_reason or "task_failed"
             async with self._pool.acquire() as conn:
-                await conn.fetchval(
-                    "SELECT fail_background_task($1::uuid, $2::uuid, $3::text, $4::uuid)",
-                    task_id,
-                    execution_id,
-                    error,
-                    turn_id,
+                task_updated = bool(
+                    await conn.fetchval(
+                        "SELECT fail_background_task($1::uuid, $2::uuid, $3::text, $4::uuid)",
+                        task_id,
+                        execution_id,
+                        error,
+                        turn_id,
+                    )
                 )
+
+        succeeded = criteria_met and task_updated
 
         return {
             "task_id": str(task_id),
             "execution_id": str(execution_id),
+            "criteria_met": criteria_met,
+            "task_updated": task_updated,
             "succeeded": succeeded,
         }
