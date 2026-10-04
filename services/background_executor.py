@@ -43,6 +43,15 @@ class _EventBridgeState:
     error: Exception | None = None
 
 
+class _TerminalEventError(RuntimeError):
+    def __init__(self, event_type: str, original: Exception) -> None:
+        super().__init__(
+            f"background task {event_type} event write failed: {original}"
+        )
+        self.event_type = event_type
+        self.original = original
+
+
 class BackgroundExecutor:
     def __init__(self, pool: Any) -> None:
         self._pool = pool
@@ -242,21 +251,6 @@ class BackgroundExecutor:
             error = result.stopped_reason or "task_failed"
 
         async with self._pool.acquire() as conn:
-            transaction = conn.transaction()
-            await transaction.start()
-            marked_unknown = bool(
-                await conn.fetchval(
-                    "SELECT mark_background_task_unknown($1::uuid, $2::uuid, $3::text, $4::uuid)",
-                    UUID(state.task_id),
-                    UUID(state.execution_id),
-                    "terminal event pending",
-                    turn_id,
-                )
-            )
-            if not marked_unknown:
-                await transaction.rollback()
-                return False
-
             if criteria_met:
                 updated = bool(
                     await conn.fetchval(
@@ -282,23 +276,20 @@ class BackgroundExecutor:
                 event_type = "task_failed"
                 event_payload = {"error": error}
 
-            if not updated:
-                await transaction.rollback()
-                return False
+        if not updated:
+            return False
 
-            try:
-                event_turn_id = await self._event_turn_id(turn_id)
-                await self._emit_task_event(
-                    state,
-                    event_type=event_type,
-                    payload=event_payload,
-                    turn_id=event_turn_id,
-                )
-                await transaction.commit()
-                return True
-            except Exception:
-                await transaction.rollback()
-                raise
+        try:
+            event_turn_id = await self._event_turn_id(turn_id)
+            await self._emit_task_event(
+                state,
+                event_type=event_type,
+                payload=event_payload,
+                turn_id=event_turn_id,
+            )
+        except Exception as exc:
+            raise _TerminalEventError(event_type, exc) from exc
+        return True
 
     async def run(self, request: BackgroundTaskRequest) -> dict[str, Any]:
         if request.success_criteria not in _SUCCESS_CRITERIA:
@@ -409,6 +400,8 @@ class BackgroundExecutor:
                 criteria=request.success_criteria,
                 turn_id=turn_id,
             )
+        except _TerminalEventError:
+            raise
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             await self._fail_run(

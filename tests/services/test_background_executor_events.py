@@ -253,6 +253,93 @@ async def test_background_executor_records_task_and_tool_events(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_terminal_event_failure_preserves_real_task_terminal_state(
+    db_pool,
+    monkeypatch,
+):
+    _patch_explicit_assembly(monkeypatch)
+    recorded: list[BehaviorEvent] = []
+
+    async def failing_terminal_record(
+        pool: Any,
+        event: BehaviorEvent,
+    ) -> dict[str, Any]:
+        if event.event_type == "task_completed":
+            raise RuntimeError("terminal behavior log unavailable")
+        recorded.append(event)
+        return {
+            "event_id": str(event.event_id),
+            "seq": len(recorded),
+            "deduplicated": False,
+        }
+
+    monkeypatch.setattr(
+        "services.background_executor.record_behavior_event",
+        failing_terminal_record,
+    )
+
+    async def fake_agent_run(
+        self: AgentLoop,
+        user_message: str,
+        history: list[dict[str, Any]] | None = None,
+        user_content: Any | None = None,
+    ) -> AgentLoopResult:
+        return _loop_result()
+
+    monkeypatch.setattr(AgentLoop, "run", fake_agent_run)
+
+    async with db_pool.acquire() as conn:
+        session_id = await conn.fetchval(
+            "INSERT INTO chat_sessions DEFAULT VALUES RETURNING id"
+        )
+
+    command_id = uuid4()
+    executor = BackgroundExecutor(db_pool)
+    request = BackgroundTaskRequest(
+        session_id=session_id,
+        command_id=command_id,
+        instruction="preserve real terminal state",
+        success_criteria="text",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="task_completed event write failed",
+    ):
+        await executor.run(request)
+
+    assert [event.event_type for event in recorded] == [
+        "task_queued",
+        "task_started",
+    ]
+
+    async with db_pool.acquire() as conn:
+        task = await conn.fetchrow(
+            """
+            SELECT status, error, current_execution_id
+            FROM background_tasks WHERE command_id=$1
+            """,
+            command_id,
+        )
+        execution = await conn.fetchrow(
+            """
+            SELECT status, error
+            FROM background_task_executions WHERE id=$1
+            """,
+            task["current_execution_id"],
+        )
+
+    assert task["status"] == "completed"
+    assert task["error"] is None
+    assert execution["status"] == "completed"
+    assert execution["error"] is None
+    assert all(
+        event.event_type not in {"task_completed", "task_failed"}
+        for event in recorded
+    )
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_event_retry_reuses_event_object_and_id(db_pool, monkeypatch):
     recorded: list[BehaviorEvent] = []
 
