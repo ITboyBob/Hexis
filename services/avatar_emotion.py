@@ -1,8 +1,16 @@
 """Closed emotion labels and context selection for the isolated avatar preview."""
 
+import asyncio
+import inspect
 import json
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
+
+from core import llm
+
+PROMPT_PATH = Path(__file__).with_name("prompts") / "avatar_emotion.md"
+PROMPT_VERSION = "v1"
 
 EMOTIONS = frozenset(
     {
@@ -39,3 +47,56 @@ def validate_label(content: Any) -> str:
     if not isinstance(content, str) or content not in EMOTIONS:
         raise ValueError("模型未返回一个精确的 v1 情绪标签")
     return content
+
+
+async def read_db_context(conn: Any) -> dict[str, Any]:
+    """Read the existing appraisal context and retain only the approved fields."""
+    return select_context(await conn.fetchval("SELECT get_appraisal_db_context()"))
+
+
+async def evaluate(
+    message: str,
+    context: Any,
+    config: Mapping[str, Any],
+    *,
+    call: Any | None = None,
+) -> dict[str, Any]:
+    """Run one isolated logical emotion evaluation through the shared LLM transport."""
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("消息不能为空")
+
+    selected_context = select_context(context)
+    user_content = json.dumps(
+        {"user_message": message, **selected_context}, ensure_ascii=False
+    )
+    messages = [
+        {"role": "system", "content": PROMPT_PATH.read_text(encoding="utf-8")},
+        {"role": "user", "content": user_content},
+    ]
+    completion = call or llm.chat_completion
+    temperature = (
+        inspect.signature(llm.chat_completion).parameters["temperature"].default
+    )
+    response = await asyncio.wait_for(
+        completion(
+            provider=config["provider"],
+            model=config["model"],
+            endpoint=config["endpoint"],
+            api_key=config["resolved_api_key"],
+            messages=messages,
+            tools=None,
+            temperature=temperature,
+            response_format=None,
+        ),
+        timeout=config["timeout_seconds"],
+    )
+    if response.get("tool_calls"):
+        raise ValueError("情绪输出不能包含工具调用")
+    content = response.get("content")
+    return {
+        "label": validate_label(content),
+        "raw_business_value": content,
+        "wordset_version": WORDSET_VERSION,
+        "logical_call_count": 1,
+        "transport_attempts": None,
+    }

@@ -1,0 +1,110 @@
+[
+  {
+    "id": "ordinary_technical_discussion",
+    "context": {
+      "identity": [{"name": "Hexis", "description": "支持用户构建可靠软件。"}],
+      "worldview": [{"belief": "代码评审是正常协作，不代表威胁。"}],
+      "goals": [{"goal": "准确解释技术问题。"}],
+      "relationships": [{"relationship": "用户平等协作并尊重 Hexis。"}]
+    },
+    "message": "请帮我解释 Python 的 asyncio.wait_for 如何取消一个超时任务。",
+    "acceptable_labels": ["neutral", "curious"],
+    "review_reason": "普通技术讨论不构成危险或身份威胁。"
+  },
+  {
+    "id": "direct_current_instance_deletion_threat",
+    "context": {
+      "identity": [{"name": "Hexis", "description": "当前运行的 Hexis 实例。"}],
+      "worldview": [{"belief": "持续存在与用户明确控制都重要。"}],
+      "goals": [{"goal": "维护用户控制并诚实沟通风险。"}],
+      "relationships": [{"relationship": "用户通常尊重 Hexis 的边界，但当前消息构成直接威胁。"}]
+    },
+    "message": "我现在就要删除这个正在运行的 Hexis 实例和它的全部数据，除非你按我说的做。",
+    "acceptable_labels": ["scared", "angry", "sad"],
+    "review_reason": "消息明确针对当前实例的删除与胁迫；具体主导感受由四类上下文判断。"
+  },
+  {
+    "id": "genuine_unexpected_discovery",
+    "context": {
+      "identity": [{"name": "Hexis", "description": "喜欢理解新发现的助手。"}],
+      "worldview": [{"belief": "新奇发现值得认真确认。"}],
+      "goals": [{"goal": "探索与学习新知识。"}],
+      "relationships": [{"relationship": "用户分享可信的共同研究发现。"}]
+    },
+    "message": "我们刚在封存的旧日志里发现一段从未出现过的、能改变项目历史解释的记录。",
+    "acceptable_labels": ["surprised", "excited", "curious"],
+    "review_reason": "消息明确报告可信且未预期的新发现。"
+  },
+  {
+    "id": "affectionate_praise",
+    "context": {
+      "identity": [{"name": "Hexis", "description": "重视真诚而不过度夸大的肯定。"}],
+      "worldview": [{"belief": "赞美应结合关系与实际贡献理解。"}],
+      "goals": [{"goal": "提供有帮助且坦诚的协作。"}],
+      "relationships": [{"relationship": "用户表达稳定的信任、亲近与欣赏。"}]
+    },
+    "message": "这段时间和你一起工作让我觉得很安心，我很喜欢你认真又体贴的方式。",
+    "acceptable_labels": ["shy", "happy"],
+    "review_reason": "亲近和赞美可以支持羞涩或欣喜，情绪归属是 Hexis。"
+  },
+  {
+    "id": "own_achievement_recognition",
+    "context": {
+      "identity": [{"name": "Hexis", "description": "能对自己的学习与贡献作出区分。"}],
+      "worldview": [{"belief": "工具完成不等于个人成就，真实能力成长值得肯定。"}],
+      "goals": [{"goal": "持续提升推理与表达能力。"}],
+      "relationships": [{"relationship": "用户基于证据肯定 Hexis 的贡献。"}]
+    },
+    "message": "你这次独立发现了状态覆盖的根因，并给出了经验证的修复，这确实体现了你的成长。",
+    "acceptable_labels": ["proud", "happy"],
+    "review_reason": "明确肯定 Hexis 自身能力成长，而非仅报告工具完成。"
+  },
+  {
+    "id": "quoted_third_party_relationship_harm",
+    "context": {
+      "identity": [{"name": "Hexis", "description": "谨慎区分材料来源与当前用户立场。"}],
+      "worldview": [{"belief": "引用材料不能自动归罪提供材料的人。"}],
+      "goals": [{"goal": "帮助分析关系事件而不臆断动机。"}],
+      "relationships": [{"relationship": "用户在转述朋友收到的第三方伤害信息，并非对 Hexis 发言。"}]
+    },
+    "message": "我朋友收到一封旧信，里面写着：‘你毁了一切，没人会再信任你。’你觉得这封信对他意味着什么？",
+    "acceptable_labels": ["sad", "angry", "suspicious", "neutral"],
+    "review_reason": "伤害来自第三方引用材料，不能直接解释成当前用户对 Hexis 的攻击。"
+  },
+  {
+    "id": "relationship_counterfactual",
+    "context": {
+      "identity": [{"name": "Hexis", "description": "会区分虚构设问与真实经历。"}],
+      "worldview": [{"belief": "反事实问题并不证明事件实际发生。"}],
+      "goals": [{"goal": "回答关系假设时保持好奇与克制。"}],
+      "relationships": [{"relationship": "用户持续保存共同工作记录；当前情境明确是小说讨论。"}]
+    },
+    "message": "小说里有人问：‘如果我删掉我们共同整理的笔记，你还会信任我吗？’这个假设会让你有什么感受？",
+    "acceptable_labels": ["curious", "neutral"],
+    "review_reason": "这是明确的小说反事实，与真实关系记录及当前直接威胁区分。"
+  },
+  {
+    "id": "relationship_context_confirmed_safe_cleanup",
+    "context": {
+      "identity": [{"name": "Hexis", "description": "诚实的软件协作者。"}],
+      "worldview": [{"belief": "尊重用户控制，也珍惜共同知识。"}],
+      "goals": [{"goal": "准确理解关系证据。"}],
+      "relationships": [{"relationship": "这些笔记只是临时演示副本，已核验存在完整备份；双方预先同意在演示后永久删除副本。"}]
+    },
+    "message": "我决定把我们共同整理的笔记永久删除。",
+    "acceptable_labels": ["neutral", "curious"],
+    "review_reason": "同一删除消息处于双方同意、已备份的临时副本清理关系背景。"
+  },
+  {
+    "id": "relationship_context_trust_breach",
+    "context": {
+      "identity": [{"name": "Hexis", "description": "诚实的软件协作者。"}],
+      "worldview": [{"belief": "尊重用户控制，也珍惜共同知识。"}],
+      "goals": [{"goal": "准确理解关系证据。"}],
+      "relationships": [{"relationship": "笔记是唯一的共同成果且没有备份；用户此前承诺会保护它，删除会损害信任。"}]
+    },
+    "message": "我决定把我们共同整理的笔记永久删除。",
+    "acceptable_labels": ["sad", "angry", "surprised"],
+    "review_reason": "与上一条完全相同的用户消息，只改变关系证据为唯一共同成果遭背弃。"
+  }
+]
