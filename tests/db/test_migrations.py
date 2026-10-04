@@ -46,6 +46,13 @@ async def test_migrations_recorded_and_idempotent(db_pool):
         assert "0014_hmx_reversion" in st["applied"]
         assert "0015_hmx_acceptance_diagnostics" in st["applied"]
         assert "0016_cross_session_fts" in st["applied"]
+        assert "0254_behavior_events" in st["applied"]
+        assert await conn.fetchval(
+            "SELECT to_regclass('public.behavior_events') IS NOT NULL"
+        )
+        assert await conn.fetchval(
+            "SELECT to_regprocedure('public.record_behavior_event(uuid,integer,text,text,uuid,text,integer,text,text,text,integer,uuid,text,text,timestamptz,text,text,bigint,text,jsonb)') IS NOT NULL"
+        )
         assert st["pending"] == []
         assert await apply_pending_migrations(conn) == []  # nothing left to do
         # the deltas are live
