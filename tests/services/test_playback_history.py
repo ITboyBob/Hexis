@@ -121,6 +121,34 @@ async def test_interrupted_playback_with_progress_is_partial(db_pool):
     assert result["played_ms"] == 700
 
 
+async def test_get_pages_beyond_the_single_query_limit(db_pool):
+    history = PlaybackHistory(db_pool, _identity())
+    await history.open(start_ms=0)
+    await history.end(scope="partial", played_ms=900)
+    for index in range(1000):
+        await history.progress(
+            played_ms=1000 + index,
+            interval_ms=10,
+            phase="playing",
+        )
+
+    result = await history.get()
+    assert result["scope"] == "partial"
+    assert result["played_ms"] == 1999
+    assert result["event_count"] == 1002
+
+
+async def test_invalid_scope_is_rejected_before_write(db_pool):
+    history = PlaybackHistory(db_pool, _identity())
+
+    with pytest.raises(ValueError, match="scope must be complete"):
+        await history.end(scope="invalid", played_ms=100)
+
+    result = await history.get()
+    assert result["scope"] == "unknown"
+    assert result["event_count"] == 0
+
+
 async def test_generation_done_does_not_infer_playback_scope(db_pool):
     identity = _identity()
     history = PlaybackHistory(db_pool, identity)

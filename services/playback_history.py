@@ -14,6 +14,8 @@ from services.behavior_events import (
 )
 
 _SCOPES = {"complete", "partial", "unplayed", "unknown"}
+_PAGE_SIZE = 1000
+_MAX_EVENTS = 10000
 
 
 def _text(value: Any, name: str) -> str:
@@ -132,12 +134,18 @@ class PlaybackHistory:
         )
 
     async def get(self) -> dict[str, Any]:
-        events = await query_behavior_events(
-            self._pool,
-            session_id=self._identity.session_id,
-            response_id=self._identity.response_id,
-            limit=10000,
-        )
+        events: list[dict[str, Any]] = []
+        for offset in range(0, _MAX_EVENTS, _PAGE_SIZE):
+            page = await query_behavior_events(
+                self._pool,
+                session_id=self._identity.session_id,
+                response_id=self._identity.response_id,
+                limit=_PAGE_SIZE,
+                offset=offset,
+            )
+            events.extend(page)
+            if len(page) < _PAGE_SIZE:
+                break
         rows = [
             event
             for event in events
