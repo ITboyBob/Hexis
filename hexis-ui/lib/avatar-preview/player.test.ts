@@ -32,6 +32,36 @@ describe("本地播放器反馈", () => {
     await player.destroy();
   });
 
+  it("携带response_id/media_session_id/played_ms/interval_ms且终态后迟到反馈无效", async () => {
+    const audio = new FakeAudio();
+    const emitted: unknown[] = [];
+    const player = new LocalPlayer((value) => emitted.push(value), {
+      audio: audio as unknown as HTMLAudioElement,
+      createContext: () => fakeContext() as unknown as AudioContext,
+    });
+    await player.start(new File(["audio"], "clip.wav"), {
+      id: "play-1",
+      epoch: 7,
+      response_id: "resp-1",
+      media_session_id: "media-1",
+    });
+    audio.dispatchEvent(new Event("playing"));
+    expect(emitted.at(-1)).toMatchObject({
+      playback_id: "play-1",
+      output_epoch: 7,
+      response_id: "resp-1",
+      media_session_id: "media-1",
+      phase: "playing",
+      played_ms: 3000,
+    });
+    expect((emitted.at(-1) as { interval_ms: number }).interval_ms).toBeGreaterThanOrEqual(0);
+    audio.dispatchEvent(new Event("ended"));
+    const count = emitted.length;
+    audio.dispatchEvent(new Event("playing"));
+    expect(emitted).toHaveLength(count);
+    await player.destroy();
+  });
+
   it("destroy释放object URL与AudioContext，旧元素事件不再发出", async () => {
     const audio = new FakeAudio();
     const close = vi.fn(async () => undefined);

@@ -1,6 +1,11 @@
 import type { Playback } from "./contracts";
 
-type Identity = { id: string; epoch: number };
+type Identity = {
+  id: string;
+  epoch: number;
+  response_id?: string;
+  media_session_id?: string;
+};
 type Options = { audio?: HTMLAudioElement; createContext?: () => AudioContext };
 
 export class LocalPlayer {
@@ -16,6 +21,7 @@ export class LocalPlayer {
   private closed = true;
   private playing = false;
   private current?: Identity;
+  private lastFeedbackAt = 0;
   private handlers: Array<[string, EventListener]> = [];
 
   constructor(private readonly emit: (value: Playback) => void, options: Options = {}) {
@@ -37,10 +43,27 @@ export class LocalPlayer {
     this.playing = phase === "playing";
     if (["drained", "cancel", "error"].includes(phase)) this.closed = true;
     cancelAnimationFrame(this.raf);
-    this.emit({ playback_id: this.current.id, output_epoch: this.current.epoch,
-      phase, progress: Number.isFinite(this.audio.currentTime) ? this.audio.currentTime : 0,
-      amplitude: 0, source: "real" });
+    this.emitFeedback(this.current, phase, 0);
     if (this.playing) this.frame();
+  }
+
+  private emitFeedback(identity: Identity, phase: Playback["phase"], amplitude: number): void {
+    const now = performance.now();
+    const interval_ms = this.lastFeedbackAt ? Math.max(0, now - this.lastFeedbackAt) : 0;
+    this.lastFeedbackAt = now;
+    const progress = Number.isFinite(this.audio.currentTime) ? this.audio.currentTime : 0;
+    this.emit({
+      playback_id: identity.id,
+      output_epoch: identity.epoch,
+      response_id: identity.response_id,
+      media_session_id: identity.media_session_id,
+      phase,
+      progress,
+      played_ms: Math.round(progress * 1000),
+      interval_ms,
+      amplitude,
+      source: "real",
+    });
   }
 
   private frame = (): void => {
@@ -48,9 +71,7 @@ export class LocalPlayer {
     this.analyser.getByteTimeDomainData(this.samples);
     const sum = this.samples.reduce((total, byte) => total + ((byte - 128) / 128) ** 2, 0);
     const amplitude = Math.sqrt(sum / this.samples.length) * (this.audio.muted ? 0 : this.audio.volume);
-    this.emit({ playback_id: this.current.id, output_epoch: this.current.epoch, phase: "playing",
-      progress: Number.isFinite(this.audio.currentTime) ? this.audio.currentTime : 0,
-      amplitude: Math.max(0, Math.min(1, amplitude)), source: "real" });
+    this.emitFeedback(this.current, "playing", Math.max(0, Math.min(1, amplitude)));
     this.raf = requestAnimationFrame(this.frame);
   };
 
@@ -115,9 +136,7 @@ export class LocalPlayer {
     this.playing = false;
     cancelAnimationFrame(this.raf);
     this.audio.pause();
-    if (previous) this.emit({ playback_id: previous.id, output_epoch: previous.epoch,
-      phase: "cancel", progress: Number.isFinite(this.audio.currentTime) ? this.audio.currentTime : 0,
-      amplitude: 0, source: "real" });
+    if (previous) this.emitFeedback(previous, "cancel", 0);
     if (this.url) URL.revokeObjectURL(this.url);
     this.url = undefined;
   }

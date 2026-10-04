@@ -69,8 +69,12 @@ export type PlaybackPhase = "playing" | "buffering" | "drained" | "cancel" | "er
 export type Playback = {
   playback_id: string;
   output_epoch: number;
+  response_id?: string;
+  media_session_id?: string;
   phase: PlaybackPhase;
   progress: number;
+  played_ms: number;
+  interval_ms: number;
   amplitude: number;
   source: Source;
 };
