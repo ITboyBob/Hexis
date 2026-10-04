@@ -10,6 +10,16 @@ class UnknownProtocolEvent(ValueError):
     """A vendor event is outside the explicitly verified BOB-101 subset."""
 
 
+_FINAL_TRANSCRIPT_EVENTS = {
+    "input_audio_transcription.completed",
+    "conversation.item.input_audio_transcription.completed",
+}
+_PARTIAL_TRANSCRIPT_EVENTS = {
+    "input_audio_transcription.partial",
+    "conversation.item.input_audio_transcription.partial",
+}
+
+
 @dataclass(frozen=True)
 class ProtocolEvent:
     type: str
@@ -33,7 +43,7 @@ def parse_event(value: dict[str, Any]) -> ProtocolEvent:
             raw=value,
             session_id=session.get("id"),
         )
-    if event_type == "input_audio_transcription.completed":
+    if event_type in _FINAL_TRANSCRIPT_EVENTS:
         return ProtocolEvent(
             type="input_transcript_final",
             raw=value,
@@ -41,7 +51,7 @@ def parse_event(value: dict[str, Any]) -> ProtocolEvent:
             transcript=value.get("transcript"),
             is_final=True,
         )
-    if event_type == "input_audio_transcription.partial":
+    if event_type in _PARTIAL_TRANSCRIPT_EVENTS:
         return ProtocolEvent(
             type="input_transcript_partial",
             raw=value,
@@ -55,21 +65,34 @@ def parse_event(value: dict[str, Any]) -> ProtocolEvent:
         "response.done",
         "response.failed",
     }:
-        return ProtocolEvent(type=event_type, raw=value, response_id=value.get("response_id"))
+        return ProtocolEvent(
+            type=event_type, raw=value, response_id=value.get("response_id")
+        )
     raise UnknownProtocolEvent(event_type)
 
 
-def build_update_session(
-    instructions: str, *, model: str, voice: str
-) -> dict[str, Any]:
+def build_update_session(instructions: str, *, voice: str) -> dict[str, Any]:
     return {
         "type": "session.update",
         "session": {
-            "model": model,
+            "modalities": ["text", "audio"],
             "instructions": instructions,
+            "turn_detection": None,
             "audio": {
-                "input": {"format": "pcm 16000/s16le/mono"},
-                "output": {"format": "pcm 24000", "voice": voice},
+                "input": {
+                    "format": {
+                        "type": "pcm",
+                        "sample_rate": 16000,
+                        "sample_format": "s16le",
+                        "channels": 1,
+                        "packing": "interleaved",
+                        "channel_layout": "mono",
+                    }
+                },
+                "output": {
+                    "voice": voice,
+                    "format": {"type": "pcm", "sample_rate": 24000},
+                },
             },
         },
     }

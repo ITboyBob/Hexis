@@ -22,25 +22,36 @@ def test_parses_session_updated_gate_and_preserves_raw():
 
 
 def test_parses_input_final_and_rejects_partial_as_authorization_source():
-    event = parse_event(
-        {
-            "type": "input_audio_transcription.completed",
-            "item_id": "item-1",
-            "transcript": "请继续",
-            "is_final": True,
-        }
-    )
-    assert event.type == "input_transcript_final"
-    assert event.item_id == "item-1"
-    assert event.transcript == "请继续"
-    partial = parse_event(
-        {
-            "type": "input_audio_transcription.partial",
-            "item_id": "item-1",
-            "transcript": "请",
-        }
-    )
-    assert partial.type == "input_transcript_partial"
+    for event_type in [
+        "input_audio_transcription.completed",
+        "conversation.item.input_audio_transcription.completed",
+    ]:
+        event = parse_event(
+            {
+                "type": event_type,
+                "item_id": "item-1",
+                "transcript": "请继续",
+                "is_final": True,
+            }
+        )
+        assert event.type == "input_transcript_final"
+        assert event.item_id == "item-1"
+        assert event.transcript == "请继续"
+        assert event.is_final is True
+
+    for event_type in [
+        "input_audio_transcription.partial",
+        "conversation.item.input_audio_transcription.partial",
+    ]:
+        partial = parse_event(
+            {
+                "type": event_type,
+                "item_id": "item-1",
+                "transcript": "请",
+            }
+        )
+        assert partial.type == "input_transcript_partial"
+        assert partial.is_final is False
 
 
 def test_response_create_uses_nested_instructions_and_explicit_response_id():
@@ -52,15 +63,28 @@ def test_response_create_uses_nested_instructions_and_explicit_response_id():
 
 
 def test_update_session_uses_nested_audio_contract():
-    value = build_update_session("稳定层", model="qwen-realtime", voice="Tina")
+    value = build_update_session("稳定层", voice="Tina")
     assert value == {
         "type": "session.update",
         "session": {
-            "model": "qwen-realtime",
+            "modalities": ["text", "audio"],
             "instructions": "稳定层",
+            "turn_detection": None,
             "audio": {
-                "input": {"format": "pcm 16000/s16le/mono"},
-                "output": {"format": "pcm 24000", "voice": "Tina"},
+                "input": {
+                    "format": {
+                        "type": "pcm",
+                        "sample_rate": 16000,
+                        "sample_format": "s16le",
+                        "channels": 1,
+                        "packing": "interleaved",
+                        "channel_layout": "mono",
+                    }
+                },
+                "output": {
+                    "voice": "Tina",
+                    "format": {"type": "pcm", "sample_rate": 24000},
+                },
             },
         },
     }

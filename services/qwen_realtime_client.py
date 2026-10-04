@@ -7,6 +7,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from services.qwen_realtime_protocol import (
     ProtocolEvent,
@@ -17,6 +18,19 @@ from services.qwen_realtime_protocol import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _endpoint_with_model(endpoint: str, model: str) -> str:
+    parsed = urlsplit(endpoint)
+    query = [
+        item
+        for item in parse_qsl(parsed.query, keep_blank_values=True)
+        if item[0] != "model"
+    ]
+    query.append(("model", model))
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
+    )
 
 
 class QwenRealtimeConnectionError(RuntimeError):
@@ -65,9 +79,10 @@ class QwenRealtimeClient:
         if self._websocket is not None:
             raise RuntimeError("Qwen Realtime WebSocket 已连接")
 
+        effective_endpoint = _endpoint_with_model(self.endpoint, self.model)
         try:
             websocket = await self.connect_factory(
-                self.endpoint,
+                effective_endpoint,
                 extra_headers={"Authorization": f"Bearer {self.api_key}"},
             )
         except Exception as exc:
@@ -80,9 +95,7 @@ class QwenRealtimeClient:
         loop = asyncio.get_running_loop()
         self._session_ready = loop.create_future()
         try:
-            await self._send(
-                build_update_session(instructions, model=self.model, voice=self.voice)
-            )
+            await self._send(build_update_session(instructions, voice=self.voice))
             self._receive_task = asyncio.create_task(
                 self._receive_loop(), name="qwen-realtime-receive"
             )
@@ -98,9 +111,7 @@ class QwenRealtimeClient:
     async def commit_audio(self) -> None:
         await self._send({"type": "input_audio_buffer.commit"})
 
-    async def create_first_response(
-        self, response_id: str, instructions: str
-    ) -> None:
+    async def create_first_response(self, response_id: str, instructions: str) -> None:
         await self._send(build_first_response(response_id, instructions))
 
     async def events(self) -> AsyncIterator[ProtocolEvent]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 
@@ -37,6 +38,7 @@ def make_client(
     incoming: list[dict],
     *,
     connect_factory=None,
+    endpoint: str = "wss://qwen.example/realtime",
 ):
     observed: dict = {}
 
@@ -49,7 +51,7 @@ def make_client(
 
     return (
         QwenRealtimeClient(
-            endpoint="wss://qwen.example/realtime",
+            endpoint=endpoint,
             model="qwen-realtime",
             voice="Tina",
             api_key="explicit-key",
@@ -57,6 +59,22 @@ def make_client(
         ),
         observed,
     )
+
+
+async def test_connect_merges_model_into_endpoint_query():
+    client, observed = make_client(
+        [{"type": "session.updated", "session": {"id": "qwen-1"}}],
+        endpoint="wss://qwen.example/realtime?model=stale&foo=bar&model=older",
+    )
+
+    await client.connect("稳定层")
+
+    parsed = urlsplit(observed["endpoint"])
+    assert parsed.scheme == "wss"
+    assert parsed.netloc == "qwen.example"
+    assert parsed.path == "/realtime"
+    assert parse_qsl(parsed.query) == [("foo", "bar"), ("model", "qwen-realtime")]
+    await client.close()
 
 
 async def test_connect_waits_for_session_updated_and_does_not_send_response():
@@ -67,20 +85,37 @@ async def test_connect_waits_for_session_updated_and_does_not_send_response():
     session_id = await client.connect("稳定层")
 
     assert session_id == "qwen-1"
-    assert observed["endpoint"] == "wss://qwen.example/realtime"
+    assert parse_qsl(urlsplit(observed["endpoint"]).query) == [
+        ("model", "qwen-realtime")
+    ]
     assert observed["extra_headers"] == {"Authorization": "Bearer explicit-key"}
     assert client.websocket.sent[0] == {
         "type": "session.update",
         "session": {
-            "model": "qwen-realtime",
+            "modalities": ["text", "audio"],
             "instructions": "稳定层",
+            "turn_detection": None,
             "audio": {
-                "input": {"format": "pcm 16000/s16le/mono"},
-                "output": {"format": "pcm 24000", "voice": "Tina"},
+                "input": {
+                    "format": {
+                        "type": "pcm",
+                        "sample_rate": 16000,
+                        "sample_format": "s16le",
+                        "channels": 1,
+                        "packing": "interleaved",
+                        "channel_layout": "mono",
+                    }
+                },
+                "output": {
+                    "voice": "Tina",
+                    "format": {"type": "pcm", "sample_rate": 24000},
+                },
             },
         },
     }
-    assert all(message["type"] != "response.create" for message in client.websocket.sent)
+    assert all(
+        message["type"] != "response.create" for message in client.websocket.sent
+    )
     await client.close()
 
 
@@ -91,16 +126,13 @@ async def test_connect_rejects_missing_session_id():
         await client.connect("稳定层")
 
     assert all(
-        message["type"] != "response.create"
-        for message in observed["websocket"].sent
+        message["type"] != "response.create" for message in observed["websocket"].sent
     )
     await client.close()
 
 
 async def test_audio_methods_send_facts_without_authorization():
-    client, _ = make_client(
-        [{"type": "session.updated", "session": {"id": "qwen-1"}}]
-    )
+    client, _ = make_client([{"type": "session.updated", "session": {"id": "qwen-1"}}])
     await client.connect("稳定层")
     client.websocket.sent.clear()
 
@@ -114,7 +146,9 @@ async def test_audio_methods_send_facts_without_authorization():
         },
         {"type": "input_audio_buffer.commit"},
     ]
-    assert all(message["type"] != "input_committed" for message in client.websocket.sent)
+    assert all(
+        message["type"] != "input_committed" for message in client.websocket.sent
+    )
     await client.close()
 
 
@@ -123,12 +157,12 @@ async def test_wait_for_final_ignores_partial():
         [
             {"type": "session.updated", "session": {"id": "qwen-1"}},
             {
-                "type": "input_audio_transcription.partial",
+                "type": "conversation.item.input_audio_transcription.partial",
                 "item_id": "item-1",
                 "transcript": "请",
             },
             {
-                "type": "input_audio_transcription.completed",
+                "type": "conversation.item.input_audio_transcription.completed",
                 "item_id": "item-1",
                 "transcript": "请继续",
                 "is_final": True,
@@ -147,11 +181,11 @@ async def test_wait_for_final_ignores_partial():
 
 
 async def test_create_first_response_requires_explicit_call():
-    client, _ = make_client(
-        [{"type": "session.updated", "session": {"id": "qwen-1"}}]
-    )
+    client, _ = make_client([{"type": "session.updated", "session": {"id": "qwen-1"}}])
     await client.connect("稳定层")
-    assert all(message["type"] != "response.create" for message in client.websocket.sent)
+    assert all(
+        message["type"] != "response.create" for message in client.websocket.sent
+    )
 
     await client.create_first_response("resp-1", "每轮上下文")
 
@@ -179,9 +213,7 @@ async def test_unknown_event_is_logged_and_connection_continues(caplog):
 
 
 async def test_close_cancels_local_task_and_closes_websocket():
-    client, _ = make_client(
-        [{"type": "session.updated", "session": {"id": "qwen-1"}}]
-    )
+    client, _ = make_client([{"type": "session.updated", "session": {"id": "qwen-1"}}])
     await client.connect("稳定层")
     task = client._receive_task
     websocket = client.websocket
