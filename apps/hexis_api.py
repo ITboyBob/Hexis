@@ -220,6 +220,7 @@ class PlaybackEventRequest(BaseModel):
     session_id: uuid.UUID
     response_id: str = Field(min_length=1, max_length=200)
     playback_id: str = Field(min_length=1, max_length=200)
+    producer_seq: int = Field(ge=0, strict=True)
     output_epoch: int = Field(ge=0)
     media_session_id: str = Field(min_length=1, max_length=200)
     turn_id: uuid.UUID | None = None
@@ -2556,11 +2557,15 @@ async def record_voice_playback(req: PlaybackEventRequest):
     if req.action == "open":
         if req.start_ms is None:
             raise HTTPException(status_code=422, detail="start_ms is required")
-        return await history.open(start_ms=req.start_ms)
+        return await history.open(
+            start_ms=req.start_ms, producer_seq=req.producer_seq
+        )
     if req.action == "audible":
         if req.audible_ms is None:
             raise HTTPException(status_code=422, detail="audible_ms is required")
-        return await history.audible(audible_ms=req.audible_ms)
+        return await history.audible(
+            audible_ms=req.audible_ms, producer_seq=req.producer_seq
+        )
     if req.action == "progress":
         if req.played_ms is None or req.interval_ms is None or req.phase is None:
             raise HTTPException(
@@ -2571,16 +2576,21 @@ async def record_voice_playback(req: PlaybackEventRequest):
             played_ms=req.played_ms,
             interval_ms=req.interval_ms,
             phase=req.phase,
+            producer_seq=req.producer_seq,
         )
     if req.action == "end":
         if req.scope is None or req.played_ms is None:
             raise HTTPException(
                 status_code=422, detail="scope and played_ms are required"
             )
-        return await history.end(scope=req.scope, played_ms=req.played_ms)
+        return await history.end(
+            scope=req.scope, played_ms=req.played_ms, producer_seq=req.producer_seq
+        )
     if req.played_ms is None or req.reason is None:
         raise HTTPException(status_code=422, detail="played_ms and reason are required")
-    return await history.interrupt(reason=req.reason, played_ms=req.played_ms)
+    return await history.interrupt(
+        reason=req.reason, played_ms=req.played_ms, producer_seq=req.producer_seq
+    )
 
 
 @app.get("/api/voice/status")

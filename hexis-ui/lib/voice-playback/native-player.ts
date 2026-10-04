@@ -19,6 +19,7 @@ export type NativePlaybackEventRequest = {
   session_id: string;
   playback_id: string;
   response_id: string;
+  producer_seq: number;
   output_epoch: number;
   media_session_id: string;
   start_ms?: number;
@@ -45,6 +46,7 @@ export class NativeOutputPlayer {
   private pendingFeedback: Playback[] = [];
   private lastProgressPhase?: Playback["phase"];
   private suppressingProgressEcho = false;
+  private producerSeq = 0;
 
   constructor(private readonly options: NativeOutputPlayerOptions) {}
 
@@ -179,10 +181,12 @@ export class NativeOutputPlayer {
       "session_id" | "playback_id" | "response_id" | "output_epoch" | "media_session_id"
     >,
   ): void {
+    const producer_seq = ++this.producerSeq;
     const request: NativePlaybackEventRequest = {
       session_id: this.options.session_id,
       playback_id: this.options.identity.playback_id,
       response_id: this.options.identity.response_id,
+      producer_seq,
       output_epoch: this.options.identity.output_epoch,
       media_session_id: this.options.identity.media_session_id,
       ...event,

@@ -63,8 +63,17 @@ class PlaybackHistory:
         self._identity = identity
         self._producer_seq = 0
 
-    async def _record(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-        self._producer_seq += 1
+    async def _record(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        producer_seq: int | None,
+    ) -> dict[str, Any]:
+        if producer_seq is None:
+            self._producer_seq += 1
+        else:
+            producer_seq = _nonnegative(producer_seq, "producer_seq")
+            self._producer_seq = max(self._producer_seq, producer_seq)
         event = BehaviorEvent(
             event_id=uuid4(),
             schema_version=1,
@@ -73,7 +82,11 @@ class PlaybackHistory:
             session_id=self._identity.session_id,
             source="voice-playback",
             producer_id="voice-playback-client",
-            producer_seq=self._producer_seq,
+            producer_seq=(
+                self._producer_seq
+                if producer_seq is None
+                else producer_seq
+            ),
             channel="voice",
             payload={
                 **payload,
@@ -90,19 +103,31 @@ class PlaybackHistory:
         )
         return await record_behavior_event(self._pool, event)
 
-    async def open(self, *, start_ms: int) -> dict[str, Any]:
+    async def open(
+        self, *, start_ms: int, producer_seq: int | None = None
+    ) -> dict[str, Any]:
         return await self._record(
-            "voice_playback_started", {"start_ms": _nonnegative(start_ms, "start_ms")}
+            "voice_playback_started",
+            {"start_ms": _nonnegative(start_ms, "start_ms")},
+            producer_seq,
         )
 
-    async def audible(self, *, audible_ms: int) -> dict[str, Any]:
+    async def audible(
+        self, *, audible_ms: int, producer_seq: int | None = None
+    ) -> dict[str, Any]:
         return await self._record(
             "voice_first_audible",
             {"audible_ms": _nonnegative(audible_ms, "audible_ms")},
+            producer_seq,
         )
 
     async def progress(
-        self, *, played_ms: int, interval_ms: int, phase: str
+        self,
+        *,
+        played_ms: int,
+        interval_ms: int,
+        phase: str,
+        producer_seq: int | None = None,
     ) -> dict[str, Any]:
         return await self._record(
             "voice_playback_progress",
@@ -111,9 +136,12 @@ class PlaybackHistory:
                 "interval_ms": _nonnegative(interval_ms, "interval_ms"),
                 "phase": _text(phase, "phase"),
             },
+            producer_seq,
         )
 
-    async def end(self, *, scope: str, played_ms: int) -> dict[str, Any]:
+    async def end(
+        self, *, scope: str, played_ms: int, producer_seq: int | None = None
+    ) -> dict[str, Any]:
         if scope not in _SCOPES:
             raise ValueError("scope must be complete, partial, unplayed, or unknown")
         return await self._record(
@@ -122,15 +150,19 @@ class PlaybackHistory:
                 "scope": scope,
                 "played_ms": _nonnegative(played_ms, "played_ms"),
             },
+            producer_seq,
         )
 
-    async def interrupt(self, *, reason: str, played_ms: int) -> dict[str, Any]:
+    async def interrupt(
+        self, *, reason: str, played_ms: int, producer_seq: int | None = None
+    ) -> dict[str, Any]:
         return await self._record(
             "voice_playback_interrupted",
             {
                 "reason": _text(reason, "reason"),
                 "played_ms": _nonnegative(played_ms, "played_ms"),
             },
+            producer_seq,
         )
 
     async def get(self) -> dict[str, Any]:
@@ -154,6 +186,7 @@ class PlaybackHistory:
             and event.get("response_id") == self._identity.response_id
             and event.get("output_epoch") == self._identity.output_epoch
         ]
+        rows.sort(key=lambda event: event["producer_seq"])
         ended = next(
             (event for event in rows if event["event_type"] == "voice_playback_ended"),
             None,

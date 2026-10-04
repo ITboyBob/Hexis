@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from uuid import uuid4
 
 import pytest
@@ -9,6 +10,7 @@ from services.behavior_events import (
     query_behavior_events,
     record_behavior_event,
 )
+import services.playback_history as playback_history_module
 from services.playback_history import PlaybackHistory, PlaybackIdentity
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
@@ -62,6 +64,69 @@ async def test_records_playback_events_and_aggregates_history(db_pool):
     assert all(event["media_session_id"] == "media-1" for event in events)
     assert all(event["output_epoch"] == 1 for event in events)
     assert all(event["payload"]["playback_id"] == "play-1" for event in events)
+    assert [event["producer_seq"] for event in sorted(
+        events, key=lambda event: event["producer_seq"]
+    )] == [1, 2, 3, 4]
+
+
+async def test_explicit_producer_seq_does_not_break_internal_increment(db_pool):
+    identity = _identity()
+    history = PlaybackHistory(db_pool, identity)
+
+    await history.open(start_ms=0, producer_seq=10)
+    await history.audible(audible_ms=100, producer_seq=11)
+    await history.progress(played_ms=200, interval_ms=100, phase="playing")
+
+    events = await query_behavior_events(
+        db_pool,
+        session_id=identity.session_id,
+        response_id=identity.response_id,
+    )
+    assert [event["producer_seq"] for event in sorted(
+        events, key=lambda event: event["producer_seq"]
+    )] == [10, 11, 12]
+
+
+async def test_invalid_explicit_producer_seq_is_rejected_before_write(db_pool):
+    history = PlaybackHistory(db_pool, _identity())
+
+    with pytest.raises(ValueError, match="producer_seq must be a non-negative integer"):
+        await history.open(start_ms=0, producer_seq=-1)
+
+    result = await history.get()
+    assert result["event_count"] == 0
+
+
+async def test_get_orders_concurrent_events_by_producer_seq(db_pool, monkeypatch):
+    identity = _identity()
+    history = PlaybackHistory(db_pool, identity)
+    original_record = playback_history_module.record_behavior_event
+
+    async def delayed_interrupt_record(pool, event):
+        if event.producer_seq == 2:
+            await asyncio.sleep(0.05)
+        return await original_record(pool, event)
+
+    monkeypatch.setattr(
+        playback_history_module, "record_behavior_event", delayed_interrupt_record
+    )
+    await asyncio.gather(
+        history.end(scope="complete", played_ms=1000, producer_seq=1),
+        history.interrupt(reason="user-stop", played_ms=900, producer_seq=2),
+    )
+
+    events = await query_behavior_events(
+        db_pool,
+        session_id=identity.session_id,
+        response_id=identity.response_id,
+    )
+    assert [event["event_type"] for event in events] == [
+        "voice_playback_interrupted",
+        "voice_playback_ended",
+    ]
+
+    result = await history.get()
+    assert result["scope"] == "complete"
 
 
 @pytest.mark.parametrize(

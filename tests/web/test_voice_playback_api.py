@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from uuid import uuid4
 
 import httpx
 import pytest
 
 import apps.hexis_api as hexis_api
+from services.behavior_events import query_behavior_events
 from services.playback_history import PlaybackHistory, PlaybackIdentity
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
@@ -13,12 +15,13 @@ pytestmark = pytest.mark.asyncio(loop_scope="session")
 SESSION_ID = "11111111-1111-1111-1111-111111111111"
 
 
-def _body(action: str, **overrides):
+def _body(action: str, producer_seq: int = 1, **overrides):
     body = {
         "action": action,
         "session_id": SESSION_ID,
         "response_id": "resp-1",
         "playback_id": "play-1",
+        "producer_seq": producer_seq,
         "output_epoch": 1,
         "media_session_id": "media-1",
     }
@@ -40,24 +43,24 @@ async def client(monkeypatch):
 async def test_playback_api_dispatches_every_action(client, monkeypatch):
     recorded = []
 
-    async def fake_open(self, *, start_ms):
-        recorded.append(("open", start_ms))
+    async def fake_open(self, *, start_ms, producer_seq):
+        recorded.append(("open", start_ms, producer_seq))
         return {"event_id": "1", "seq": 1, "deduplicated": False}
 
-    async def fake_audible(self, *, audible_ms):
-        recorded.append(("audible", audible_ms))
+    async def fake_audible(self, *, audible_ms, producer_seq):
+        recorded.append(("audible", audible_ms, producer_seq))
         return {"event_id": "2", "seq": 2, "deduplicated": False}
 
-    async def fake_progress(self, *, played_ms, interval_ms, phase):
-        recorded.append(("progress", played_ms, interval_ms, phase))
+    async def fake_progress(self, *, played_ms, interval_ms, phase, producer_seq):
+        recorded.append(("progress", played_ms, interval_ms, phase, producer_seq))
         return {"event_id": "3", "seq": 3, "deduplicated": False}
 
-    async def fake_end(self, *, scope, played_ms):
-        recorded.append(("end", scope, played_ms))
+    async def fake_end(self, *, scope, played_ms, producer_seq):
+        recorded.append(("end", scope, played_ms, producer_seq))
         return {"event_id": "4", "seq": 4, "deduplicated": False}
 
-    async def fake_interrupt(self, *, reason, played_ms):
-        recorded.append(("interrupt", reason, played_ms))
+    async def fake_interrupt(self, *, reason, played_ms, producer_seq):
+        recorded.append(("interrupt", reason, played_ms, producer_seq))
         return {"event_id": "5", "seq": 5, "deduplicated": False}
 
     monkeypatch.setattr(PlaybackHistory, "open", fake_open)
@@ -67,28 +70,42 @@ async def test_playback_api_dispatches_every_action(client, monkeypatch):
     monkeypatch.setattr(PlaybackHistory, "interrupt", fake_interrupt)
 
     responses = [
-        await client.post("/api/voice/playback", json=_body("open", start_ms=100)),
-        await client.post("/api/voice/playback", json=_body("audible", audible_ms=150)),
         await client.post(
-            "/api/voice/playback",
-            json=_body("progress", played_ms=500, interval_ms=100, phase="playing"),
-        ),
-        await client.post(
-            "/api/voice/playback", json=_body("end", scope="partial", played_ms=900)
+            "/api/voice/playback", json=_body("open", producer_seq=1, start_ms=100)
         ),
         await client.post(
             "/api/voice/playback",
-            json=_body("interrupt", reason="user-stop", played_ms=700),
+            json=_body("audible", producer_seq=2, audible_ms=150),
+        ),
+        await client.post(
+            "/api/voice/playback",
+            json=_body(
+                "progress",
+                producer_seq=3,
+                played_ms=500,
+                interval_ms=100,
+                phase="playing",
+            ),
+        ),
+        await client.post(
+            "/api/voice/playback",
+            json=_body("end", producer_seq=4, scope="partial", played_ms=900),
+        ),
+        await client.post(
+            "/api/voice/playback",
+            json=_body(
+                "interrupt", producer_seq=5, reason="user-stop", played_ms=700
+            ),
         ),
     ]
 
     assert [response.status_code for response in responses] == [200] * 5
     assert recorded == [
-        ("open", 100),
-        ("audible", 150),
-        ("progress", 500, 100, "playing"),
-        ("end", "partial", 900),
-        ("interrupt", "user-stop", 700),
+        ("open", 100, 1),
+        ("audible", 150, 2),
+        ("progress", 500, 100, "playing", 3),
+        ("end", "partial", 900, 4),
+        ("interrupt", "user-stop", 700, 5),
     ]
 
 
@@ -120,6 +137,22 @@ async def test_playback_api_rejects_unknown_action_and_extra_fields(client):
 
     assert unknown.status_code == 422
     assert extra.status_code == 422
+
+
+async def test_playback_api_requires_a_nonnegative_producer_seq(client):
+    missing_body = _body("open", start_ms=0)
+    missing_body.pop("producer_seq")
+    missing = await client.post("/api/voice/playback", json=missing_body)
+    negative = await client.post(
+        "/api/voice/playback", json=_body("open", producer_seq=-1, start_ms=0)
+    )
+    non_integer = await client.post(
+        "/api/voice/playback", json=_body("open", producer_seq="1", start_ms=0)
+    )
+
+    assert missing.status_code == 422
+    assert negative.status_code == 422
+    assert non_integer.status_code == 422
 
 
 async def test_playback_api_returns_503_before_database_is_ready(monkeypatch):
@@ -159,6 +192,7 @@ async def test_playback_api_records_real_events_through_shared_history(
                     session_id=str(identity.session_id),
                     response_id=identity.response_id,
                     playback_id=identity.playback_id,
+                    producer_seq=1,
                     output_epoch=identity.output_epoch,
                     media_session_id=identity.media_session_id,
                     start_ms=100,
@@ -171,6 +205,7 @@ async def test_playback_api_records_real_events_through_shared_history(
                     session_id=str(identity.session_id),
                     response_id=identity.response_id,
                     playback_id=identity.playback_id,
+                    producer_seq=2,
                     output_epoch=identity.output_epoch,
                     media_session_id=identity.media_session_id,
                     played_ms=500,
@@ -185,6 +220,7 @@ async def test_playback_api_records_real_events_through_shared_history(
                     session_id=str(identity.session_id),
                     response_id=identity.response_id,
                     playback_id=identity.playback_id,
+                    producer_seq=3,
                     output_epoch=identity.output_epoch,
                     media_session_id=identity.media_session_id,
                     scope="partial",
@@ -194,6 +230,12 @@ async def test_playback_api_records_real_events_through_shared_history(
         ]
 
     assert [response.status_code for response in responses] == [200, 200, 200]
+    events = await query_behavior_events(
+        db_pool, session_id=identity.session_id, response_id=identity.response_id
+    )
+    assert [event["producer_seq"] for event in sorted(
+        events, key=lambda event: event["producer_seq"]
+    )] == [1, 2, 3]
     result = await PlaybackHistory(db_pool, identity).get()
     assert result == {
         "playback_id": identity.playback_id,
@@ -204,3 +246,61 @@ async def test_playback_api_records_real_events_through_shared_history(
         "played_ms": 900,
         "event_count": 3,
     }
+
+
+async def test_playback_api_concurrent_requests_keep_producer_stream_order(
+    db_pool, monkeypatch
+):
+    identity = PlaybackIdentity(
+        session_id=uuid4(),
+        response_id=f"resp-{uuid4()}",
+        playback_id=f"play-{uuid4()}",
+        output_epoch=1,
+        media_session_id=f"media-{uuid4()}",
+    )
+    monkeypatch.setattr(hexis_api, "_pool", db_pool)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=hexis_api.app),
+        base_url="http://test",
+    ) as http:
+        open_request = http.post(
+            "/api/voice/playback",
+            json=_body(
+                "open",
+                producer_seq=1,
+                session_id=str(identity.session_id),
+                response_id=identity.response_id,
+                playback_id=identity.playback_id,
+                output_epoch=identity.output_epoch,
+                media_session_id=identity.media_session_id,
+                start_ms=0,
+            ),
+        )
+        interrupt_request = http.post(
+            "/api/voice/playback",
+            json=_body(
+                "interrupt",
+                producer_seq=2,
+                session_id=str(identity.session_id),
+                response_id=identity.response_id,
+                playback_id=identity.playback_id,
+                output_epoch=identity.output_epoch,
+                media_session_id=identity.media_session_id,
+                reason="user-stop",
+                played_ms=500,
+            ),
+        )
+        responses = await asyncio.gather(open_request, interrupt_request)
+
+    assert [response.status_code for response in responses] == [200, 200]
+    events = await query_behavior_events(
+        db_pool, session_id=identity.session_id, response_id=identity.response_id
+    )
+    ordered = sorted(events, key=lambda event: event["producer_seq"])
+    assert [event["producer_seq"] for event in ordered] == [1, 2]
+    assert [event["event_type"] for event in ordered] == [
+        "voice_playback_started",
+        "voice_playback_interrupted",
+    ]
+    result = await PlaybackHistory(db_pool, identity).get()
+    assert result["scope"] == "partial"

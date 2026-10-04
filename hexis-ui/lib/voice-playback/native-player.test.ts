@@ -88,23 +88,27 @@ describe("NativeOutputPlayer", () => {
 
     expect(events).toHaveLength(3);
     expect(events.at(count - 1)).toEqual(events.at(-1));
+    expect(events.map((event) => event.producer_seq)).toEqual([1, 2, 3]);
     expect(events[0]).toMatchObject({
       action: "open",
       session_id: "11111111-1111-1111-1111-111111111111",
       playback_id: "play-2",
       response_id: "resp-2",
+      producer_seq: 1,
       output_epoch: 2,
       media_session_id: "media-2",
       start_ms: 100,
     });
     expect(events[1]).toMatchObject({
       action: "progress",
+      producer_seq: 2,
       played_ms: 3000,
       interval_ms: expect.any(Number),
       phase: "playing",
     });
     expect(events[2]).toMatchObject({
       action: "end",
+      producer_seq: 3,
       scope: "complete",
       played_ms: 3000,
     });
@@ -129,6 +133,7 @@ describe("NativeOutputPlayer", () => {
     expect(stoppedEvents).toHaveLength(2);
     expect(stoppedEvents[1]).toMatchObject({
       action: "interrupt",
+      producer_seq: 2,
       reason: "player-stop",
       played_ms: 3000,
     });
@@ -150,6 +155,7 @@ describe("NativeOutputPlayer", () => {
     expect(errorEvents).toHaveLength(2);
     expect(errorEvents[1]).toMatchObject({
       action: "end",
+      producer_seq: 2,
       scope: "unknown",
       played_ms: 3000,
     });
