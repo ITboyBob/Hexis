@@ -69,7 +69,7 @@ class InputCommitReceipt:
 
 
 def _range_key(source: CaptureRange) -> str:
-    return f"{source.capture_instance_id}:{source.start_frame}:{source.end_frame}:{source.audio_sha256}"
+    return f"{source.capture_instance_id}:{source.start_frame}:{source.end_frame}"
 
 
 def _fingerprint(source: CaptureRange, value: FinalTranscript) -> str:

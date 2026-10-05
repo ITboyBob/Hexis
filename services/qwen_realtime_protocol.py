@@ -43,6 +43,12 @@ def parse_event(value: dict[str, Any]) -> ProtocolEvent:
             raw=value,
             session_id=session.get("id"),
         )
+    if event_type == "input_audio_buffer.committed":
+        return ProtocolEvent(
+            type="input_audio_buffer_committed",
+            raw=value,
+            item_id=value.get("item_id"),
+        )
     if event_type in _FINAL_TRANSCRIPT_EVENTS:
         return ProtocolEvent(
             type="input_transcript_final",

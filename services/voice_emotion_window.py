@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -12,16 +13,44 @@ from typing import Any
 
 
 def _default_schedule(callback: Callable[[], None], delay_ms: float) -> Any:
+    """Run the deadline on the event loop when available, else on a timer thread.
+
+    ``dispatch`` is a seam so tests can invoke the callback synchronously.
+    """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        return None
-    return loop.call_later(delay_ms / 1000, callback)
+        timer = threading.Timer(
+            delay_ms / 1000,
+            lambda: dispatch(callback, loop=None),
+        )
+        timer.daemon = True
+        timer.start()
+        return {"kind": "thread", "timer": timer}
+    handle = loop.call_later(delay_ms / 1000, lambda: dispatch(callback, loop=loop))
+    return {"kind": "loop", "handle": handle}
+
+
+def dispatch(callback: Callable[[], None], *, loop: Any = None) -> None:
+    """Invoke a scheduled deadline callback safely on its owning loop."""
+    if loop is None:
+        callback()
+        return
+    loop.call_soon_threadsafe(callback)
 
 
 def _default_cancel(handle: Any) -> None:
-    if handle is not None:
-        handle.cancel()
+    if handle is None:
+        return
+    if isinstance(handle, dict):
+        if handle.get("kind") == "loop":
+            handle["handle"].cancel()
+            return
+        timer = handle.get("timer")
+        if timer is not None:
+            timer.cancel()
+        return
+    handle.cancel()
 
 
 class TimeoutKind(str, Enum):
@@ -50,7 +79,10 @@ class EmotionWindowHost:
         schedule: Callable[[Callable[[], None], float], Any] | None = None,
         cancel: Callable[[Any], None] | None = None,
     ) -> None:
-        self._now = now or time.monotonic
+        if now is None:
+            self._now_ms = lambda: time.monotonic() * 1000.0
+        else:
+            self._now_ms = lambda: float(now()) * 1000.0
         self._schedule = schedule or _default_schedule
         self._cancel = cancel or _default_cancel
         self._entries: dict[tuple[str, str, int, int], dict[str, Any]] = {}
@@ -75,7 +107,7 @@ class EmotionWindowHost:
                 "owner": "service",
                 "decision_seq": 0,
             },
-            "deadline": self._now() + timeout_ms,
+            "deadline": self._now_ms() + timeout_ms,
             "timer": None,
             "logical_call_count": 1,
             "transport_attempts": 0,
@@ -100,7 +132,7 @@ class EmotionWindowHost:
             return {"accepted": False, "fact": None}
         if entry["fact"]["status"] != "open":
             return {"accepted": False, "fact": dict(entry["fact"])}
-        if self._now() >= entry["deadline"]:
+        if self._now_ms() >= entry["deadline"]:
             return {"accepted": False, "fact": dict(entry["fact"])}
 
         if entry["timer"] is not None:
@@ -155,7 +187,11 @@ class EmotionWindowHost:
         return diagnostic
 
     def record_late_error(
-        self, identity: Mapping[str, Any], error: BaseException
+        self,
+        identity: Mapping[str, Any],
+        error: BaseException,
+        *,
+        rejection_reason: str = "visual_window_closed",
     ) -> LateDiagnostic | None:
         key, _ = self._identity(identity)
         entry = self._entries.get(key)
@@ -166,6 +202,26 @@ class EmotionWindowHost:
             status="error",
             error_type=type(error).__name__,
             logical_call_count=entry["logical_call_count"],
+            rejection_reason=rejection_reason,
+        )
+        self._late_diagnostics.append(diagnostic)
+        return diagnostic
+
+    def record_cancellation(
+        self,
+        identity: Mapping[str, Any],
+        *,
+        rejection_reason: str = "coordinator_cancelled",
+    ) -> LateDiagnostic:
+        """Always record a cancellation diagnostic, even without a closed entry."""
+        key, normalized = self._identity(identity)
+        entry = self._entries.get(key)
+        diagnostic = LateDiagnostic(
+            identity=normalized,
+            status="error",
+            error_type="CancelledError",
+            logical_call_count=entry["logical_call_count"] if entry else 1,
+            rejection_reason=rejection_reason,
         )
         self._late_diagnostics.append(diagnostic)
         return diagnostic
@@ -221,7 +277,7 @@ class EmotionWindowHost:
             return None
         if entry["fact"]["status"] != "open":
             return dict(entry["fact"])
-        remaining = entry["deadline"] - self._now()
+        remaining = entry["deadline"] - self._now_ms()
         if remaining > 0:
             entry["timer"] = self._schedule(
                 lambda: self._expire_entry(key, entry), remaining
@@ -268,7 +324,9 @@ class EmotionWindowHost:
         stimulus_revision = identity["stimulus_revision"]
         if isinstance(input_order, bool) or not isinstance(input_order, int):
             raise ValueError("input_order must be an integer")
-        if isinstance(stimulus_revision, bool) or not isinstance(stimulus_revision, int):
+        if isinstance(stimulus_revision, bool) or not isinstance(
+            stimulus_revision, int
+        ):
             raise ValueError("stimulus_revision must be an integer")
         if input_order < 0:
             raise ValueError("input_order must be greater than or equal to 0")

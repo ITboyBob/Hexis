@@ -169,8 +169,7 @@ async def test_evaluation_release_without_context_does_not_call_first_response()
         return {"label": "happy", "logical_call_count": 1}
 
     async def hydrator(value, message):
-        await asyncio.sleep(0.02)
-        return SimpleNamespace(per_response_instructions="context", hydrate_ms=1.0)
+        raise RuntimeError("hydration unavailable")
 
     coordinator = VoiceEmotionCoordinator(
         context_reader=context_reader,
@@ -184,7 +183,166 @@ async def test_evaluation_release_without_context_does_not_call_first_response()
 
     assert result.released is True
     assert result.context_ready is False
+    assert result.hydration is None
     assert first_response.called is False
+
+
+async def test_late_hydration_success_still_counts_as_context_ready():
+    """水合在评估完成后才成功：context_ready 必须按最终实际结果计算。"""
+
+    async def context_reader(value):
+        return {"identity": {}, "worldview": {}, "goals": {}, "relationships": {}}
+
+    async def evaluator(message, context):
+        return {"label": "happy", "logical_call_count": 1}
+
+    async def hydrator(value, message):
+        await asyncio.sleep(0.02)
+        return SimpleNamespace(per_response_instructions="context", hydrate_ms=1.0)
+
+    coordinator = VoiceEmotionCoordinator(
+        context_reader=context_reader,
+        evaluator=evaluator,
+        hydrator=hydrator,
+        emotion_timeout_ms=1000,
+    )
+    result = await coordinator.run(identity(), "请继续")
+
+    assert result.released is True
+    assert result.context_ready is True
+    assert result.hydration.per_response_instructions == "context"
+
+
+async def test_hydration_error_keeps_context_not_ready_with_structured_reason():
+    """水合失败：context_ready=False，且结构化 reason 说明原因。"""
+
+    async def context_reader(value):
+        return {"identity": {}, "worldview": {}, "goals": {}, "relationships": {}}
+
+    async def evaluator(message, context):
+        return {"label": "happy", "logical_call_count": 1}
+
+    async def hydrator(value, message):
+        raise RuntimeError("hydration unavailable")
+
+    coordinator = VoiceEmotionCoordinator(
+        context_reader=context_reader,
+        evaluator=evaluator,
+        hydrator=hydrator,
+        emotion_timeout_ms=1000,
+    )
+    result = await coordinator.run(identity(), "请继续")
+
+    assert result.released is True
+    assert result.context_ready is False
+    assert result.hydration is None
+    assert result.metrics["hydration_error_type"] == "RuntimeError"
+
+
+async def test_parent_cancellation_recovers_both_child_tasks_with_diagnostics():
+    """父调用取消：结构化回收评估与水合子任务，无 orphan，保留诊断。"""
+
+    started = asyncio.Event()
+    cancelled_flags: dict[str, bool] = {"evaluation": False, "hydration": False}
+
+    async def context_reader(value):
+        return {"identity": {}, "worldview": {}, "goals": {}, "relationships": {}}
+
+    async def evaluator(message, context):
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled_flags["evaluation"] = True
+            raise
+
+    async def hydrator(value, message):
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled_flags["hydration"] = True
+            raise
+
+    coordinator = VoiceEmotionCoordinator(
+        context_reader=context_reader,
+        evaluator=evaluator,
+        hydrator=hydrator,
+        emotion_timeout_ms=100_000,
+    )
+    value = identity()
+    run_task = asyncio.create_task(coordinator.run(value, "请继续"))
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    await asyncio.sleep(0)
+
+    run_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert cancelled_flags == {"evaluation": True, "hydration": True}
+    assert coordinator.last_evaluation_task.done()
+    diagnostics = coordinator.window_host.late_diagnostics
+    assert len(diagnostics) == 1
+    assert diagnostics[0].status == "error"
+    assert diagnostics[0].error_type == "CancelledError"
+    assert diagnostics[0].rejection_reason == "coordinator_cancelled"
+
+
+async def test_metrics_measure_hydration_and_gate_wait_independently():
+    """hydr­ate_ms 覆盖水合自身起止；gate_wait_ms 是三条件齐备时刻。"""
+
+    async def context_reader(value):
+        return {"identity": {}, "worldview": {}, "goals": {}, "relationships": {}}
+
+    async def evaluator(message, context):
+        await asyncio.sleep(0.02)
+        return {"label": "happy", "logical_call_count": 1}
+
+    async def hydrator(value, message):
+        await asyncio.sleep(0.04)
+        return SimpleNamespace(per_response_instructions="context", hydrate_ms=1.0)
+
+    coordinator = VoiceEmotionCoordinator(
+        context_reader=context_reader,
+        evaluator=evaluator,
+        hydrator=hydrator,
+        emotion_timeout_ms=1000,
+    )
+    result = await coordinator.run(identity(), "请继续")
+
+    assert result.metrics["hydrate_ms"] == pytest.approx(40, abs=15)
+    assert result.metrics["gate_wait_ms"] == pytest.approx(40, abs=15)
+    assert result.metrics["eval_ms"] == pytest.approx(20, abs=15)
+    assert result.metrics["gate_wait_ms"] >= result.metrics["eval_ms"]
+    assert result.metrics["gate_wait_ms"] >= result.metrics["hydrate_ms"]
+
+
+async def test_hydrate_ms_is_not_inflated_when_evaluation_is_slower():
+    """评估比水合慢：hydrate_ms 只能反映水合自身耗时，不得吸收评估等待。"""
+
+    async def context_reader(value):
+        return {"identity": {}, "worldview": {}, "goals": {}, "relationships": {}}
+
+    async def evaluator(message, context):
+        await asyncio.sleep(0.04)
+        return {"label": "happy", "logical_call_count": 1}
+
+    async def hydrator(value, message):
+        await asyncio.sleep(0.005)
+        return SimpleNamespace(per_response_instructions="context", hydrate_ms=1.0)
+
+    coordinator = VoiceEmotionCoordinator(
+        context_reader=context_reader,
+        evaluator=evaluator,
+        hydrator=hydrator,
+        emotion_timeout_ms=1000,
+    )
+    result = await coordinator.run(identity(), "请继续")
+
+    assert result.metrics["hydrate_ms"] == pytest.approx(5, abs=15)
+    assert result.metrics["eval_ms"] == pytest.approx(40, abs=15)
+    assert result.metrics["gate_wait_ms"] >= 40
 
 
 async def test_hydration_first_and_model_timeout_closes_visual_window():
@@ -196,6 +354,7 @@ async def test_hydration_first_and_model_timeout_closes_visual_window():
         return {"label": "happy", "logical_call_count": 1}
 
     async def hydrator(value, message):
+        await asyncio.sleep(0.02)
         return SimpleNamespace(per_response_instructions="context", hydrate_ms=1.0)
 
     coordinator = VoiceEmotionCoordinator(
@@ -260,7 +419,7 @@ async def test_old_identity_timeout_does_not_close_new_input():
         context_reader=context_reader,
         evaluator=evaluator,
         hydrator=hydrator,
-        emotion_timeout_ms=0.001,
+        emotion_timeout_ms=1,
     )
     old = identity()
     new = identity()

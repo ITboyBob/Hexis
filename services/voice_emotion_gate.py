@@ -10,7 +10,6 @@ from typing import Any
 
 from services.voice_emotion_window import EmotionWindowHost, LateDiagnostic, TimeoutKind
 
-
 Identity = Mapping[str, Any]
 
 
@@ -50,9 +49,7 @@ class VoiceEmotionCoordinator:
         self.window_host = window_host or EmotionWindowHost()
         self.last_evaluation_task: asyncio.Task[Any] | None = None
 
-    async def run(
-        self, identity: Identity, message: str
-    ) -> VoiceEmotionGateResult:
+    async def run(self, identity: Identity, message: str) -> VoiceEmotionGateResult:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must not be empty")
 
@@ -63,56 +60,80 @@ class VoiceEmotionCoordinator:
         started = loop.time()
         self.window_host.open(identity, self._emotion_timeout_ms)
 
-        evaluation_started = loop.time()
-        evaluation_task = asyncio.create_task(self._evaluate(identity, message))
+        evaluation_timing: dict[str, float | None] = {
+            "start": loop.time(),
+            "end": None,
+        }
+        evaluation_task = asyncio.create_task(
+            self._evaluate(identity, message, evaluation_timing)
+        )
         self.last_evaluation_task = evaluation_task
-        hydration_started = loop.time()
-        hydration_task = asyncio.create_task(self._hydrate(identity, message))
-
-        done, _pending = await asyncio.wait(
-            {evaluation_task}, timeout=self._emotion_timeout_ms / 1000
+        hydration_timing: dict[str, float | None] = {
+            "start": loop.time(),
+            "end": None,
+        }
+        hydration_task = asyncio.create_task(
+            self._hydrate(identity, message, hydration_timing)
         )
-        evaluation_finished = loop.time()
-        if evaluation_task in done:
-            try:
-                value = evaluation_task.result()
-                accepted = self.window_host.accept_result(identity)
-                evaluation = {
-                    "status": "valid",
-                    "value": value,
-                    "accepted": accepted["accepted"],
-                }
-                release_reason = "evaluation_complete"
-            except Exception as exc:
-                evaluation = {
-                    "status": "error",
-                    "error_type": type(exc).__name__,
-                }
-                release_reason = "evaluation_error"
-        else:
-            self.window_host.close_for_timeout(
-                identity, TimeoutKind.MODEL_TIMEOUT
-            )
-            evaluation = {
-                "status": "timeout",
-                "reason": TimeoutKind.MODEL_TIMEOUT.value,
-            }
-            release_reason = TimeoutKind.MODEL_TIMEOUT.value
-            evaluation_task.add_done_callback(
-                lambda task: self._record_late_evaluation(identity, task)
-            )
-            evaluation_task.cancel()
 
-        context_ready = (
-            hydration_task.done()
-            and not hydration_task.cancelled()
-            and hydration_task.exception() is None
-        )
         try:
-            hydration = await hydration_task
-        except Exception:
+            done, _pending = await asyncio.wait(
+                {evaluation_task}, timeout=self._emotion_timeout_ms / 1000
+            )
+            if evaluation_task in done:
+                try:
+                    value = evaluation_task.result()
+                    accepted = self.window_host.accept_result(identity)
+                    evaluation = {
+                        "status": "valid",
+                        "value": value,
+                        "accepted": accepted["accepted"],
+                    }
+                    release_reason = "evaluation_complete"
+                except Exception as exc:
+                    evaluation = {
+                        "status": "error",
+                        "error_type": type(exc).__name__,
+                    }
+                    release_reason = "evaluation_error"
+            else:
+                self.window_host.close_for_timeout(identity, TimeoutKind.MODEL_TIMEOUT)
+                evaluation = {
+                    "status": "timeout",
+                    "reason": TimeoutKind.MODEL_TIMEOUT.value,
+                }
+                release_reason = TimeoutKind.MODEL_TIMEOUT.value
+                evaluation_task.add_done_callback(
+                    lambda task: self._record_late_evaluation(identity, task)
+                )
+                evaluation_task.cancel()
+
             hydration = None
-            context_ready = False
+            hydration_error_type: str | None = None
+            try:
+                hydration = await hydration_task
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                hydration = None
+                hydration_error_type = type(exc).__name__
+            context_ready = hydration is not None
+        except asyncio.CancelledError:
+            self._recover_cancelled_children(identity, evaluation_task, hydration_task)
+            raise
+
+        def _elapsed(timing: dict[str, float | None]) -> float:
+            end = timing["end"]
+            return ((end if end is not None else loop.time()) - timing["start"]) * 1000
+
+        metrics: dict[str, Any] = {
+            "eval_ms": _elapsed(evaluation_timing),
+            "hydrate_ms": _elapsed(hydration_timing),
+            "gate_wait_ms": (loop.time() - started) * 1000,
+            "release_reason": release_reason,
+        }
+        if hydration_error_type is not None:
+            metrics["hydration_error_type"] = hydration_error_type
 
         return VoiceEmotionGateResult(
             identity=dict(identity),
@@ -121,21 +142,54 @@ class VoiceEmotionCoordinator:
             evaluation=evaluation,
             hydration=hydration,
             visual_window=self.window_host.current(identity),
-            metrics={
-                "eval_ms": (evaluation_finished - evaluation_started) * 1000,
-                "hydrate_ms": (loop.time() - hydration_started) * 1000,
-                "gate_wait_ms": (evaluation_finished - started) * 1000,
-                "release_reason": release_reason,
-            },
+            metrics=metrics,
             late_diagnostics=self.window_host.late_diagnostics,
         )
 
-    async def _evaluate(self, identity: Identity, message: str) -> Any:
-        context = await self._context_reader(identity)
-        return await self._evaluator(message, context)
+    def _recover_cancelled_children(
+        self,
+        identity: Identity,
+        evaluation_task: asyncio.Task[Any],
+        hydration_task: asyncio.Task[Any],
+    ) -> None:
+        """Cancel and await both children, recording one structured diagnostic."""
+        for task in (evaluation_task, hydration_task):
+            if not task.done():
+                task.cancel()
+        if evaluation_task.done():
+            try:
+                evaluation_task.exception()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        self.window_host.close_for_timeout(identity, TimeoutKind.MODEL_TIMEOUT)
+        diagnostic = self.window_host.record_late_error(
+            identity,
+            asyncio.CancelledError(),
+            rejection_reason="coordinator_cancelled",
+        )
+        if diagnostic is None:
+            self.window_host.record_cancellation(
+                identity, rejection_reason="coordinator_cancelled"
+            )
 
-    async def _hydrate(self, identity: Identity, message: str) -> Any:
-        return await self._hydrator(identity, message)
+    async def _evaluate(
+        self, identity: Identity, message: str, timing: dict[str, float | None]
+    ) -> Any:
+        try:
+            context = await self._context_reader(identity)
+            return await self._evaluator(message, context)
+        finally:
+            timing["end"] = asyncio.get_running_loop().time()
+
+    async def _hydrate(
+        self, identity: Identity, message: str, timing: dict[str, float | None]
+    ) -> Any:
+        try:
+            return await self._hydrator(identity, message)
+        finally:
+            timing["end"] = asyncio.get_running_loop().time()
 
     def _record_late_evaluation(
         self, identity: Identity, task: asyncio.Task[Any]

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,6 +41,7 @@ class FirstResponseTurnResult:
     ok: bool
     gate: FirstResponseGate
     response_sent: bool = False
+    response_send_status: str = "not_sent"
     release_started_monotonic_ms: int | None = None
     release_ended_monotonic_ms: int | None = None
     hydration_started_monotonic_ms: int | None = None
@@ -131,13 +134,77 @@ async def _measure(awaitable: Awaitable[Any]) -> _MeasuredAwaitable:
 
 
 def _release_fact(value: Any) -> bool:
+    """Fail closed: only an explicit truthy ``released`` may authorize a response."""
     if value is None:
-        return True
-    if isinstance(value, dict):
-        released = value.get("released")
-    else:
-        released = getattr(value, "released", None)
-    return released is None or bool(released)
+        return False
+    facts = value
+    released = (
+        facts.get("released")
+        if isinstance(facts, dict)
+        else getattr(facts, "released", None)
+    )
+    context_ready = (
+        facts.get("context_ready")
+        if isinstance(facts, dict)
+        else getattr(facts, "context_ready", None)
+    )
+    return released is True and context_ready is True
+
+
+def _turn_identity_key(value: FinalTranscript, source: CaptureRange) -> str:
+    body = {
+        "identity": value.identity.model_dump(mode="json"),
+        "capture_instance_id": str(value.capture_instance_id),
+        "media_session_id": value.media_session_id,
+        "item_id": value.item_id,
+        "transcript": value.transcript,
+        "transcript_version": value.transcript_version,
+        "range": source.model_dump(mode="json"),
+    }
+    return hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+class _TurnRegistry:
+    """In-process idempotency for one complete input identity."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._results: dict[str, FirstResponseTurnResult] = {}
+        self._inflight: dict[str, asyncio.Future[FirstResponseTurnResult]] = {}
+
+    async def claim(
+        self, key: str
+    ) -> tuple[bool, FirstResponseTurnResult | asyncio.Future[FirstResponseTurnResult]]:
+        async with self._lock:
+            done = self._results.get(key)
+            if done is not None:
+                return False, done
+            inflight = self._inflight.get(key)
+            if inflight is not None:
+                return False, inflight
+            future: asyncio.Future[FirstResponseTurnResult] = (
+                asyncio.get_running_loop().create_future()
+            )
+            self._inflight[key] = future
+            return True, future
+
+    async def resolve(self, key: str, result: FirstResponseTurnResult) -> None:
+        async with self._lock:
+            self._results[key] = result
+            future = self._inflight.pop(key, None)
+        if future is not None and not future.done():
+            future.set_result(result)
+
+    async def abandon(self, key: str) -> None:
+        async with self._lock:
+            future = self._inflight.pop(key, None)
+        if future is not None and not future.done():
+            future.cancel()
+
+
+_TURN_REGISTRY = _TurnRegistry()
 
 
 def _hydration_instructions(value: Any) -> str:
@@ -205,9 +272,57 @@ async def run_first_response_turn(
     event_sink: Callable[[BehaviorEvent], Awaitable[None]],
     response_id: str,
 ) -> FirstResponseTurnResult:
-    """Run one committed voice input through the one-shot first-response gate."""
+    """Run one committed voice input through the one-shot first-response gate.
+
+    Re-running the same complete input identity returns the original result
+    without invoking ``response.create`` a second time.
+    """
+    key = _turn_identity_key(final_transcript, capture_range)
+    claimed, existing = await _TURN_REGISTRY.claim(key)
+    if not claimed:
+        # The caller's awaitables are unused on the cached path; close them so
+        # no coroutine is left un-awaited.
+        _discard(release)
+        _discard(hydration)
+        if isinstance(existing, asyncio.Future):
+            return await existing
+        return existing
+
+    try:
+        result = await _run_new_first_response_turn(
+            authorization_service=authorization_service,
+            final_transcript=final_transcript,
+            capture_range=capture_range,
+            release=release,
+            hydration=hydration,
+            client=client,
+            event_sink=event_sink,
+            response_id=response_id,
+        )
+    except BaseException:
+        await _TURN_REGISTRY.abandon(key)
+        raise
+    if result.response_send_status in {"sent", "send_unknown"}:
+        await _TURN_REGISTRY.resolve(key, result)
+    else:
+        await _TURN_REGISTRY.abandon(key)
+    return result
+
+
+async def _run_new_first_response_turn(
+    *,
+    authorization_service: InputAuthorizationService,
+    final_transcript: FinalTranscript,
+    capture_range: CaptureRange,
+    release: Awaitable[Any],
+    hydration: Awaitable[Any],
+    client: Any,
+    event_sink: Callable[[BehaviorEvent], Awaitable[None]],
+    response_id: str,
+) -> FirstResponseTurnResult:
     gate = FirstResponseGate()
     response_sent = False
+    response_send_status = "not_sent"
     release_started: int | None = None
     release_ended: int | None = None
     hydration_started: int | None = None
@@ -233,15 +348,23 @@ async def run_first_response_turn(
             )
         )
 
-        final_event = await client.wait_for_final()
+        committed_event = await client.wait_for_input_committed()
+        if not committed_event.item_id:
+            raise _TurnStageError(
+                _error(ValueError("云端 commit 回执缺少 item_id"), "final_transcript")
+            )
+        final_event = await client.wait_for_final(committed_event.item_id)
         if (
             final_event.type != "input_transcript_final"
             or final_event.is_final is not True
+            or final_event.item_id != committed_event.item_id
             or final_event.item_id != final_transcript.item_id
             or final_event.transcript != final_transcript.transcript
         ):
             raise _TurnStageError(
-                _error(ValueError("云 final 转录与待授权转录不一致"), "final_transcript")
+                _error(
+                    ValueError("云 final 转录与待授权转录不一致"), "final_transcript"
+                )
             )
 
         authorization_started = _monotonic_ms()
@@ -281,9 +404,7 @@ async def run_first_response_turn(
                 _error(release_result.exception, "release")
             ) from release_result.exception
         if not _release_fact(release_result.value):
-            raise _TurnStageError(
-                _error(RuntimeError("C 节点未放行"), "release")
-            )
+            raise _TurnStageError(_error(RuntimeError("C 节点未放行"), "release"))
         gate.mark_emotion_released()
 
         if hydration_result.exception is not None:
@@ -298,8 +419,15 @@ async def run_first_response_turn(
 
         gate.assert_ready()
         created_started = _monotonic_ms()
-        await client.create_first_response(response_id, instructions)
+        response_send_status = "sending"
+        try:
+            await client.create_first_response(response_id, instructions)
+        except Exception as exc:
+            response_send_status = "send_unknown"
+            error = _error(exc, "response_send")
+            raise _TurnStageError(_error(exc, "response_send")) from exc
         response_sent = True
+        response_send_status = "sent"
         await event_sink(
             _event(
                 event_type="voice_response_created",
@@ -328,6 +456,7 @@ async def run_first_response_turn(
         ok=error is None,
         gate=gate,
         response_sent=response_sent,
+        response_send_status=response_send_status,
         release_started_monotonic_ms=release_started,
         release_ended_monotonic_ms=release_ended,
         hydration_started_monotonic_ms=hydration_started,

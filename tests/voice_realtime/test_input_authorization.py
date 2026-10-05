@@ -62,7 +62,10 @@ async def test_rejects_partial_empty_and_mismatched_final():
     with pytest.raises(ValueError, match="转录不能为空"):
         validate_final(bound.model_copy(update={"transcript": "  "}), source)
     with pytest.raises(ValueError, match="采集实例"):
-        validate_final(bound.model_copy(update={"capture_instance_id": other.capture_instance_id}), source)
+        validate_final(
+            bound.model_copy(update={"capture_instance_id": other.capture_instance_id}),
+            source,
+        )
     with pytest.raises(ValueError, match="媒体会话"):
         validate_final(bound.model_copy(update={"media_session_id": "media-2"}), source)
     with pytest.raises(ValueError, match="会话"):
@@ -103,6 +106,20 @@ async def test_same_range_with_changed_content_fails_loud():
     changed = final(value, source).model_copy(update={"transcript": "不同内容"})
     with pytest.raises(AuthorizationConflict, match="同一采集范围"):
         await service.commit(changed, source)
+
+
+async def test_same_range_with_changed_audio_content_fails_loud():
+    service = InputAuthorizationService()
+    value = identity()
+    source = capture(value)
+    await service.commit(final(value, source), source)
+
+    changed_audio = source.model_copy(update={"audio_sha256": "b" * 64})
+    with pytest.raises(AuthorizationConflict, match="同一采集范围"):
+        await service.commit(final(value, source), changed_audio)
+
+    retried = await service.commit(final(value, source), source)
+    assert retried.deduplicated is True
 
 
 async def test_concurrent_same_range_has_one_winner():

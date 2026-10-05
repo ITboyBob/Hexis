@@ -127,10 +127,37 @@ class QwenRealtimeClient:
                 return
             await asyncio.sleep(0)
 
-    async def wait_for_final(self) -> ProtocolEvent:
+    async def wait_for_input_committed(self) -> ProtocolEvent:
+        """Wait for the cloud commit receipt that binds the acoustic range."""
         async for event in self.events():
-            if event.type == "input_transcript_final" and event.is_final is True:
+            if event.type == "input_audio_buffer_committed":
+                if not event.item_id:
+                    raise QwenRealtimeProtocolError(
+                        "input_audio_buffer.committed 缺少 item_id"
+                    )
                 return event
+        raise RuntimeError("Qwen Realtime 连接已结束，未收到 commit 回执")
+
+    async def wait_for_final(self, item_id: str | None = None) -> ProtocolEvent:
+        """Wait for a final transcript, optionally bound to a commit item_id.
+
+        When ``item_id`` is provided, any unbound, stale, or mismatched final is
+        rejected and never returned to the caller.
+        """
+        if item_id is not None and (not isinstance(item_id, str) or not item_id):
+            raise ValueError("item_id 必须是非空字符串")
+        async for event in self.events():
+            if event.type != "input_transcript_final" or event.is_final is not True:
+                continue
+            if item_id is None:
+                return event
+            if event.item_id == item_id:
+                return event
+            logger.warning(
+                "忽略未绑定 final 转录: expected_item=%s actual_item=%s",
+                item_id,
+                event.item_id,
+            )
         raise RuntimeError("Qwen Realtime 连接已结束，未收到 final 转录")
 
     async def close(self) -> None:

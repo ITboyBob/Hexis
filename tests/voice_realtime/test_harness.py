@@ -188,7 +188,15 @@ def turn_fakes():
         async def commit_audio(self):
             self.commit_calls += 1
 
-        async def wait_for_final(self):
+        async def wait_for_input_committed(self):
+            return ProtocolEvent(
+                type="input_audio_buffer_committed",
+                item_id="item-1",
+            )
+
+        async def wait_for_final(self, item_id=None):
+            if item_id is not None and item_id != event.item_id:
+                raise AssertionError("final 未绑定到 commit 回执 item_id")
             return event
 
         async def create_first_response(self, response_id, instructions):
@@ -258,6 +266,10 @@ async def test_harness_success_creates_bounded_evidence(tmp_path, monkeypatch):
         [
             {"type": "session.updated", "session": {"id": "cloud-session-1"}},
             {"type": "vendor.unknown", "secret": "hidden"},
+            {
+                "type": "input_audio_buffer.committed",
+                "item_id": "item-1",
+            },
             {
                 "type": "conversation.item.input_audio_transcription.completed",
                 "item_id": "item-1",

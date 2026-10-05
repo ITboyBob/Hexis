@@ -10,6 +10,7 @@ import pytest
 from services.qwen_realtime_client import (
     QwenRealtimeClient,
     QwenRealtimeConnectionError,
+    QwenRealtimeProtocolError,
     QwenRealtimeSessionError,
 )
 
@@ -177,6 +178,91 @@ async def test_wait_for_final_ignores_partial():
     assert event.item_id == "item-1"
     assert event.transcript == "请继续"
     assert event.is_final is True
+    await client.close()
+
+
+async def test_wait_for_input_committed_returns_typed_item_receipt():
+    client, _ = make_client(
+        [
+            {"type": "session.updated", "session": {"id": "qwen-1"}},
+            {"type": "input_audio_buffer.committed", "item_id": "item-1"},
+        ]
+    )
+    await client.connect("稳定层")
+
+    event = await client.wait_for_input_committed()
+
+    assert event.type == "input_audio_buffer_committed"
+    assert event.item_id == "item-1"
+    await client.close()
+
+
+async def test_wait_for_input_committed_requires_item_id():
+    client, _ = make_client(
+        [
+            {"type": "session.updated", "session": {"id": "qwen-1"}},
+            {"type": "input_audio_buffer.committed"},
+        ]
+    )
+    await client.connect("稳定层")
+
+    with pytest.raises(QwenRealtimeProtocolError, match="item_id"):
+        await client.wait_for_input_committed()
+    await client.close()
+
+
+async def test_wait_for_final_bound_rejects_mismatched_item():
+    client, _ = make_client(
+        [
+            {"type": "session.updated", "session": {"id": "qwen-1"}},
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "stale-item",
+                "transcript": "旧内容",
+                "is_final": True,
+            },
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "item-1",
+                "transcript": "请继续",
+                "is_final": True,
+            },
+        ]
+    )
+    await client.connect("稳定层")
+
+    event = await client.wait_for_final("item-1")
+
+    assert event.item_id == "item-1"
+    assert event.transcript == "请继续"
+    await client.close()
+
+
+async def test_wait_for_final_bound_returns_each_bound_item_final():
+    client, _ = make_client(
+        [
+            {"type": "session.updated", "session": {"id": "qwen-1"}},
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "item-1",
+                "transcript": "请继续",
+                "is_final": True,
+            },
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "item-1",
+                "transcript": "重复内容",
+                "is_final": True,
+            },
+        ]
+    )
+    await client.connect("稳定层")
+
+    first = await client.wait_for_final("item-1")
+    second = await client.wait_for_final("item-1")
+
+    assert first.transcript == "请继续"
+    assert second.transcript == "重复内容"
     await client.close()
 
 

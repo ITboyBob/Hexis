@@ -53,6 +53,7 @@ _KNOWN_EVENT_TYPES = {
     "session.updated",
     "input_audio_buffer.append",
     "input_audio_buffer.commit",
+    "input_audio_buffer.committed",
     "input_audio_transcription.partial",
     "input_audio_transcription.completed",
     "conversation.item.input_audio_transcription.partial",
@@ -742,10 +743,12 @@ async def run_harness(
                 )
             )
 
-            final_event = await client.wait_for_final()
+            committed_event = await client.wait_for_input_committed()
+            final_event = await client.wait_for_final(committed_event.item_id)
             if (
                 final_event.type != "input_transcript_final"
                 or final_event.is_final is not True
+                or final_event.item_id != committed_event.item_id
                 or not final_event.item_id
                 or not isinstance(final_event.transcript, str)
                 or not final_event.transcript.strip()

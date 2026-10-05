@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from uuid import uuid4
 
 import pytest
@@ -158,3 +159,60 @@ def test_accept_result_does_not_close_at_deadline():
 
     assert rejected["accepted"] is False
     assert rejected["fact"]["status"] == "open"
+
+
+def test_default_clock_and_injected_clock_share_millisecond_units():
+    """默认时钟 time.monotonic()（秒）不得与 ms timeout 相加。
+
+    原缺陷：open(identity, 100) 得到 deadline ≈ 0.0x 秒 + 100（秒数量级），
+    真实窗口约 100000 秒不关闭；correct 后默认时钟单位为 ms。
+    本测试注入一个单位为秒的时钟，验证构造器按 ms 语义归一。
+    """
+    seconds_clock = [5000.0]  # time.monotonic() 风格：秒
+    host = EmotionWindowHost(now=lambda: seconds_clock[0])
+    value = identity()
+    host.open(value, 100)
+
+    seconds_clock[0] += 0.05  # 50ms 后
+    assert host.accept_result(value)["accepted"] is True
+
+    host2 = EmotionWindowHost(now=lambda: seconds_clock[0])
+    value2 = identity()
+    host2.open(value2, 100)
+    seconds_clock[0] += 0.15  # 150ms 后：超过 100ms 窗口
+    expired = host2.expire(value2)
+    assert expired["status"] == "closed"
+    assert expired["reason"] == "model_timeout"
+
+
+def test_default_real_clock_window_closes_after_timeout():
+    """真实 time.monotonic 时钟 + 真实调度：100ms 窗口必须在约 100ms 后关闭。"""
+    host = EmotionWindowHost()  # 默认 time.monotonic + loop.call_later
+    value = identity()
+    started = time.monotonic()
+    host.open(value, 100)
+
+    deadline = started + 5.0
+    while host.current(value) is not None and host.current(value)["status"] == "open":
+        if time.monotonic() > deadline:
+            break
+        time.sleep(0.005)
+
+    elapsed = time.monotonic() - started
+    fact = host.current(value)
+    assert fact["status"] == "closed"
+    assert fact["reason"] == "model_timeout"
+    assert 0.08 <= elapsed < 2.0
+    host.dispose()
+
+
+def test_default_real_clock_window_accepts_within_timeout():
+    """真实时钟：窗口打开后立即接纳成功，且不再被残余计时器关闭。"""
+    host = EmotionWindowHost()
+    value = identity()
+    host.open(value, 100)
+    accepted = host.accept_result(value)
+    assert accepted["accepted"] is True
+    time.sleep(0.15)  # 超过原窗口时长
+    assert host.current(value)["status"] == "accepted"
+    host.dispose()

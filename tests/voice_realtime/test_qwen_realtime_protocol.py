@@ -90,6 +90,16 @@ def test_update_session_uses_nested_audio_contract():
     }
 
 
+def test_parses_input_audio_buffer_committed_as_typed_binding():
+    raw = {"type": "input_audio_buffer.committed", "item_id": "item-1"}
+    event = parse_event(raw)
+    assert event == ProtocolEvent(
+        type="input_audio_buffer_committed",
+        raw=raw,
+        item_id="item-1",
+    )
+
+
 def test_unknown_event_is_diagnostic_not_crash():
     with pytest.raises(UnknownProtocolEvent):
         parse_event({"type": "vendor.new.event"})
