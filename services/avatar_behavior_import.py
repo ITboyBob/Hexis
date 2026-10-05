@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import asyncpg
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from services.behavior_events import BehaviorEvent, record_behavior_event
+
+# Fixed namespace for deriving stable global event ids from the Avatar
+# preview's non-UUID local ids (e.g. "preview-event-3-<uuid>"). The value
+# itself is arbitrary but must never change, or repeat imports of the same
+# export stop deduplicating against earlier rows.
+_AVATAR_EVENT_ID_NAMESPACE = UUID("a575e53c-dc3d-4d21-83c0-cac569303de8")
 
 
 def _uuid(value: Any, name: str) -> UUID:
@@ -16,6 +22,36 @@ def _uuid(value: Any, name: str) -> UUID:
         return UUID(str(value))
     except (ValueError, AttributeError, TypeError) as exc:
         raise ValueError(f"{name} must be a UUID") from exc
+
+
+def _optional_text(value: Any, name: str) -> str | None:
+    """Map optional payload text; missing stays NULL, blank/odd types reject."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        raise ValueError(f"{name} must be a non-empty trimmed string when provided")
+    return value
+
+
+def _avatar_event_id(value: Any) -> UUID:
+    """Map one Avatar event_id to a stable global UUID.
+
+    Plain UUID input passes through unchanged. Non-UUID local ids (the
+    preview page emits "preview-event-<seq>-<uuid>") derive a deterministic
+    UUIDv5 from the fixed namespace and the original string, so re-importing
+    the same export deduplicates instead of duplicating.
+    """
+    if isinstance(value, UUID):
+        return value
+    text = value if isinstance(value, str) else None
+    if text is not None:
+        try:
+            return UUID(text)
+        except ValueError:
+            pass
+        if text.strip() and text == text.strip():
+            return uuid5(_AVATAR_EVENT_ID_NAMESPACE, text)
+    raise ValueError("event_id must be a UUID or a non-empty trimmed string")
 
 
 def _text(value: Any, name: str) -> str:
@@ -58,10 +94,24 @@ def _event_from_avatar(item: Any, session_id: UUID) -> BehaviorEvent:
             task_id = _text(task_id, "task.task_id")
 
     feedback = payload.get("feedback")
+    response_id = None
+    media_session_id = None
     output_epoch = None
-    if isinstance(feedback, dict):
+    if payload["type"] == "playback_open":
+        # The playback_open epoch lives at the payload top level, not inside
+        # a feedback object.
+        output_epoch = _nonnegative(payload.get("output_epoch"), "payload.output_epoch")
+    elif isinstance(feedback, dict):
         output_epoch = _nonnegative(
             feedback.get("output_epoch"), "feedback.output_epoch"
+        )
+        # playback feedback's response/media identifiers belong on the
+        # envelope columns; absence stays NULL.
+        response_id = _optional_text(
+            feedback.get("response_id"), "feedback.response_id"
+        )
+        media_session_id = _optional_text(
+            feedback.get("media_session_id"), "feedback.media_session_id"
         )
 
     stimulus_revision = None
@@ -73,7 +123,7 @@ def _event_from_avatar(item: Any, session_id: UUID) -> BehaviorEvent:
         input_turn_id = _text(identity.get("input_turn_id"), "identity.input_turn_id")
 
     return BehaviorEvent(
-        event_id=_uuid(item.get("event_id"), "event_id"),
+        event_id=_avatar_event_id(item.get("event_id")),
         schema_version=1,
         event_type=f"avatar.{_text(payload['type'], 'payload.type')}",
         stream_id=_text(item.get("stream_id"), "stream_id"),
@@ -85,6 +135,8 @@ def _event_from_avatar(item: Any, session_id: UUID) -> BehaviorEvent:
         payload=payload,
         stimulus_revision=stimulus_revision,
         input_turn_id=input_turn_id,
+        response_id=response_id,
+        media_session_id=media_session_id,
         output_epoch=output_epoch,
         task_id=task_id,
     )
