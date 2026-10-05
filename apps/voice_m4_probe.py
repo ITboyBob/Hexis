@@ -35,7 +35,7 @@ from services.voice_context_hydration import hydrate_voice_context
 
 SCHEMA = "voice-m4-probe-v1"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_BASELINE = "2e0418037136721a8d0ecf947a1ccd9182378c12"
+EXPECTED_BASELINE = "c65fcc01376b478aba4cbf27c924d34227fd6011"
 _MODES = {"preflight", "protocol", "devices", "calibration"}
 _SELECTED_REALTIME_CONFIG = Path(
     "/Users/itboybob/.cache/hexis/batch3-serial-voice-2026-10-05/config-real-2.json"
@@ -61,6 +61,7 @@ _STAGES = {
         "cancel",
         "continuation",
         "history",
+        "instruction_layers",
     ),
     "devices": ("reference_wav", "browser_probe"),
     "calibration": ("reference_wav", "playback", "capture"),
@@ -144,7 +145,7 @@ def _text_summary(value: str) -> dict[str, Any]:
 
 
 class ProtocolProbe:
-    """Run the live M4 protocol capability checks in one cloud session."""
+    """Run live M4 protocol checks and defer the instruction gate to the end."""
 
     def __init__(self) -> None:
         self.config = _load_selected_config()
@@ -162,6 +163,8 @@ class ProtocolProbe:
         self.per_response_instructions: str | None = None
         self.final_transcript: str | None = None
         self.last_response_transcript: str | None = None
+        self.first_response_transcript: str | None = None
+        self.instruction_anchor_results: list[dict[str, Any]] = []
 
     async def __call__(self, stage: str, _probe_request: ProbeRequest) -> dict[str, Any]:
         if stage == "wav":
@@ -176,6 +179,8 @@ class ProtocolProbe:
             return await self._continuation_stage()
         if stage == "history":
             return await self._history_stage()
+        if stage == "instruction_layers":
+            return await self._instruction_layers_stage()
         raise ProbeStageError(stage, f"未知 protocol 阶段: {stage}")
 
     async def close(self) -> None:
@@ -252,6 +257,7 @@ class ProtocolProbe:
             memory_limit=int(self.config.get("memory_limit", 10)),
         )
         self.per_response_instructions = (
+            f"{self.stable_instructions}\n\n"
             f"{hydration.per_response_instructions}\n\n"
             f"Capability probe turn anchor: include the exact token "
             f"{_TURN_ANCHOR} in this reply."
@@ -278,7 +284,7 @@ class ProtocolProbe:
             response_id, self.per_response_instructions
         )
         result = await self._consume_response(response_id, started)
-        self._require_instruction_anchors(result)
+        self.first_response_transcript = self.last_response_transcript
         result["protocol_events"] = self.protocol_events
         result["unknown_events"] = self.unknown_events
         return result
@@ -332,7 +338,6 @@ class ProtocolProbe:
             response_id, self.per_response_instructions
         )
         result = await self._consume_response(response_id, started)
-        self._require_instruction_anchors(result)
         result["final_transcript"] = _text_summary(final.transcript)
         result["protocol_events"] = self.protocol_events
         result["unknown_events"] = self.unknown_events
@@ -344,7 +349,7 @@ class ProtocolProbe:
             or self.audio is None
             or self.per_response_instructions is None
             or self.final_transcript is None
-            or self.last_response_transcript is None
+            or self.first_response_transcript is None
         ):
             raise ProbeStageError("history", "受控重建缺少已确认历史")
         await self.client.close()
@@ -391,7 +396,7 @@ class ProtocolProbe:
             f"{self.per_response_instructions}\n\n"
             "## Confirmed Prior Conversation\n"
             f"User: {self.final_transcript}\n"
-            f"Assistant: {self.last_response_transcript}\n"
+            f"Assistant: {self.first_response_transcript}\n"
             "The prior conversation above is confirmed text history. Do not "
             "replay its audio or recall it as a new user request."
         )
@@ -399,7 +404,6 @@ class ProtocolProbe:
             response_id, reconstructed_instructions
         )
         result = await self._consume_response(response_id, started)
-        self._require_instruction_anchors(result)
         result.update(
             {
                 "history_mode": "controlled_rebuild",
@@ -407,13 +411,40 @@ class ProtocolProbe:
                 "final_transcript": _text_summary(final.transcript),
                 "confirmed_history": {
                     "user": _text_summary(self.final_transcript),
-                    "assistant": _text_summary(self.last_response_transcript),
+                    "assistant": _text_summary(self.first_response_transcript),
                 },
                 "protocol_events": self.protocol_events,
                 "unknown_events": self.unknown_events,
             }
         )
         return result
+
+    async def _instruction_layers_stage(self) -> dict[str, Any]:
+        observations = self.instruction_anchor_results
+        if not observations:
+            raise ProbeStageError("instruction_layers", "没有可判定的指令层锚点回执")
+        failed = [
+            index
+            for index, anchors in enumerate(observations, start=1)
+            if anchors.get("stable") is not True or anchors.get("per_turn") is not True
+        ]
+        if failed:
+            raise ProbeStageError(
+                "instruction_layers",
+                "稳定层与每轮层指令锚点未同时生效: "
+                f"failed_responses={failed}",
+                details={
+                    "observations": observations,
+                    "response_transcript": _text_summary(
+                        self.last_response_transcript or ""
+                    ),
+                },
+            )
+        return {
+            "status": "passed",
+            "observations": observations,
+            "rendering": "stable_plus_per_turn",
+        }
 
     async def _wait_for_response_created(self, response_id: str) -> Any:
         async for event in self.client.events():
@@ -459,6 +490,7 @@ class ProtocolProbe:
             "stable": _STABLE_ANCHOR in transcript,
             "per_turn": _TURN_ANCHOR in transcript,
         }
+        self.instruction_anchor_results.append(anchors)
         return {
             "response_id": terminal.response_id or response_id,
             "status": terminal.status,
@@ -469,22 +501,6 @@ class ProtocolProbe:
             "first_delta_ms": first_delta_ms,
             "terminal_ms": time.monotonic_ns() // 1_000_000 - started_ms,
         }
-
-    def _require_instruction_anchors(self, result: dict[str, Any]) -> None:
-        anchors = result.get("instruction_anchors", {})
-        if anchors.get("stable") is not True or anchors.get("per_turn") is not True:
-            raise ProbeStageError(
-                "cloud_response",
-                "稳定层与每轮层指令锚点未同时生效: "
-                f"stable={anchors.get('stable')} per_turn={anchors.get('per_turn')}",
-                details={
-                    "instruction_anchors": anchors,
-                    "response_transcript": _text_summary(
-                        self.last_response_transcript or ""
-                    ),
-                },
-            )
-
 
 class DevicesProbe:
     """Run the real browser microphone and local playback capability probe."""

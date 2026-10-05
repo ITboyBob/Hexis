@@ -8,6 +8,7 @@ import pytest
 
 from apps.voice_m4_probe import (
     EXPECTED_BASELINE,
+    _STAGES,
     ProbeBaselineError,
     ProbeRequest,
     ProbeStageError,
@@ -94,3 +95,12 @@ async def test_probe_rejects_mismatched_baseline(tmp_path):
         )
 
     assert not (tmp_path / "evidence.json").exists()
+
+
+def test_protocol_probe_defers_instruction_gate_until_after_capabilities():
+    stages = _STAGES["protocol"]
+
+    assert stages[-1] == "instruction_layers"
+    assert stages.index("cancel") < stages.index("instruction_layers")
+    assert stages.index("continuation") < stages.index("instruction_layers")
+    assert stages.index("history") < stages.index("instruction_layers")
