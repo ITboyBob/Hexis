@@ -178,7 +178,12 @@ export class NativeOutputPlayer {
   private emit(
     event: Omit<
       NativePlaybackEventRequest,
-      "session_id" | "playback_id" | "response_id" | "output_epoch" | "media_session_id"
+      | "session_id"
+      | "playback_id"
+      | "response_id"
+      | "producer_seq"
+      | "output_epoch"
+      | "media_session_id"
     >,
   ): void {
     const producer_seq = ++this.producerSeq;

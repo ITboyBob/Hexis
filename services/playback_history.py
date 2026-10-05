@@ -14,8 +14,20 @@ from services.behavior_events import (
 )
 
 _SCOPES = {"complete", "partial", "unplayed", "unknown"}
+_TERMINAL_EVENT_TYPES = {"voice_playback_ended", "voice_playback_interrupted"}
 _PAGE_SIZE = 1000
 _MAX_EVENTS = 10000
+
+
+def _fold_played_ms(played_ms: int, payload: dict[str, Any]) -> int:
+    played = payload.get("played_ms")
+    if (
+        isinstance(played, int)
+        and not isinstance(played, bool)
+        and played >= 0
+    ):
+        return max(played_ms, played)
+    return played_ms
 
 
 def _text(value: Any, name: str) -> str:
@@ -178,7 +190,7 @@ class PlaybackHistory:
             events.extend(page)
             if len(page) < _PAGE_SIZE:
                 break
-        rows = [
+        receipts = [
             event
             for event in events
             if isinstance(event.get("payload"), dict)
@@ -186,43 +198,36 @@ class PlaybackHistory:
             and event.get("response_id") == self._identity.response_id
             and event.get("output_epoch") == self._identity.output_epoch
         ]
-        rows.sort(key=lambda event: event["producer_seq"])
-        ended = next(
-            (event for event in rows if event["event_type"] == "voice_playback_ended"),
-            None,
-        )
-        interrupted = next(
+        rows = sorted(
             (
                 event
-                for event in rows
-                if event["event_type"] == "voice_playback_interrupted"
+                for event in receipts
+                if event.get("media_session_id") == self._identity.media_session_id
             ),
-            None,
+            key=lambda event: event["producer_seq"],
         )
 
         scope = "unknown"
-        if ended:
-            ended_scope = ended["payload"].get("scope")
-            scope = ended_scope if ended_scope in _SCOPES else "unknown"
-        elif interrupted:
-            interrupted_ms = interrupted["payload"].get("played_ms", 0)
-            if (
-                isinstance(interrupted_ms, int)
-                and not isinstance(interrupted_ms, bool)
-                and interrupted_ms >= 0
-            ):
-                scope = "unplayed" if interrupted_ms == 0 else "partial"
-
-        played_ms = max(
-            (
-                int(event["payload"].get("played_ms") or 0)
-                for event in rows
-                if isinstance(event["payload"].get("played_ms"), int)
-                and not isinstance(event["payload"].get("played_ms"), bool)
-                and event["payload"].get("played_ms", 0) >= 0
-            ),
-            default=0,
-        )
+        played_ms = 0
+        for event in rows:
+            payload = event["payload"]
+            event_type = event["event_type"]
+            if event_type not in _TERMINAL_EVENT_TYPES:
+                played_ms = _fold_played_ms(played_ms, payload)
+                continue
+            if event_type == "voice_playback_ended":
+                ended_scope = payload.get("scope")
+                scope = ended_scope if ended_scope in _SCOPES else "unknown"
+            else:
+                interrupted_ms = payload.get("played_ms", 0)
+                if (
+                    isinstance(interrupted_ms, int)
+                    and not isinstance(interrupted_ms, bool)
+                    and interrupted_ms >= 0
+                ):
+                    scope = "unplayed" if interrupted_ms == 0 else "partial"
+            played_ms = _fold_played_ms(played_ms, payload)
+            break
         return {
             "playback_id": self._identity.playback_id,
             "response_id": self._identity.response_id,
@@ -230,7 +235,7 @@ class PlaybackHistory:
             "media_session_id": self._identity.media_session_id,
             "scope": scope,
             "played_ms": played_ms,
-            "event_count": len(rows),
+            "event_count": len(receipts),
         }
 
 

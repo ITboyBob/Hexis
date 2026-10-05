@@ -172,7 +172,31 @@ async def test_late_receipt_supplements_only_its_original_instance(db_pool):
 
     result = await history.get()
     assert result["scope"] == "partial"
-    assert result["played_ms"] == 1200
+    assert result["played_ms"] == 900
+    assert result["event_count"] == 3
+
+
+async def test_late_ended_after_interrupt_keeps_the_first_terminal(db_pool):
+    history = PlaybackHistory(db_pool, _identity())
+    await history.open(start_ms=0)
+    await history.interrupt(reason="user-stop", played_ms=700)
+    await history.end(scope="complete", played_ms=1000)
+
+    result = await history.get()
+    assert result["scope"] == "partial"
+    assert result["played_ms"] == 700
+    assert result["event_count"] == 3
+
+
+async def test_late_progress_after_unplayed_terminal_keeps_zero_played_ms(db_pool):
+    history = PlaybackHistory(db_pool, _identity())
+    await history.open(start_ms=0)
+    await history.end(scope="unplayed", played_ms=0)
+    await history.progress(played_ms=9999, interval_ms=100, phase="playing")
+
+    result = await history.get()
+    assert result["scope"] == "unplayed"
+    assert result["played_ms"] == 0
     assert result["event_count"] == 3
 
 
@@ -199,7 +223,7 @@ async def test_get_pages_beyond_the_single_query_limit(db_pool):
 
     result = await history.get()
     assert result["scope"] == "partial"
-    assert result["played_ms"] == 1999
+    assert result["played_ms"] == 900
     assert result["event_count"] == 1002
 
 
@@ -242,3 +266,26 @@ async def test_generation_done_does_not_infer_playback_scope(db_pool):
     assert result["scope"] == "unknown"
     assert result["played_ms"] == 0
     assert result["event_count"] == 1
+
+
+async def test_mismatched_media_receipts_are_excluded_from_scope_aggregation(db_pool):
+    identity = _identity()
+    history = PlaybackHistory(db_pool, identity)
+    await history.open(start_ms=0)
+    await history.progress(played_ms=300, interval_ms=100, phase="playing")
+
+    mismatched = PlaybackIdentity(
+        session_id=identity.session_id,
+        response_id=identity.response_id,
+        playback_id=identity.playback_id,
+        output_epoch=identity.output_epoch,
+        media_session_id="media-other",
+    )
+    other_media = PlaybackHistory(db_pool, mismatched)
+    await other_media.interrupt(reason="user-stop", played_ms=900, producer_seq=3)
+
+    result = await history.get()
+    assert result["scope"] == "unknown"
+    assert result["played_ms"] == 300
+    assert result["event_count"] == 3
+
