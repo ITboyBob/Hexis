@@ -5,6 +5,7 @@ import pytest
 from services.qwen_realtime_protocol import (
     ProtocolEvent,
     UnknownProtocolEvent,
+    build_cancel_response,
     build_first_response,
     build_update_session,
     parse_event,
@@ -60,6 +61,34 @@ def test_response_create_uses_nested_instructions_and_explicit_response_id():
         "type": "response.create",
         "response": {"id": "resp-1", "instructions": "每轮上下文"},
     }
+
+
+def test_cancel_response_is_an_explicit_control_message():
+    assert build_cancel_response() == {"type": "response.cancel"}
+
+
+def test_parses_generated_audio_transcript_delta_and_done():
+    delta = parse_event(
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": "resp-1",
+            "delta": "你好",
+        }
+    )
+    done = parse_event(
+        {
+            "type": "response.audio_transcript.done",
+            "response_id": "resp-1",
+            "transcript": "你好，我在。",
+        }
+    )
+
+    assert delta.type == "response_audio_transcript_delta"
+    assert delta.response_id == "resp-1"
+    assert delta.text == "你好"
+    assert done.type == "response_audio_transcript_done"
+    assert done.response_id == "resp-1"
+    assert done.text == "你好，我在。"
 
 
 def test_update_session_uses_nested_audio_contract():

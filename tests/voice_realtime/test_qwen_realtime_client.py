@@ -288,6 +288,74 @@ async def test_create_first_response_requires_explicit_call():
     await client.close()
 
 
+async def test_audio_final_precedes_explicit_response_create():
+    client, _ = make_client(
+        [
+            {"type": "session.updated", "session": {"id": "qwen-1"}},
+            {"type": "input_audio_buffer.committed", "item_id": "item-1"},
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "item-1",
+                "transcript": "请继续",
+                "is_final": True,
+            },
+        ]
+    )
+    await client.connect("稳定层")
+
+    committed = await client.wait_for_input_committed()
+    final = await client.wait_for_final(committed.item_id)
+
+    assert final.transcript == "请继续"
+    assert all(
+        message["type"] != "response.create" for message in client.websocket.sent
+    )
+    await client.create_first_response("resp-1", "每轮上下文")
+    assert client.websocket.sent[-1]["type"] == "response.create"
+    await client.close()
+
+
+async def test_cancel_response_sends_explicit_control():
+    client, _ = make_client([{"type": "session.updated", "session": {"id": "qwen-1"}}])
+    await client.connect("稳定层")
+    client.websocket.sent.clear()
+
+    await client.cancel_response()
+
+    assert client.websocket.sent == [{"type": "response.cancel"}]
+    await client.close()
+
+
+async def test_wait_for_response_terminal_returns_structured_error():
+    client, _ = make_client(
+        [
+            {"type": "session.updated", "session": {"id": "qwen-1"}},
+            {
+                "type": "error",
+                "error": {"code": "server_error", "message": "Cloud failed"},
+            },
+        ]
+    )
+    await client.connect("稳定层")
+
+    event = await client.wait_for_response_terminal()
+
+    assert event.type == "response_failed"
+    assert event.error_code == "server_error"
+    assert event.error_message == "Cloud failed"
+    await client.close()
+
+
+async def test_wait_for_response_terminal_timeout_fails_loudly():
+    client, _ = make_client([{"type": "session.updated", "session": {"id": "qwen-1"}}])
+    await client.connect("稳定层")
+
+    with pytest.raises(asyncio.TimeoutError):
+        await client.wait_for_response_terminal(timeout=0.01)
+
+    await client.close()
+
+
 async def test_unknown_event_is_logged_and_connection_continues(caplog):
     client, _ = make_client(
         [

@@ -12,6 +12,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from services.qwen_realtime_protocol import (
     ProtocolEvent,
     UnknownProtocolEvent,
+    build_cancel_response,
     build_first_response,
     build_update_session,
     parse_event,
@@ -115,6 +116,9 @@ class QwenRealtimeClient:
     async def create_first_response(self, response_id: str, instructions: str) -> None:
         await self._send(build_first_response(response_id, instructions))
 
+    async def cancel_response(self) -> None:
+        await self._send(build_cancel_response())
+
     async def events(self) -> AsyncIterator[ProtocolEvent]:
         self._require_connected()
         while True:
@@ -162,6 +166,24 @@ class QwenRealtimeClient:
                 event.item_id,
             )
         raise RuntimeError("Qwen Realtime 连接已结束，未收到 final 转录")
+
+    async def wait_for_response_terminal(
+        self, response_id: str | None = None, *, timeout: float | None = None
+    ) -> ProtocolEvent:
+        """Wait for a response terminal event without treating deltas as done."""
+
+        async def wait() -> ProtocolEvent:
+            async for event in self.events():
+                if event.type not in {"response.done", "response_failed"}:
+                    continue
+                if response_id is not None and event.response_id != response_id:
+                    continue
+                return event
+            raise RuntimeError("Qwen Realtime 连接已结束，未收到 response 终态")
+
+        if timeout is None:
+            return await wait()
+        return await asyncio.wait_for(wait(), timeout)
 
     async def close(self) -> None:
         receive_task = self._receive_task

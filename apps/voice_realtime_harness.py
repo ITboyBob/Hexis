@@ -66,14 +66,25 @@ _KNOWN_EVENT_TYPES = {
     "conversation.item.input_audio_transcription.partial",
     "conversation.item.input_audio_transcription.completed",
     "response.create",
+    "response.cancel",
     "response.created",
     "response.text.delta",
     "response.audio.delta",
+    "response.audio.done",
+    "response.audio_transcript.delta",
+    "response.audio_transcript.done",
+    "response.content_part.added",
+    "response.content_part.done",
+    "response.output_item.added",
+    "response.output_item.done",
     "response.done",
     "response.failed",
     "error",
     "input_audio_transcription.failed",
     "conversation.item.input_audio_transcription.failed",
+    "conversation.item.created",
+    "conversation.item.input_audio_transcription.delta",
+    "session.created",
 }
 _UUID_NAMESPACE = uuid5(UUID(int=0), "hexis:bob101:harness")
 
@@ -304,6 +315,8 @@ def sanitize_protocol_event(
         response = raw.get("response") or {}
         payload["response_id"] = response.get("id")
         payload["instructions"] = _text_summary(response.get("instructions"))
+    elif event_type == "response.cancel":
+        pass
     elif event_type == "response.created":
         response = raw.get("response") or {}
         payload["response_id"] = response.get("id")
@@ -311,6 +324,17 @@ def sanitize_protocol_event(
         payload["audio"] = _audio_summary(raw.get("delta"))
     elif event_type == "response.text.delta":
         payload["text"] = _text_summary(raw.get("delta"))
+    elif event_type in {
+        "response.audio_transcript.delta",
+        "response_audio_transcript_delta",
+        "response.audio_transcript.done",
+        "response_audio_transcript_done",
+    }:
+        payload["transcript"] = _preview_summary(
+            raw.get("delta")
+            if event_type.endswith("delta")
+            else raw.get("transcript") or raw.get("text")
+        )
     elif event_type in {
         "input_audio_transcription.partial",
         "input_audio_transcription.completed",
@@ -321,6 +345,8 @@ def sanitize_protocol_event(
     elif event_type in {"response.done", "response.failed"}:
         response = raw.get("response") or {}
         payload["response_id"] = response.get("id") or raw.get("response_id")
+        if event_type == "response.done" and isinstance(response, dict):
+            payload["status"] = response.get("status")
         if event_type == "response.failed":
             error = response.get("error") if isinstance(response, dict) else None
             if isinstance(error, dict):

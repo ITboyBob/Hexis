@@ -34,6 +34,8 @@ class ProtocolEvent:
     is_final: bool | None = None
     response_id: str | None = None
     audio: str | None = None
+    text: str | None = None
+    status: str | None = None
     output_index: int | None = None
     error_code: str | None = None
     error_message: str | None = None
@@ -105,6 +107,7 @@ def parse_event(value: dict[str, Any]) -> ProtocolEvent:
             type="response.done",
             raw=value,
             response_id=response.get("id") or value.get("response_id"),
+            status=response.get("status"),
         )
     if event_type == "response.failed":
         response = value.get("response") or {}
@@ -125,15 +128,31 @@ def parse_event(value: dict[str, Any]) -> ProtocolEvent:
     if event_type in {
         "response.text.delta",
         "response.audio.delta",
+        "response.audio_transcript.delta",
+        "response.audio_transcript.done",
     }:
-        if event_type == "response.audio.delta":
+        if event_type in {"response.audio.delta", "response.audio_transcript.delta"}:
             return ProtocolEvent(
-                type=event_type,
+                type=(
+                    "response_audio_transcript_delta"
+                    if event_type == "response.audio_transcript.delta"
+                    else event_type
+                ),
                 raw=value,
                 response_id=value.get("response_id"),
                 item_id=value.get("item_id"),
                 output_index=value.get("output_index"),
-                audio=value.get("delta"),
+                audio=value.get("delta") if event_type == "response.audio.delta" else None,
+                text=value.get("delta") if event_type == "response.audio_transcript.delta" else None,
+            )
+        if event_type == "response.audio_transcript.done":
+            return ProtocolEvent(
+                type="response_audio_transcript_done",
+                raw=value,
+                response_id=value.get("response_id"),
+                item_id=value.get("item_id"),
+                output_index=value.get("output_index"),
+                text=value.get("transcript") or value.get("text"),
             )
         return ProtocolEvent(
             type=event_type, raw=value, response_id=value.get("response_id")
@@ -175,3 +194,7 @@ def build_first_response(
         "type": "response.create",
         "response": {"id": response_id, "instructions": per_response_instructions},
     }
+
+
+def build_cancel_response() -> dict[str, Any]:
+    return {"type": "response.cancel"}

@@ -264,6 +264,21 @@ def test_protocol_evidence_redacts_sensitive_and_large_payloads():
     assert len(value["payload"]["audio"]["sha256"]) == 64
 
 
+def test_protocol_evidence_records_generated_transcript_without_raw_text():
+    raw = {
+        "type": "response.audio_transcript.done",
+        "response_id": "resp-1",
+        "transcript": "你好，我在。",
+    }
+    value = sanitize_protocol_event(
+        parse_event(raw), source="real", direction="incoming"
+    )
+
+    assert value["type"] == "response_audio_transcript_done"
+    assert value["payload"]["transcript"]["preview"] == "你好，我在。"
+    assert "raw" not in value
+
+
 @pytest.mark.asyncio(loop_scope="function")
 async def test_harness_success_creates_bounded_evidence(tmp_path, monkeypatch):
     wav = tmp_path / "input.wav"
