@@ -26,7 +26,7 @@ type Wav = {
 type CaptureResult = {
   status: "granted" | "denied" | "unavailable";
   reason?: string;
-  settings?: Record<string, unknown>;
+  settings?: unknown;
   sampleRate?: number;
   sampleCount?: number;
   peak?: number;

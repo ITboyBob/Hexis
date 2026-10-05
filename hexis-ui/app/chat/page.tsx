@@ -2791,7 +2791,14 @@ export default function ChatPage() {
                 <Paperclip size={17} />
               </button>
               <VoiceRecorder disabled={sending || attachmentsPreparing} onTranscript={handleVoiceTranscript} />
-              <TalkMode disabled={sending || attachmentsPreparing || Boolean(input.trim()) || attachments.length > 0 || fileAttachments.length > 0} onUtterance={handleSend} />
+              <TalkMode
+                disabled={sending || attachmentsPreparing || Boolean(input.trim()) || attachments.length > 0 || fileAttachments.length > 0}
+                sessionId={sessionId}
+                onSessionId={(nextSessionId) => {
+                  saveSessionId(nextSessionId);
+                  setSessionId(nextSessionId);
+                }}
+              />
               <textarea
                 ref={textareaRef}
                 aria-label={`Message ${agentStatus.agent_name || "Hexis"}`}

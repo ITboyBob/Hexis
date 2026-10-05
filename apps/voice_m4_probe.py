@@ -35,7 +35,7 @@ from services.voice_context_hydration import hydrate_voice_context
 
 SCHEMA = "voice-m4-probe-v1"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_BASELINE = "c65fcc01376b478aba4cbf27c924d34227fd6011"
+EXPECTED_BASELINE = "a31af80f6bf8d59d481fd456efeb35ed1f413aba"
 _MODES = {"preflight", "protocol", "devices", "calibration"}
 _SELECTED_REALTIME_CONFIG = Path(
     "/Users/itboybob/.cache/hexis/batch3-serial-voice-2026-10-05/config-real-2.json"
@@ -114,7 +114,7 @@ class ProbeRunResult:
     evidence: dict[str, Any]
 
 
-def _load_selected_config() -> dict[str, Any]:
+def load_selected_config() -> dict[str, Any]:
     if not _SELECTED_REALTIME_CONFIG.is_file():
         raise ProbeStageError("config", "已选择的 Qwen Realtime 配置文件不存在")
     value = json.loads(_SELECTED_REALTIME_CONFIG.read_text(encoding="utf-8"))
@@ -123,7 +123,7 @@ def _load_selected_config() -> dict[str, Any]:
     return value
 
 
-def _load_m4_stable_instructions() -> str:
+def load_m4_stable_instructions() -> str:
     if not _M4_INSTRUCTIONS.is_file():
         raise ProbeStageError("instructions", "M4 测试指令文件不存在")
     text = _M4_INSTRUCTIONS.read_text(encoding="utf-8")
@@ -148,8 +148,8 @@ class ProtocolProbe:
     """Run live M4 protocol checks and defer the instruction gate to the end."""
 
     def __init__(self) -> None:
-        self.config = _load_selected_config()
-        self.base_stable_instructions = _load_m4_stable_instructions()
+        self.config = load_selected_config()
+        self.base_stable_instructions = load_m4_stable_instructions()
         self.stable_instructions = (
             f"{self.base_stable_instructions}\n\n"
             f"Capability probe stable anchor: include the exact token "
@@ -206,7 +206,7 @@ class ProtocolProbe:
 
 
     async def _cloud_input_stage(self, _probe_request: ProbeRequest) -> dict[str, Any]:
-        api_key = _selected_env_value(self.config["api_key_env"])
+        api_key = selected_env_value(self.config["api_key_env"])
         if not api_key:
             raise ProbeStageError(
                 "cloud_input", f"环境变量 {self.config['api_key_env']} 未提供 API Key"
@@ -355,7 +355,7 @@ class ProtocolProbe:
         await self.client.close()
         self.client = None
 
-        api_key = _selected_env_value(self.config["api_key_env"])
+        api_key = selected_env_value(self.config["api_key_env"])
         if not api_key:
             raise ProbeStageError(
                 "history", f"环境变量 {self.config['api_key_env']} 未提供 API Key"
@@ -596,7 +596,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _selected_env_value(name: str) -> str | None:
+def selected_env_value(name: str) -> str | None:
     value = get_key(PROJECT_ROOT / ".env", name)
     if value is None:
         value = os.environ.get(name)
@@ -607,11 +607,11 @@ def _config_summary() -> dict[str, Any]:
     selected: dict[str, Any] = {}
     if _SELECTED_REALTIME_CONFIG.is_file():
         selected = json.loads(_SELECTED_REALTIME_CONFIG.read_text(encoding="utf-8"))
-    endpoint = selected.get("endpoint") or _selected_env_value(
+    endpoint = selected.get("endpoint") or selected_env_value(
         "QWEN_OMNI_REALTIME_URL"
     )
-    model = selected.get("model") or _selected_env_value("QWEN_REALTIME_MODEL")
-    voice = selected.get("voice") or _selected_env_value("QWEN_REALTIME_VOICE")
+    model = selected.get("model") or selected_env_value("QWEN_REALTIME_MODEL")
+    voice = selected.get("voice") or selected_env_value("QWEN_REALTIME_VOICE")
     api_key_env = selected.get("api_key_env") or "DASHSCOPE_API_KEY"
     value = {
         "endpoint": endpoint,

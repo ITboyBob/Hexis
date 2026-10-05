@@ -31,7 +31,16 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Literal
 
 import asyncpg
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -55,6 +64,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _pool: asyncpg.Pool | None = None
+_voice_realtime_registry: Any | None = None
 
 
 def _dsn() -> str:
@@ -233,6 +243,12 @@ class PlaybackEventRequest(BaseModel):
         default=None, pattern="^(complete|partial|unplayed|unknown)$"
     )
     reason: str | None = Field(default=None, min_length=1, max_length=120)
+
+
+class VoiceRealtimeSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: uuid.UUID
 
 
 class WebPushKeys(BaseModel):
@@ -2535,6 +2551,256 @@ async def transcribe_pwa_voice(
         "outcome": result.outcome,
         "duration_ms": result.duration_ms,
     }
+
+
+def _voice_realtime_session_registry():
+    global _voice_realtime_registry
+    if _voice_realtime_registry is None:
+        from services.voice_realtime_session import VoiceRealtimeSessionRegistry
+
+        _voice_realtime_registry = VoiceRealtimeSessionRegistry()
+    return _voice_realtime_registry
+
+
+def _browser_realtime_websocket_url(media_session_id: str) -> str:
+    base = (os.getenv("HEXIS_BROWSER_API_URL") or "").strip()
+    if not base:
+        raise HTTPException(
+            status_code=503,
+            detail="HEXIS_BROWSER_API_URL is not configured; set the browser-reachable local API address and retry.",
+        )
+    parsed = urllib.parse.urlsplit(base)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+        "127.0.0.1",
+        "localhost",
+    }:
+        raise HTTPException(
+            status_code=503,
+            detail="HEXIS_BROWSER_API_URL must be an explicit local http(s) address on 127.0.0.1 or localhost.",
+        )
+    scheme = "ws" if parsed.scheme == "http" else "wss"
+    return urllib.parse.urlunsplit(
+        (scheme, parsed.netloc, f"/api/voice/realtime/{media_session_id}", "", "")
+    )
+
+
+@app.post("/api/voice/realtime/sessions")
+async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
+    """Create one server-owned cloud realtime session for a chat."""
+
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
+
+    from apps.voice_m4_probe import (
+        load_m4_stable_instructions,
+        load_selected_config,
+        selected_env_value,
+    )
+    from apps.voice_realtime_harness import _default_connect_factory
+    from services.qwen_realtime_client import QwenRealtimeClient
+    from services.voice_realtime_session import (
+        VoiceRealtimeSession,
+        new_media_session_id,
+    )
+
+    registry = _voice_realtime_session_registry()
+    if registry.get(req.session_id) is not None:
+        raise HTTPException(status_code=409, detail="This chat already has an active realtime session.")
+
+    async with _pool.acquire() as conn:
+        stale_id = await conn.fetchval(
+            """
+            SELECT id FROM voice_realtime_sessions
+            WHERE session_id=$1::uuid AND status='active'
+            """,
+            req.session_id,
+        )
+        if stale_id is not None:
+            await conn.execute(
+                """
+                UPDATE voice_realtime_sessions
+                SET status='closed', closed_reason='disconnect', closed_at=now(),
+                    last_event_at=now()
+                WHERE id=$1::uuid
+                """,
+                stale_id,
+            )
+
+    config = load_selected_config()
+    api_key = selected_env_value(config["api_key_env"])
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail=f"{config['api_key_env']} is not configured for the selected realtime model.",
+        )
+
+    instructions = load_m4_stable_instructions()
+    media_session_id = new_media_session_id()
+    client = QwenRealtimeClient(
+        endpoint=config["endpoint"],
+        model=config["model"],
+        voice=config["voice"],
+        api_key=api_key,
+        connect_factory=_default_connect_factory,
+    )
+    session = VoiceRealtimeSession(
+        session_id=req.session_id,
+        media_session_id=media_session_id,
+        client=client,
+    )
+    registry.register(req.session_id, session)
+    try:
+        cloud_session_id = await session.start(instructions)
+        receiver = asyncio.create_task(session.run_receiver())
+        session.register_background_task(receiver)
+        instructions_hash = hashlib.sha256(instructions.encode("utf-8")).hexdigest()
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO voice_realtime_sessions
+                    (session_id, qwen_session_id, status, model, endpoint, instructions_hash)
+                VALUES ($1::uuid, $2, 'active', $3, $4, $5)
+                """,
+                req.session_id,
+                cloud_session_id,
+                config["model"],
+                config["endpoint"],
+                instructions_hash,
+            )
+            from services.behavior_events import BehaviorEvent, record_behavior_event
+
+            ready_event = BehaviorEvent(
+                event_id=uuid.uuid5(
+                    uuid.UUID(int=0),
+                    f"hexis:voice-realtime:{req.session_id}:{media_session_id}:ready",
+                ),
+                schema_version=1,
+                event_type="voice_session_ready",
+                stream_id="voice-realtime-session",
+                session_id=req.session_id,
+                source="server",
+                producer_id="hexis.voice-realtime",
+                producer_seq=0,
+                channel="voice",
+                payload={
+                    "qwen_session_id": cloud_session_id,
+                    "instructions_hash": instructions_hash,
+                    "gate": True,
+                },
+                media_session_id=media_session_id,
+            )
+            await record_behavior_event(_pool, ready_event)
+            await conn.execute(
+                """
+                UPDATE voice_realtime_sessions
+                SET last_event_at=now()
+                WHERE session_id=$1::uuid AND status='active'
+                """,
+                req.session_id,
+            )
+    except Exception:
+        await session.close("error")
+        registry.remove(req.session_id, session)
+        raise
+
+    return {
+        "session_id": str(req.session_id),
+        "media_session_id": media_session_id,
+        "websocket_url": _browser_realtime_websocket_url(media_session_id),
+    }
+
+
+@app.websocket("/api/voice/realtime/{media_session_id}")
+async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
+    """Exchange explicit local media envelopes for one realtime session."""
+
+    await websocket.accept()
+    registry = _voice_realtime_session_registry()
+    session = registry.get_by_media_session_id(media_session_id)
+    expected_origin = (os.getenv("HEXIS_UI_ORIGIN") or "http://localhost:3477").strip()
+    if session is None or websocket.headers.get("origin") != expected_origin:
+        await websocket.close(code=1008, reason="realtime session or origin is invalid")
+        return
+
+    from services.voice_realtime_transport import (
+        ClientTransportError,
+        VoiceClientTransport,
+        parse_client_message,
+    )
+    from apps.voice_m4_probe import load_m4_stable_instructions
+
+    transport = VoiceClientTransport(
+        session_id=session.session_id,
+        media_session_id=session.media_session_id,
+    )
+    instructions_hash = hashlib.sha256(
+        load_m4_stable_instructions().encode("utf-8")
+    ).hexdigest()
+    await websocket.send_json(
+        {
+            "schema_version": 1,
+            "type": "ready",
+            "session_id": str(session.session_id),
+            "media_session_id": session.media_session_id,
+            "producer_seq": 0,
+            "cloud_session_id": session.cloud_session_id,
+            "instructions_hash": instructions_hash,
+        }
+    )
+
+    close_reason = "manual"
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                value = json.loads(raw)
+                message = parse_client_message(value)
+                transport.accept(message)
+            except (json.JSONDecodeError, ValidationError, ClientTransportError) as exc:
+                await websocket.send_json(
+                    {
+                        "schema_version": 1,
+                        "type": "error",
+                        "session_id": str(session.session_id),
+                        "media_session_id": session.media_session_id,
+                        "producer_seq": 1,
+                        "stage": "transport",
+                        "code": "invalid_message",
+                        "message": str(exc),
+                        "recoverable": False,
+                    }
+                )
+                close_reason = "error"
+                break
+
+            if message.type == "audio_chunk":
+                await session.client.append_audio(message.pcm_base64)
+            elif message.type == "utterance_end":
+                await session.client.commit_audio()
+            elif message.type == "control" and message.action == "close":
+                break
+    except WebSocketDisconnect:
+        close_reason = "disconnect"
+    finally:
+        await session.close(close_reason)
+        registry.remove(session.session_id, session)
+        if _pool is not None:
+            async with _pool.acquire() as conn:
+                status = "failed" if close_reason == "error" else "closed"
+                await conn.execute(
+                    """
+                    UPDATE voice_realtime_sessions
+                    SET status=$2, closed_reason=$3, closed_at=now(), last_event_at=now()
+                    WHERE session_id=$1::uuid AND status='active'
+                    """,
+                    session.session_id,
+                    status,
+                    close_reason,
+                )
+        try:
+            await websocket.close(code=1000, reason="realtime session closed")
+        except Exception:
+            logger.debug("realtime websocket already closed", exc_info=True)
 
 
 @app.post("/api/voice/playback")

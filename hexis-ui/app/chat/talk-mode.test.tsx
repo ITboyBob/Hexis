@@ -1,55 +1,147 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TalkMode } from "./talk-mode";
 
+class FakeTrack {
+  stop = vi.fn();
+}
+
+class FakeStream {
+  constructor(readonly tracks: FakeTrack[] = [new FakeTrack()]) {}
+  getTracks() {
+    return this.tracks;
+  }
+}
+
+class FakeWebSocket {
+  static readonly OPEN = 1;
+  static instances: FakeWebSocket[] = [];
+  readyState = 0;
+  sent: string[] = [];
+  onopen: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+  private listeners: Record<string, Array<() => void>> = {};
+
+  constructor(readonly url: string) {
+    FakeWebSocket.instances.push(this);
+    queueMicrotask(() => this.open());
+  }
+
+  open() {
+    this.readyState = 1;
+    this.onopen?.();
+  }
+
+  send(data: string) {
+    this.sent.push(data);
+    const value = JSON.parse(data) as { type?: string; action?: string };
+    if (value.type === "control" && value.action === "close") this.close();
+  }
+
+  addEventListener(type: string, listener: () => void) {
+    this.listeners[type] = [...(this.listeners[type] || []), listener];
+  }
+
+  close() {
+    this.readyState = 3;
+    this.listeners.close?.forEach((listener) => listener());
+    this.onclose?.();
+  }
+}
+
 describe("TalkMode", () => {
+  beforeEach(() => {
+    Object.defineProperty(window, "isSecureContext", {
+      value: true,
+      configurable: true,
+    });
+  });
+
   afterEach(() => {
     vi.unstubAllGlobals();
-    Object.defineProperty(window, "isSecureContext", { value: true, configurable: true });
+    FakeWebSocket.instances = [];
+    Object.defineProperty(window, "isSecureContext", {
+      value: true,
+      configurable: true,
+    });
   });
 
-  it("keeps microphone access off until explicit start", () => {
-    const getUserMedia = vi.fn();
+  it("requests the microphone immediately and reaches realtime listening", async () => {
+    const order: string[] = [];
+    const track = new FakeTrack();
+    const getUserMedia = vi.fn().mockImplementation(async () => {
+      order.push("getUserMedia");
+      return new FakeStream([track]);
+    });
     Object.defineProperty(navigator, "mediaDevices", {
       value: { getUserMedia },
       configurable: true,
     });
-    render(<TalkMode onUtterance={vi.fn()} />);
-
-    expect(screen.getByRole("button", { name: "Start Talk mode" })).toBeInTheDocument();
-    expect(getUserMedia).not.toHaveBeenCalled();
-  });
-
-  it("gives the exact settings step before requesting a microphone", async () => {
-    Object.defineProperty(window, "isSecureContext", { value: true, configurable: true });
-    class Recorder {}
-    vi.stubGlobal("MediaRecorder", Recorder);
-    const getUserMedia = vi.fn();
-    Object.defineProperty(navigator, "mediaDevices", {
-      value: { getUserMedia },
-      configurable: true,
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        new Response(JSON.stringify({ stt_enabled: false }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const value = String(url);
+      order.push(value);
+      if (
+        value.includes("/api/voice/transcribe") ||
+        value.includes("/api/voice/synthesize")
+      ) {
+        throw new Error("legacy voice path must not be called");
+      }
+      return new Response(
+        JSON.stringify({
+          session_id: "session-1",
+          media_session_id: "media-1",
+          websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1",
         }),
-      ),
-    );
-    render(<TalkMode onUtterance={vi.fn()} />);
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    render(<TalkMode sessionId="session-1" />);
 
     fireEvent.click(screen.getByRole("button", { name: "Start Talk mode" }));
 
-    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Settings → Voice"));
-    expect(getUserMedia).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByText("Listening")).toBeInTheDocument());
+    expect(order[0]).toBe("getUserMedia");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/voice/realtime/sessions",
+      expect.objectContaining({ method: "POST" }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop Talk mode" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Start Talk mode" }),
+      ).toBeInTheDocument(),
+    );
+    expect(track.stop).toHaveBeenCalled();
+    expect(FakeWebSocket.instances[0].readyState).toBe(3);
+  });
+
+  it("does not create a realtime session when microphone permission is denied", async () => {
+    const getUserMedia = vi.fn().mockRejectedValue(new Error("Permission denied"));
+    Object.defineProperty(navigator, "mediaDevices", {
+      value: { getUserMedia },
+      configurable: true,
+    });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    render(<TalkMode sessionId="session-1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Start Talk mode" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Permission denied");
+    expect(screen.queryByText("Listening")).not.toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("refuses a remote-device microphone without HTTPS", async () => {
-    Object.defineProperty(window, "isSecureContext", { value: false, configurable: true });
-    render(<TalkMode onUtterance={vi.fn()} />);
+    Object.defineProperty(window, "isSecureContext", {
+      value: false,
+      configurable: true,
+    });
+    render(<TalkMode sessionId="session-1" />);
 
     fireEvent.click(screen.getByRole("button", { name: "Start Talk mode" }));
 
