@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 from uuid import uuid4
 
 import pytest
@@ -117,16 +118,30 @@ def test_transport_rejects_range_conflict_and_bad_pcm_length():
             )
         )
     )
-    conflict = parse_client_message(
+    first_chunk = parse_client_message(
         envelope(
             "audio_chunk",
             1,
             session_id=session_id,
             capture_instance_id=str(capture_instance),
-            start_frame=2,
-            end_frame=4,
+            start_frame=0,
+            end_frame=2,
             start_monotonic_ms=0,
             end_monotonic_ms=10,
+            pcm_base64=base64.b64encode(b"\x01\x00\x02\x00").decode(),
+        )
+    )
+    transport.accept(first_chunk)
+    conflict = parse_client_message(
+        envelope(
+            "audio_chunk",
+            2,
+            session_id=session_id,
+            capture_instance_id=str(capture_instance),
+            start_frame=3,
+            end_frame=5,
+            start_monotonic_ms=11,
+            end_monotonic_ms=20,
             pcm_base64=base64.b64encode(b"\x01\x00\x02\x00").decode(),
         )
     )
@@ -136,7 +151,7 @@ def test_transport_rejects_range_conflict_and_bad_pcm_length():
     bad_length = parse_client_message(
         envelope(
             "audio_chunk",
-            2,
+            3,
             session_id=session_id,
             capture_instance_id=str(capture_instance),
             start_frame=0,
@@ -148,6 +163,69 @@ def test_transport_rejects_range_conflict_and_bad_pcm_length():
     )
     with pytest.raises(ClientTransportError, match="PCM"):
         transport.accept(bad_length)
+
+
+def test_transport_allows_silence_gaps_between_voice_utterances():
+    session_id = uuid4()
+    transport = VoiceClientTransport(
+        session_id=session_id, media_session_id="media-1"
+    )
+    capture_instance = uuid4()
+    transport.accept(
+        parse_client_message(
+            envelope(
+                "capture_open",
+                0,
+                session_id=session_id,
+                capture_instance_id=str(capture_instance),
+                sample_rate=16000,
+                channels=1,
+                sample_format="s16le",
+            )
+        )
+    )
+
+    def send_audio(seq: int, start: int, end: int, start_ms: int, end_ms: int):
+        return transport.accept(
+            parse_client_message(
+                envelope(
+                    "audio_chunk",
+                    seq,
+                    session_id=session_id,
+                    capture_instance_id=str(capture_instance),
+                    start_frame=start,
+                    end_frame=end,
+                    start_monotonic_ms=start_ms,
+                    end_monotonic_ms=end_ms,
+                    pcm_base64=base64.b64encode(b"\x01\x00" * (end - start)).decode(),
+                )
+            )
+        )
+
+    def end_utterance(seq: int, start: int, end: int, start_ms: int, end_ms: int):
+        pcm = b"\x01\x00" * (end - start)
+        message = parse_client_message(
+            envelope(
+                "utterance_end",
+                seq,
+                session_id=session_id,
+                capture_instance_id=str(capture_instance),
+                start_frame=start,
+                end_frame=end,
+                start_monotonic_ms=start_ms,
+                end_monotonic_ms=end_ms,
+                audio_sha256=hashlib.sha256(pcm).hexdigest(),
+            )
+        )
+        return transport.accept(message)
+
+    send_audio(1, 2_045_264, 2_045_280, 10_000, 10_001)
+    end_utterance(2, 2_045_264, 2_045_280, 10_000, 10_001)
+    send_audio(3, 2_400_000, 2_400_016, 20_000, 20_001)
+    end_utterance(4, 2_400_000, 2_400_016, 20_000, 20_001)
+
+    with pytest.raises(ClientTransportError, match="overlaps an earlier utterance"):
+        send_audio(5, 2_400_008, 2_400_024, 20_002, 20_003)
 
 
 def test_transport_rejects_oversized_base64_and_wrong_identity():

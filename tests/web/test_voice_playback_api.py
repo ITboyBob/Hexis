@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -9,6 +9,7 @@ import pytest
 import apps.hexis_api as hexis_api
 from services.behavior_events import query_behavior_events
 from services.playback_history import PlaybackHistory, PlaybackIdentity
+from services.voice_realtime_session import VoiceRealtimeSession, VoiceRealtimeSessionRegistry
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
 
@@ -29,10 +30,48 @@ def _body(action: str, producer_seq: int = 1, **overrides):
     return body
 
 
+def _register_playback_session(monkeypatch, identity: PlaybackIdentity):
+    class Client:
+        async def close(self):
+            return None
+
+    registry = VoiceRealtimeSessionRegistry()
+    session = VoiceRealtimeSession(
+        session_id=identity.session_id,
+        media_session_id=identity.media_session_id,
+        client=Client(),
+    )
+    session._playback_ids[identity.response_id] = identity.playback_id
+    session._playback_state[identity.response_id] = {
+        "output_epoch": identity.output_epoch,
+        "playback_id": identity.playback_id,
+        "scheduled_frames": 480_000,
+        "scheduled_ms": 10_000,
+        "opened": False,
+        "terminal": False,
+        "last_seq": 0,
+        "receipts": {},
+        "played_ms": 0,
+        "invalidated": False,
+    }
+    registry.register(identity.session_id, session)
+    monkeypatch.setattr(hexis_api, "_voice_realtime_registry", registry)
+    return session
+
+
 @pytest.fixture
 async def client(monkeypatch):
     pool = object()
     monkeypatch.setattr(hexis_api, "_pool", pool)
+    identity = PlaybackIdentity(
+        session_id=UUID(SESSION_ID),
+        response_id="resp-1",
+        playback_id="play-1",
+        output_epoch=1,
+        media_session_id="media-1",
+    )
+    session = _register_playback_session(monkeypatch, identity)
+    session.accept_playback_receipt = lambda _request: True
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=hexis_api.app),
         base_url="http://test",
@@ -180,6 +219,7 @@ async def test_playback_api_records_real_events_through_shared_history(
         media_session_id=f"media-{uuid4()}",
     )
     monkeypatch.setattr(hexis_api, "_pool", db_pool)
+    _register_playback_session(monkeypatch, identity)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=hexis_api.app),
         base_url="http://test",
@@ -261,6 +301,7 @@ async def test_playback_api_retry_deduplicates_with_stable_event_id(
         media_session_id=f"media-{uuid4()}",
     )
     monkeypatch.setattr(hexis_api, "_pool", db_pool)
+    _register_playback_session(monkeypatch, identity)
     body = {
         "action": "open",
         "session_id": str(identity.session_id),
@@ -296,6 +337,7 @@ async def test_playback_api_concurrent_requests_keep_producer_stream_order(
         media_session_id=f"media-{uuid4()}",
     )
     monkeypatch.setattr(hexis_api, "_pool", db_pool)
+    _register_playback_session(monkeypatch, identity)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=hexis_api.app),
         base_url="http://test",

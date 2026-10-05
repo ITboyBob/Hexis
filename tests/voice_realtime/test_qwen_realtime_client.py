@@ -99,10 +99,13 @@ async def test_connect_waits_for_session_updated_and_does_not_send_response():
     assert client.websocket.sent[0] == {
         "type": "session.update",
         "session": {
-            "modalities": ["text", "audio"],
-            "instructions": "稳定层",
-            "turn_detection": None,
-            "audio": {
+                "modalities": ["text", "audio"],
+                "instructions": "稳定层",
+                "turn_detection": None,
+                "input_audio_transcription": {
+                    "model": "qwen3-asr-flash-realtime"
+                },
+                "audio": {
                 "input": {
                     "format": {
                         "type": "pcm",
@@ -123,6 +126,103 @@ async def test_connect_waits_for_session_updated_and_does_not_send_response():
     assert all(
         message["type"] != "response.create" for message in client.websocket.sent
     )
+    await client.close()
+
+
+async def test_turn_instruction_update_waits_for_matching_session_receipt_before_response():
+    client, observed = make_client(
+        [{"type": "session.updated", "session": {"id": "qwen-1"}}]
+    )
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "voice_recall",
+            "description": "read-only recall",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    await client.connect("稳定层", tools=[tool])
+    ws = observed["websocket"]
+    update_task = asyncio.create_task(
+        client.update_session_instructions("每轮层")
+    )
+    await asyncio.sleep(0)
+
+    update = ws.sent[-1]
+    assert update["type"] == "session.update"
+    assert update["session"] == {"instructions": "稳定层\n\n每轮层"}
+    assert all(message["type"] != "response.create" for message in ws.sent)
+    ws.incoming.put_nowait(
+        json.dumps(
+            {
+                "type": "session.updated",
+                "event_id": "provider-generated-stale-event",
+                "session": {
+                    "id": "qwen-1",
+                    "instructions": "上一轮指令",
+                },
+            }
+        )
+    )
+    ws.incoming.put_nowait(
+        json.dumps(
+            {
+                "type": "session.updated",
+                "event_id": "provider-generated-update-event",
+                "session": {
+                    **{
+                        key: value
+                        for key, value in ws.sent[0]["session"].items()
+                        if key != "instructions"
+                    },
+                    "id": "qwen-1",
+                    "instructions": "稳定层\n\n每轮层",
+                },
+            }
+        )
+    )
+    receipt = await update_task
+
+    assert receipt.instructions == "稳定层\n\n每轮层"
+    await client.create_first_response("resp-1")
+    assert ws.sent[-1]["type"] == "response.create"
+    assert "instructions" not in ws.sent[-1].get("response", {})
+    await client.close()
+
+
+async def test_turn_instruction_update_fails_closed_if_receipt_changes_session_config():
+    client, observed = make_client(
+        [{"type": "session.updated", "session": {"id": "qwen-1"}}]
+    )
+    await client.connect("稳定层")
+    ws = observed["websocket"]
+    update_task = asyncio.create_task(
+        client.update_session_instructions("每轮层")
+    )
+    await asyncio.sleep(0)
+    update = ws.sent[-1]
+    ws.incoming.put_nowait(
+        json.dumps(
+            {
+                "type": "session.updated",
+                "event_id": "provider-generated-update-event",
+                "session": {
+                    **{
+                        key: value
+                        for key, value in ws.sent[0]["session"].items()
+                        if key != "instructions"
+                    },
+                    "id": "qwen-1",
+                    "instructions": "稳定层\n\n每轮层",
+                    "modalities": ["text"],
+                },
+            }
+        )
+    )
+
+    with pytest.raises(QwenRealtimeSessionError, match="modalities"):
+        await update_task
+    assert all(message["type"] != "response.create" for message in ws.sent)
     await client.close()
 
 
@@ -156,6 +256,21 @@ async def test_audio_methods_send_facts_without_authorization():
     assert all(
         message["type"] != "input_committed" for message in client.websocket.sent
     )
+    await client.close()
+
+
+async def test_large_audio_is_split_below_provider_websocket_frame_limit():
+    client, _ = make_client([{"type": "session.updated", "session": {"id": "qwen-1"}}])
+    await client.connect("稳定层")
+    client.websocket.sent.clear()
+    audio = "A" * 200_000
+
+    await client.append_audio(audio)
+
+    chunks = [message["audio"] for message in client.websocket.sent]
+    assert len(chunks) == 2
+    assert "".join(chunks) == audio
+    assert all(len(json.dumps(message)) < 262_144 for message in client.websocket.sent)
     await client.close()
 
 
@@ -200,6 +315,60 @@ async def test_wait_for_input_committed_returns_typed_item_receipt():
 
     assert event.type == "input_audio_buffer_committed"
     assert event.item_id == "item-1"
+    await client.close()
+
+
+async def test_voice_recall_tool_output_and_followup_stay_on_same_cloud_session():
+    client, observed = make_client(
+        [{"type": "session.updated", "session": {"id": "qwen-1"}}]
+    )
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "voice_recall",
+            "description": "read-only recall",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    await client.connect("稳定层", tools=[tool])
+    await client.send_function_call_output("call-1", '{"status":"no_results"}')
+    update_task = asyncio.create_task(
+        client.update_session_instructions("同一轮上下文")
+    )
+    await asyncio.sleep(0)
+    update = observed["websocket"].sent[-1]
+    observed["websocket"].incoming.put_nowait(
+        json.dumps({
+            "type": "session.updated",
+                "event_id": update["event_id"],
+                    "session": {
+                        **{
+                            key: value
+                            for key, value in observed["websocket"].sent[0]["session"].items()
+                            if key != "instructions"
+                        },
+                        "id": "qwen-1",
+                        "instructions": "稳定层\n\n同一轮上下文",
+                    },
+        })
+    )
+    await update_task
+    await client.create_first_response("resp-2")
+    sent = observed["websocket"].sent
+    assert sent[0]["session"]["tools"] == [tool]
+    assert sent[0]["session"]["tool_choice"] == "auto"
+    assert sent[1] == {
+        "type": "conversation.item.create",
+        "item": {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": '{"status":"no_results"}',
+        },
+    }
+    assert sent[2]["type"] == "session.update"
+    assert sent[2]["session"] == {"instructions": "稳定层\n\n同一轮上下文"}
+    assert sent[3]["response"]["id"] == "resp-2"
+    assert "tools" not in sent[3]["response"]
     await client.close()
 
 
@@ -279,12 +448,11 @@ async def test_create_first_response_requires_explicit_call():
         message["type"] != "response.create" for message in client.websocket.sent
     )
 
-    await client.create_first_response("resp-1", "每轮上下文")
+    await client.create_first_response("resp-1")
 
-    assert client.websocket.sent[-1] == {
-        "type": "response.create",
-        "response": {"id": "resp-1", "instructions": "每轮上下文"},
-    }
+    assert client.websocket.sent[-1]["type"] == "response.create"
+    assert client.websocket.sent[-1]["response"] == {"id": "resp-1"}
+    assert client.websocket.sent[-1]["event_id"].startswith("event_")
     await client.close()
 
 
@@ -310,7 +478,26 @@ async def test_audio_final_precedes_explicit_response_create():
     assert all(
         message["type"] != "response.create" for message in client.websocket.sent
     )
-    await client.create_first_response("resp-1", "每轮上下文")
+    update_task = asyncio.create_task(client.update_session_instructions("每轮上下文"))
+    await asyncio.sleep(0)
+    update = client.websocket.sent[-1]
+    client.websocket.incoming.put_nowait(
+        json.dumps({
+            "type": "session.updated",
+            "event_id": update["event_id"],
+            "session": {
+                **{
+                    key: value
+                    for key, value in client.websocket.sent[0]["session"].items()
+                    if key != "instructions"
+                },
+                "id": "qwen-1",
+                "instructions": update["session"]["instructions"],
+            },
+        })
+    )
+    await update_task
+    await client.create_first_response("resp-1")
     assert client.websocket.sent[-1]["type"] == "response.create"
     await client.close()
 

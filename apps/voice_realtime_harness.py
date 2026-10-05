@@ -306,15 +306,20 @@ def sanitize_protocol_event(
 
     if event_type == "session.updated":
         payload["session_id"] = (raw.get("session") or {}).get("id")
+        payload["event_id"] = raw.get("event_id")
+        payload["instructions"] = _text_summary(
+            (raw.get("session") or {}).get("instructions")
+        )
     elif event_type == "session.update":
         session = raw.get("session") or {}
+        payload["event_id"] = raw.get("event_id")
         payload["instructions"] = _text_summary(session.get("instructions"))
     elif event_type == "input_audio_buffer.append":
         payload["audio"] = _audio_summary(raw.get("audio"))
     elif event_type == "response.create":
         response = raw.get("response") or {}
+        payload["event_id"] = raw.get("event_id")
         payload["response_id"] = response.get("id")
-        payload["instructions"] = _text_summary(response.get("instructions"))
     elif event_type == "response.cancel":
         pass
     elif event_type == "response.created":
@@ -979,7 +984,8 @@ async def run_harness(
 
             response_id = f"resp-{uuid5(_UUID_NAMESPACE, input_turn_id)}"
             started = time.monotonic_ns() // 1_000_000
-            await client.create_first_response(response_id, instructions)
+            await client.update_session_instructions(instructions)
+            await client.create_first_response(response_id)
             evidence["response_created"] = True
             evidence["response_create_monotonic_ms"] = (
                 time.monotonic_ns() // 1_000_000 - started

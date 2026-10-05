@@ -33,6 +33,7 @@ from services.behavior_events import (
     query_behavior_events,
     replay_behavior_events,
 )
+from services.qwen_realtime_protocol import ProtocolEvent
 from services.qwen_realtime_protocol import ProtocolEvent, parse_event
 from services.qwen_realtime_output import OutputPlaybackFacts
 from services.voice_emotion_gate import VoiceEmotionCoordinator
@@ -96,9 +97,28 @@ class FakeWebSocket:
             self.incoming.put_nowait(json.dumps(value))
         self.sent: list[dict] = []
         self.closed = False
+        self.session_config = None
 
     async def send(self, message: str) -> None:
-        self.sent.append(json.loads(message))
+        value = json.loads(message)
+        self.sent.append(value)
+        if value.get("type") == "session.update":
+            if value.get("event_id"):
+                self.session_config.update(value["session"])
+                self.incoming.put_nowait(
+                    json.dumps(
+                        {
+                            "type": "session.updated",
+                            "event_id": value["event_id"],
+                            "session": {
+                                **self.session_config,
+                                "id": "cloud-session-1",
+                            },
+                        }
+                    )
+                )
+            else:
+                self.session_config = dict(value["session"])
 
     async def recv(self) -> str:
         return await self.incoming.get()
@@ -192,6 +212,7 @@ def turn_fakes():
         def __init__(self):
             self.commit_calls = 0
             self.create_calls = []
+            self.pending_instructions = None
 
         async def commit_audio(self):
             self.commit_calls += 1
@@ -207,8 +228,11 @@ def turn_fakes():
                 raise AssertionError("final 未绑定到 commit 回执 item_id")
             return event
 
-        async def create_first_response(self, response_id, instructions):
-            self.create_calls.append((response_id, instructions))
+        async def update_session_instructions(self, instructions):
+            self.pending_instructions = instructions
+
+        async def create_first_response(self, response_id):
+            self.create_calls.append((response_id, self.pending_instructions))
 
     return identity, source, final, Client()
 
@@ -262,6 +286,35 @@ def test_protocol_evidence_redacts_sensitive_and_large_payloads():
     assert "AAAA" not in text
     assert value["payload"]["audio"]["base64_length"] == 4
     assert len(value["payload"]["audio"]["sha256"]) == 64
+
+
+def test_instruction_update_evidence_correlates_hashes_without_raw_prompt():
+    request = {
+        "type": "session.update",
+        "event_id": "event-1",
+        "session": {"instructions": "stable secret\n\nper-turn context"},
+    }
+    receipt = {
+        "type": "session.updated",
+        "event_id": "event-1",
+        "session": {
+            "id": "cloud-session-1",
+            "instructions": "stable secret\n\nper-turn context",
+        },
+    }
+    sent = sanitize_protocol_event(
+        ProtocolEvent(type="session.update", raw=request),
+        source="real",
+        direction="outgoing",
+    )
+    received = sanitize_protocol_event(
+        parse_event(receipt), source="real", direction="incoming"
+    )
+    encoded = json.dumps([sent, received], ensure_ascii=False)
+
+    assert sent["payload"]["event_id"] == received["payload"]["event_id"]
+    assert sent["payload"]["instructions"] == received["payload"]["instructions"]
+    assert "stable secret" not in encoded
 
 
 def test_protocol_evidence_records_generated_transcript_without_raw_text():

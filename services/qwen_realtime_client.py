@@ -3,22 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from uuid import uuid4
 
 from services.qwen_realtime_protocol import (
     ProtocolEvent,
     UnknownProtocolEvent,
     build_cancel_response,
+    build_function_call_output,
     build_first_response,
     build_update_session,
     parse_event,
 )
 
 logger = logging.getLogger(__name__)
+_MAX_AUDIO_BASE64_CHARS_PER_MESSAGE = 180_000
 
 
 def _endpoint_with_model(endpoint: str, model: str) -> str:
@@ -68,6 +72,11 @@ class QwenRealtimeClient:
         self._websocket: Any | None = None
         self._receive_task: asyncio.Task[None] | None = None
         self._session_ready: asyncio.Future[ProtocolEvent] | None = None
+        self._session_update_waiter: asyncio.Future[ProtocolEvent] | None = None
+        self._session_update_expected_instructions: str | None = None
+        self._session_update_lock = asyncio.Lock()
+        self._stable_instructions = ""
+        self._session_config: dict[str, Any] | None = None
         self._events: asyncio.Queue[ProtocolEvent] = asyncio.Queue()
         self._terminal_error: Exception | None = None
 
@@ -77,7 +86,12 @@ class QwenRealtimeClient:
             raise RuntimeError("Qwen Realtime WebSocket 未连接")
         return self._websocket
 
-    async def connect(self, instructions: str) -> str:
+    async def connect(
+        self,
+        instructions: str,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> str:
         if self._websocket is not None:
             raise RuntimeError("Qwen Realtime WebSocket 已连接")
 
@@ -97,7 +111,12 @@ class QwenRealtimeClient:
         loop = asyncio.get_running_loop()
         self._session_ready = loop.create_future()
         try:
-            await self._send(build_update_session(instructions, voice=self.voice))
+            initial_update = build_update_session(
+                instructions, voice=self.voice, tools=tools
+            )
+            self._stable_instructions = instructions
+            self._session_config = copy.deepcopy(initial_update["session"])
+            await self._send(initial_update)
             self._receive_task = asyncio.create_task(
                 self._receive_loop(), name="qwen-realtime-receive"
             )
@@ -108,13 +127,87 @@ class QwenRealtimeClient:
             raise
 
     async def append_audio(self, audio: str) -> None:
-        await self._send({"type": "input_audio_buffer.append", "audio": audio})
+        if not isinstance(audio, str) or not audio:
+            raise ValueError("audio must be a non-empty base64 string")
+        chunk_size = _MAX_AUDIO_BASE64_CHARS_PER_MESSAGE
+        chunk_size -= chunk_size % 4
+        for offset in range(0, len(audio), chunk_size):
+            await self._send(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": audio[offset : offset + chunk_size],
+                }
+            )
 
     async def commit_audio(self) -> None:
         await self._send({"type": "input_audio_buffer.commit"})
 
-    async def create_first_response(self, response_id: str, instructions: str) -> None:
-        await self._send(build_first_response(response_id, instructions))
+    async def update_session_instructions(
+        self, per_turn_instructions: str, *, timeout: float = 10.0
+    ) -> ProtocolEvent:
+        """Apply stable plus per-turn instructions and require the provider echo."""
+        if not isinstance(per_turn_instructions, str) or not per_turn_instructions.strip():
+            raise ValueError("per_turn_instructions must be a non-empty string")
+        self._require_connected()
+        if self._session_config is None:
+            raise QwenRealtimeSessionError("session configuration is unavailable")
+
+        async with self._session_update_lock:
+            loop = asyncio.get_running_loop()
+            waiter: asyncio.Future[ProtocolEvent] = loop.create_future()
+            event_id = f"event_{uuid4().hex}"
+            self._session_update_waiter = waiter
+            combined = f"{self._stable_instructions}\n\n{per_turn_instructions}"
+            self._session_update_expected_instructions = combined
+            session = {"instructions": combined}
+            try:
+                await self._send(
+                    {
+                        "type": "session.update",
+                        "event_id": event_id,
+                        "session": session,
+                    }
+                )
+                receipt = await asyncio.wait_for(waiter, timeout=timeout)
+                if self._session_ready is not None:
+                    initial = self._session_ready.result()
+                    if not receipt.session_id or receipt.session_id != initial.session_id:
+                        raise QwenRealtimeSessionError(
+                            "session.updated belongs to another cloud session"
+                        )
+                received_session = (receipt.raw or {}).get("session") or {}
+                if receipt.instructions != combined:
+                    raise QwenRealtimeSessionError(
+                        "session.updated instructions do not match the requested instructions"
+                    )
+                for name, value in self._session_config.items():
+                    if name != "instructions" and received_session.get(name) != value:
+                        raise QwenRealtimeSessionError(
+                            f"session.updated changed existing session field: {name}"
+                        )
+                self._session_config["instructions"] = combined
+                return receipt
+            except asyncio.TimeoutError as exc:
+                raise QwenRealtimeSessionError(
+                    "session.update timed out before matching session.updated"
+                ) from exc
+            finally:
+                if self._session_update_waiter is waiter:
+                    self._session_update_waiter = None
+                    self._session_update_expected_instructions = None
+
+    async def create_first_response(self, response_id: str) -> None:
+        await self._send(
+            build_first_response(response_id, event_id=f"event_{uuid4().hex}")
+        )
+
+    async def send_function_call_output(self, call_id: str, output: str) -> None:
+        await self._send(build_function_call_output(call_id, output))
+
+    async def create_followup_response(
+        self, response_id: str
+    ) -> None:
+        await self.create_first_response(response_id)
 
     async def cancel_response(self) -> None:
         await self._send(build_cancel_response())
@@ -219,11 +312,30 @@ class QwenRealtimeClient:
 
             await self._events.put(event)
             if event.type == "session.updated":
-                if event.session_id:
-                    self._resolve_session(event)
-                else:
-                    self._fail_session(
-                        QwenRealtimeSessionError("session.updated 缺少 session id")
+                waiter = self._session_update_waiter
+                if (
+                    waiter is not None
+                    and not waiter.done()
+                    and event.session_id
+                    == (self._session_ready.result().session_id if self._session_ready else None)
+                    and event.instructions
+                    == self._session_update_expected_instructions
+                ):
+                    waiter.set_result(event)
+                elif self._session_ready is not None and not self._session_ready.done():
+                    if event.session_id:
+                        self._resolve_session(event)
+                    else:
+                        self._fail_session(
+                            QwenRealtimeSessionError("session.updated 缺少 session id")
+                        )
+            elif event.type == "error":
+                waiter = self._session_update_waiter
+                if waiter is not None and not waiter.done():
+                    waiter.set_exception(
+                        QwenRealtimeSessionError(
+                            event.error_message or event.error_code or "session.update rejected"
+                        )
                     )
 
     async def _send(self, value: dict[str, Any]) -> None:

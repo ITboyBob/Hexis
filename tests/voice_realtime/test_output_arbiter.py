@@ -42,3 +42,15 @@ async def test_claim_rejects_wrong_media_and_release_enables_next_epoch():
     second = await arbiter.claim("resp-2", "media-1")
 
     assert second.output_epoch == 2
+
+
+async def test_one_chat_cannot_claim_two_distinct_foreground_responses():
+    arbiter = VoiceOutputArbiter(session_id=uuid4())
+    first = await arbiter.claim("resp-1", "media-1")
+
+    with pytest.raises(OutputClaimConflict, match="another response"):
+        await arbiter.claim("resp-2", "media-1")
+
+    await arbiter.release(first.response_id, first.media_session_id)
+    second = await arbiter.claim("resp-2", "media-1")
+    assert second.output_epoch == first.output_epoch + 1

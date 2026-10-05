@@ -44,8 +44,10 @@ class FakeWebSocket {
 
   close() {
     this.readyState = 3;
-    this.listeners.close?.forEach((listener) => listener());
-    this.onclose?.();
+    queueMicrotask(() => {
+      this.listeners.close?.forEach((listener) => listener());
+      this.onclose?.();
+    });
   }
 }
 
@@ -93,6 +95,7 @@ describe("VoiceRealtimeClient", () => {
     expect(fetchMock.mock.calls[0][0]).toContain("/api/chat/session");
     expect(fetchMock.mock.calls[1][0]).toContain("/api/voice/realtime/sessions");
     expect(client.state).toBe("ready");
+    client.sendControl("barge_in", "speech_start");
     client.send({
       schema_version: 1,
       type: "control",
@@ -102,7 +105,14 @@ describe("VoiceRealtimeClient", () => {
       action: "close",
       reason: "manual",
     });
-    expect(socket.sent).toHaveLength(1);
+    expect(socket.sent).toHaveLength(2);
+    expect(JSON.parse(socket.sent[0])).toMatchObject({
+      type: "control",
+      action: "barge_in",
+      reason: "speech_start",
+      session_id: "session-1",
+      media_session_id: "media-1",
+    });
 
     client.close();
     expect(track.stop).toHaveBeenCalled();
@@ -151,5 +161,41 @@ describe("VoiceRealtimeClient", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(FakeWebSocket.instances).toHaveLength(0);
     expect(client.state).toBe("closed");
+  });
+
+  it("stops capture and exposes an explicit retry after the realtime socket drops", async () => {
+    const track = new FakeTrack();
+    Object.defineProperty(navigator, "mediaDevices", {
+      value: { getUserMedia: vi.fn().mockResolvedValue(new FakeStream([track])) },
+      configurable: true,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(
+        JSON.stringify({
+          session_id: "session-1",
+          media_session_id: "media-1",
+          websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1",
+        }),
+        { status: 200 },
+      )),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const messages: unknown[] = [];
+    const client = new VoiceRealtimeClient({
+      onMessage: (message) => messages.push(message),
+    });
+
+    await client.open("session-1");
+    FakeWebSocket.instances[0].close();
+    await vi.waitFor(() => expect(client.state).toBe("failed"));
+
+    expect(track.stop).toHaveBeenCalledOnce();
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: "error",
+      stage: "client",
+      code: "connection_failed",
+      recoverable: true,
+    }));
   });
 });

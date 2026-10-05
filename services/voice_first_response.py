@@ -421,7 +421,8 @@ async def _run_new_first_response_turn(
         created_started = _monotonic_ms()
         response_send_status = "sending"
         try:
-            await client.create_first_response(response_id, instructions)
+            await client.update_session_instructions(instructions)
+            await client.create_first_response(response_id)
         except Exception as exc:
             response_send_status = "send_unknown"
             error = _error(exc, "response_send")

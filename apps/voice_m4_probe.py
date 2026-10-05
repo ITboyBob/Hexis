@@ -35,7 +35,7 @@ from services.voice_context_hydration import hydrate_voice_context
 
 SCHEMA = "voice-m4-probe-v1"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_BASELINE = "a31af80f6bf8d59d481fd456efeb35ed1f413aba"
+EXPECTED_BASELINE = "e401c3c3ce0b15d4552e8a10d2eb8e5887c107a6"
 _MODES = {"preflight", "protocol", "devices", "calibration"}
 _SELECTED_REALTIME_CONFIG = Path(
     "/Users/itboybob/.cache/hexis/batch3-serial-voice-2026-10-05/config-real-2.json"
@@ -280,9 +280,8 @@ class ProtocolProbe:
             raise ProbeStageError("cloud_response", "云输入阶段未完成")
         response_id = f"m4-probe-{uuid.uuid4()}"
         started = time.monotonic_ns() // 1_000_000
-        await self.client.create_first_response(
-            response_id, self.per_response_instructions
-        )
+        await self.client.update_session_instructions(self.per_response_instructions)
+        await self.client.create_first_response(response_id)
         result = await self._consume_response(response_id, started)
         self.first_response_transcript = self.last_response_transcript
         result["protocol_events"] = self.protocol_events
@@ -298,7 +297,8 @@ class ProtocolProbe:
             "Capability probe: count slowly from one to twenty."
         )
         started = time.monotonic_ns() // 1_000_000
-        await self.client.create_first_response(response_id, instructions)
+        await self.client.update_session_instructions(instructions)
+        await self.client.create_first_response(response_id)
         created = await self._wait_for_response_created(response_id)
         if created is None:
             raise ProbeStageError("cancel", "云端未确认待取消 response")
@@ -334,9 +334,8 @@ class ProtocolProbe:
         final = await self.client.wait_for_final(committed.item_id)
         if not isinstance(final.transcript, str) or not final.transcript.strip():
             raise ProbeStageError("continuation", "续问未返回可用 final 转录")
-        await self.client.create_first_response(
-            response_id, self.per_response_instructions
-        )
+        await self.client.update_session_instructions(self.per_response_instructions)
+        await self.client.create_first_response(response_id)
         result = await self._consume_response(response_id, started)
         result["final_transcript"] = _text_summary(final.transcript)
         result["protocol_events"] = self.protocol_events
@@ -400,9 +399,8 @@ class ProtocolProbe:
             "The prior conversation above is confirmed text history. Do not "
             "replay its audio or recall it as a new user request."
         )
-        await self.client.create_first_response(
-            response_id, reconstructed_instructions
-        )
+        await self.client.update_session_instructions(reconstructed_instructions)
+        await self.client.create_first_response(response_id)
         result = await self._consume_response(response_id, started)
         result.update(
             {
@@ -858,13 +856,19 @@ async def run_probe(
             failed = True
             break
         except Exception as exc:
-            evidence["stages"].append(
-                {
-                    "stage": stage,
-                    "status": "failed",
-                    "reason": f"{type(exc).__name__}: {exc}",
+            failed_stage = {
+                "stage": stage,
+                "status": "failed",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+            protocol_events = getattr(stage_runner, "protocol_events", None)
+            unknown_events = getattr(stage_runner, "unknown_events", None)
+            if protocol_events or unknown_events:
+                failed_stage["details"] = {
+                    "protocol_events": protocol_events or [],
+                    "unknown_events": unknown_events or [],
                 }
-            )
+            evidence["stages"].append(failed_stage)
             failed = True
             break
 

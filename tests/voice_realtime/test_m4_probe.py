@@ -63,6 +63,29 @@ async def test_probe_records_stage_failure_without_retrying_input(tmp_path):
     assert "cloud rejected" in evidence["stages"][-1]["reason"]
 
 
+async def test_unexpected_stage_failure_preserves_sanitized_protocol_events(tmp_path):
+    class Runner:
+        protocol_events = [{"type": "session.update", "payload": {"event_id": "evt-1"}}]
+        unknown_events = []
+
+        async def __call__(self, stage, _probe_request):
+            if stage == "cloud_input":
+                raise RuntimeError("probe failed after transport activity")
+            return {"status": "passed"}
+
+    result = await run_probe(
+        request(tmp_path),
+        stage_runner=Runner(),
+        head_provider=lambda: {"head": EXPECTED_BASELINE, "dirty": False},
+    )
+    evidence = json.loads((tmp_path / "evidence.json").read_text(encoding="utf-8"))
+
+    assert result.ok is False
+    failed = evidence["stages"][-1]
+    assert failed["stage"] == "cloud_input"
+    assert failed["details"]["protocol_events"] == Runner.protocol_events
+
+
 def test_probe_redacts_secrets_recursively():
     value = {
         "api_key": "secret-key",

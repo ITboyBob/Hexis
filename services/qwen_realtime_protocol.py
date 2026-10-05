@@ -17,6 +17,7 @@ _FINAL_TRANSCRIPT_EVENTS = {
 _PARTIAL_TRANSCRIPT_EVENTS = {
     "input_audio_transcription.partial",
     "conversation.item.input_audio_transcription.partial",
+    "conversation.item.input_audio_transcription.delta",
 }
 _FAILED_TRANSCRIPT_EVENTS = {
     "input_audio_transcription.failed",
@@ -28,7 +29,9 @@ _FAILED_TRANSCRIPT_EVENTS = {
 class ProtocolEvent:
     type: str
     raw: dict[str, Any] | None = None
+    event_id: str | None = None
     session_id: str | None = None
+    instructions: str | None = None
     item_id: str | None = None
     transcript: str | None = None
     is_final: bool | None = None
@@ -39,6 +42,9 @@ class ProtocolEvent:
     output_index: int | None = None
     error_code: str | None = None
     error_message: str | None = None
+    call_id: str | None = None
+    tool_name: str | None = None
+    tool_arguments: str | None = None
 
 
 def _error_fields(value: dict[str, Any]) -> dict[str, str | None]:
@@ -58,18 +64,37 @@ def parse_event(value: dict[str, Any]) -> ProtocolEvent:
         raise ValueError("Qwen Realtime 事件必须是带 type 的 JSON 对象")
 
     event_type = value["type"]
+    if event_type == "session.created":
+        session = value.get("session") or {}
+        return ProtocolEvent(
+            type="session.created",
+            raw=value,
+            session_id=session.get("id"),
+        )
     if event_type == "session.updated":
         session = value.get("session") or {}
         return ProtocolEvent(
             type="session.updated",
             raw=value,
+            event_id=value.get("event_id"),
             session_id=session.get("id"),
+            instructions=session.get("instructions"),
         )
     if event_type == "input_audio_buffer.committed":
         return ProtocolEvent(
             type="input_audio_buffer_committed",
             raw=value,
             item_id=value.get("item_id"),
+        )
+    if event_type == "conversation.item.created":
+        item = value.get("item") or {}
+        return ProtocolEvent(
+            type="conversation.item.created",
+            raw=value,
+            item_id=item.get("id"),
+            call_id=item.get("call_id"),
+            tool_name=item.get("name"),
+            tool_arguments=item.get("arguments"),
         )
     if event_type in _FINAL_TRANSCRIPT_EVENTS:
         return ProtocolEvent(
@@ -84,7 +109,8 @@ def parse_event(value: dict[str, Any]) -> ProtocolEvent:
             type="input_transcript_partial",
             raw=value,
             item_id=value.get("item_id"),
-            transcript=value.get("transcript"),
+            transcript=value.get("transcript") or value.get("delta"),
+            text=value.get("delta"),
             is_final=False,
         )
     if event_type in _FAILED_TRANSCRIPT_EVENTS:
@@ -100,6 +126,51 @@ def parse_event(value: dict[str, Any]) -> ProtocolEvent:
             type="response.created",
             raw=value,
             response_id=response.get("id"),
+        )
+    if event_type in {
+        "response.output_item.added",
+        "response.output_item.done",
+    }:
+        item = value.get("item") or {}
+        return ProtocolEvent(
+            type=event_type,
+            raw=value,
+            response_id=value.get("response_id"),
+            item_id=item.get("id"),
+            call_id=item.get("call_id"),
+            tool_name=item.get("name"),
+            tool_arguments=item.get("arguments"),
+        )
+    if event_type in {
+        "response.content_part.added",
+        "response.content_part.done",
+        "response.audio.done",
+    }:
+        return ProtocolEvent(
+            type=event_type,
+            raw=value,
+            response_id=value.get("response_id"),
+            item_id=value.get("item_id"),
+            output_index=value.get("output_index"),
+        )
+    if event_type == "response.function_call_arguments.done":
+        return ProtocolEvent(
+            type=event_type,
+            raw=value,
+            response_id=value.get("response_id"),
+            item_id=value.get("item_id"),
+            call_id=value.get("call_id"),
+            tool_name=value.get("name"),
+            tool_arguments=value.get("arguments"),
+        )
+    if event_type == "response.function_call_arguments.delta":
+        return ProtocolEvent(
+            type=event_type,
+            raw=value,
+            response_id=value.get("response_id"),
+            item_id=value.get("item_id"),
+            call_id=value.get("call_id"),
+            text=value.get("delta"),
         )
     if event_type == "response.done":
         response = value.get("response") or {}
@@ -160,13 +231,22 @@ def parse_event(value: dict[str, Any]) -> ProtocolEvent:
     raise UnknownProtocolEvent(event_type)
 
 
-def build_update_session(instructions: str, *, voice: str) -> dict[str, Any]:
-    return {
+def build_update_session(
+    instructions: str,
+    *,
+    voice: str,
+    tools: list[dict[str, Any]] | None = None,
+    event_id: str | None = None,
+) -> dict[str, Any]:
+    session: dict[str, Any] = {
         "type": "session.update",
         "session": {
             "modalities": ["text", "audio"],
             "instructions": instructions,
             "turn_detection": None,
+            "input_audio_transcription": {
+                "model": "qwen3-asr-flash-realtime"
+            },
             "audio": {
                 "input": {
                     "format": {
@@ -185,14 +265,38 @@ def build_update_session(instructions: str, *, voice: str) -> dict[str, Any]:
             },
         },
     }
+    if tools:
+        session["session"]["tools"] = tools
+        session["session"]["tool_choice"] = "auto"
+    if event_id is not None:
+        session["event_id"] = event_id
+    return session
 
 
 def build_first_response(
-    response_id: str, per_response_instructions: str
+    response_id: str,
+    *,
+    event_id: str,
 ) -> dict[str, Any]:
     return {
         "type": "response.create",
-        "response": {"id": response_id, "instructions": per_response_instructions},
+        "event_id": event_id,
+        "response": {"id": response_id},
+    }
+
+
+def build_function_call_output(call_id: str, output: str) -> dict[str, Any]:
+    if not isinstance(call_id, str) or not call_id.strip():
+        raise ValueError("call_id must be a non-empty string")
+    if not isinstance(output, str):
+        raise ValueError("function call output must be a string")
+    return {
+        "type": "conversation.item.create",
+        "item": {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output,
+        },
     }
 
 

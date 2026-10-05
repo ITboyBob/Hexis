@@ -7,6 +7,7 @@ export type NativePlaybackIdentity = {
   output_epoch: number;
   response_id: string;
   media_session_id: string;
+  turn_id?: string;
 };
 
 type NativePlaybackAction =
@@ -24,6 +25,7 @@ export type NativePlaybackEventRequest = {
   producer_seq: number;
   output_epoch: number;
   media_session_id: string;
+  turn_id?: string;
   start_ms?: number;
   audible_ms?: number;
   played_ms?: number;
@@ -50,8 +52,11 @@ class NativePcmPlayer {
   private audibleTimer?: ReturnType<typeof setTimeout>;
   private dead = false;
   private started = false;
+  private opened = false;
   private closed = true;
   private playing = false;
+  private sourceComplete = false;
+  private scheduledUntil = 0;
   private current?: { id: string; epoch: number; response_id: string; media_session_id: string };
   private lastFeedbackAt = 0;
   private startAt = 0;
@@ -59,6 +64,7 @@ class NativePcmPlayer {
   constructor(
     private readonly emit: (value: Playback) => void,
     private readonly createContext: () => AudioContext,
+    private readonly onStarted: () => void,
   ) {}
 
   async start(
@@ -84,6 +90,8 @@ class NativePcmPlayer {
       let lastSource: AudioBufferSourceNode | undefined;
       for await (const chunk of source.chunks) {
         if (this.dead || this.closed || this.current !== identity) return;
+        await this.waitForScheduleWindow(nextTime);
+        if (this.dead || this.closed || this.current !== identity) return;
         if (source.channels !== 1) throw new Error("PCM播放仅支持mono");
         const bytes = new Uint8Array(chunk.data);
         if (bytes.byteLength === 0 || bytes.byteLength % 2 !== 0) {
@@ -100,9 +108,16 @@ class NativePcmPlayer {
         node.buffer = buffer;
         node.connect(this.analyser);
         node.start(nextTime);
+        const chunkStart = nextTime;
         nextTime += frames / source.sample_rate;
+        this.scheduledUntil = nextTime;
+        node.onended = () => {
+          if (this.sourceComplete && lastSource === node) this.feedback("drained");
+        };
         if (first) {
-          this.startAt = nextTime - frames / source.sample_rate;
+          this.startAt = chunkStart;
+          this.opened = true;
+          this.onStarted();
           this.audibleTimer = setTimeout(() => {
             this.audibleTimer = undefined;
             this.feedback("playing");
@@ -113,25 +128,37 @@ class NativePcmPlayer {
         this.sources.push(node);
       }
       if (!lastSource) throw new Error("PCM source不包含音频帧");
-      lastSource.onended = () => this.feedback("drained");
+      this.sourceComplete = true;
+      if (this.context.currentTime >= this.scheduledUntil) this.feedback("drained");
     } catch {
-      if (!this.dead && !this.closed && this.current === identity) {
+      if (this.opened && !this.dead && !this.closed && this.current === identity) {
         this.feedback("error");
       }
       throw new Error("PCM流未能播放；请检查音频格式后重试");
     }
   }
 
-  stop(): void {
+  stop(reason = "player-stop"): void {
     if (this.dead) return;
     const previous = this.current;
+    const playedMs = this.context
+      ? Math.round(
+          Math.max(
+            0,
+            Math.min(
+              this.context.currentTime - this.startAt,
+              this.scheduledUntil - this.startAt,
+            ),
+          ) * 1000,
+        )
+      : 0;
     this.current = undefined;
     this.closed = true;
     this.playing = false;
     if (this.audibleTimer !== undefined) clearTimeout(this.audibleTimer);
     cancelAnimationFrame(this.raf);
     for (const source of this.sources) source.stop();
-    if (previous) this.emitFeedback(previous, "cancel", 0);
+    if (previous) this.emitFeedback(previous, "cancel", 0, reason, playedMs);
   }
 
   async destroy(): Promise<void> {
@@ -159,11 +186,18 @@ class NativePcmPlayer {
     identity: { id: string; epoch: number; response_id: string; media_session_id: string },
     phase: Playback["phase"],
     amplitude: number,
+    reason = "player-stop",
+    playedMs = 0,
   ): void {
     const now = performance.now();
     const interval_ms = this.lastFeedbackAt ? Math.max(0, now - this.lastFeedbackAt) : 0;
     this.lastFeedbackAt = now;
-    const elapsedSeconds = this.context ? Math.max(0, this.context.currentTime - this.startAt) : 0;
+    const elapsedSeconds = this.context
+      ? Math.min(
+          Math.max(0, this.context.currentTime - this.startAt),
+          Math.max(0, this.scheduledUntil - this.startAt),
+        )
+      : 0;
     this.emit({
       playback_id: identity.id,
       output_epoch: identity.epoch,
@@ -171,10 +205,11 @@ class NativePcmPlayer {
       media_session_id: identity.media_session_id,
       phase,
       progress: elapsedSeconds,
-      played_ms: Math.round(elapsedSeconds * 1000),
+      played_ms: phase === "cancel" ? playedMs : Math.round(elapsedSeconds * 1000),
       interval_ms,
       amplitude,
       source: "real",
+      ...(phase === "cancel" ? { reason } : {}),
     });
   }
 
@@ -186,6 +221,17 @@ class NativePcmPlayer {
     this.emitFeedback(this.current, "playing", Math.max(0, Math.min(1, amplitude)));
     this.raf = requestAnimationFrame(this.frame);
   };
+
+  private async waitForScheduleWindow(nextTime: number): Promise<void> {
+    while (
+      !this.dead &&
+      !this.closed &&
+      this.context &&
+      nextTime - this.context.currentTime > 1
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
 }
 
 export class NativeOutputPlayer {
@@ -198,6 +244,7 @@ export class NativeOutputPlayer {
   private suppressingProgressEcho = false;
   private producerSeq = 0;
   private audibleEmitted = false;
+  private lastProgressReceiptAtMs = Number.NEGATIVE_INFINITY;
 
   constructor(private readonly options: NativeOutputPlayerOptions) {}
 
@@ -233,6 +280,12 @@ export class NativeOutputPlayer {
         const pcmPlayer = new NativePcmPlayer(
           (feedback) => this.handleFeedback(feedback),
           this.options.createContext ?? (() => new AudioContext()),
+          () => {
+            if (this.started || this.closed) return;
+            this.started = true;
+            this.emit({ action: "open", start_ms });
+            this.flushPendingFeedback();
+          },
         );
         this.player = pcmPlayer;
         await pcmPlayer.start(input, identity);
@@ -244,12 +297,11 @@ export class NativeOutputPlayer {
         this.player = localPlayer;
         await localPlayer.start(input, identity);
       }
-      this.started = true;
-      this.emit({
-        action: "open",
-        start_ms,
-      });
-      this.flushPendingFeedback();
+      if (!isNativePcmSource(input)) {
+        this.started = true;
+        this.emit({ action: "open", start_ms });
+        this.flushPendingFeedback();
+      }
     } catch (error) {
       this.flushPendingFeedback();
       this.close();
@@ -257,8 +309,9 @@ export class NativeOutputPlayer {
     }
   }
 
-  stop(): void {
-    this.player?.stop();
+  stop(reason = "player-stop"): void {
+    if (this.player instanceof NativePcmPlayer) this.player.stop(reason);
+    else this.player?.stop();
   }
 
   async destroy(): Promise<void> {
@@ -317,7 +370,7 @@ export class NativeOutputPlayer {
     if (feedback.phase === "cancel") {
       this.emit({
         action: "interrupt",
-        reason: "player-stop",
+        reason: feedback.reason ?? "player-stop",
         played_ms: feedback.played_ms,
       });
       this.close();
@@ -332,6 +385,9 @@ export class NativeOutputPlayer {
       this.close();
       return;
     }
+    const now = performance.now();
+    if (now - this.lastProgressReceiptAtMs < 250) return;
+    this.lastProgressReceiptAtMs = now;
     this.emit({
       action: "progress",
       played_ms: feedback.played_ms,
@@ -354,6 +410,7 @@ export class NativeOutputPlayer {
       | "producer_seq"
       | "output_epoch"
       | "media_session_id"
+      | "turn_id"
     >,
   ): void {
     const producer_seq = ++this.producerSeq;
@@ -364,6 +421,7 @@ export class NativeOutputPlayer {
       producer_seq,
       output_epoch: this.options.identity.output_epoch,
       media_session_id: this.options.identity.media_session_id,
+      ...(this.options.identity.turn_id ? { turn_id: this.options.identity.turn_id } : {}),
       ...event,
     };
     this.options.emit(request);

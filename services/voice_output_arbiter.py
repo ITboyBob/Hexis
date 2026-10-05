@@ -25,7 +25,12 @@ class VoiceOutputArbiter:
         self.session_id = session_id
         self._lock = asyncio.Lock()
         self._claims: dict[str, OutputClaim] = {}
+        self._active_response_id: str | None = None
         self._next_epoch = 1
+
+    @property
+    def active_response_id(self) -> str | None:
+        return self._active_response_id
 
     async def claim(
         self, response_id: str, media_session_id: str
@@ -36,6 +41,21 @@ class VoiceOutputArbiter:
             raise ValueError("media_session_id must be a non-empty string")
 
         async with self._lock:
+            if self._active_response_id is not None:
+                active = self._claims[self._active_response_id]
+                if active.response_id == response_id:
+                    if active.media_session_id != media_session_id:
+                        raise OutputClaimConflict(
+                            "output media session mismatch: "
+                            f"expected={active.media_session_id} actual={media_session_id}"
+                        )
+                    raise OutputClaimConflict(
+                        f"response {response_id} already owns the foreground output"
+                    )
+                raise OutputClaimConflict(
+                    "another response already owns the foreground output: "
+                    f"{active.response_id}"
+                )
             existing = self._claims.get(response_id)
             if existing is not None:
                 if existing.media_session_id != media_session_id:
@@ -52,6 +72,7 @@ class VoiceOutputArbiter:
                 output_epoch=self._next_epoch,
             )
             self._claims[response_id] = claim
+            self._active_response_id = response_id
             self._next_epoch += 1
             return claim
 
@@ -63,3 +84,5 @@ class VoiceOutputArbiter:
                     f"cannot release unowned output {response_id} for {media_session_id}"
                 )
             del self._claims[response_id]
+            if self._active_response_id == response_id:
+                self._active_response_id = None

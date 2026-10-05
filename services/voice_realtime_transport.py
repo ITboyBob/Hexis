@@ -202,12 +202,6 @@ class VoiceClientTransport:
 
     def _accept_audio_chunk(self, message: ClientAudioChunk) -> dict[str, Any]:
         capture = self._require_capture(message.capture_instance_id)
-        expected_start = capture["next_frame"]
-        if message.start_frame != expected_start:
-            raise ClientTransportError(
-                f"audio range conflict: expected_start={expected_start} "
-                f"actual_start={message.start_frame}"
-            )
         if message.end_frame < message.start_frame:
             raise ClientTransportError("audio range end precedes start")
         if message.end_monotonic_ms < message.start_monotonic_ms:
@@ -225,14 +219,35 @@ class VoiceClientTransport:
             raise ClientTransportError(
                 f"PCM chunk exceeds limit: limit={self.max_audio_bytes} actual={len(pcm)}"
             )
+        current = capture["range"]
+        if current is None:
+            expected_start = capture["next_frame"]
+            if message.start_frame < expected_start:
+                raise ClientTransportError(
+                    f"audio range overlaps an earlier utterance: "
+                    f"minimum_start={expected_start} actual_start={message.start_frame}"
+                )
+            capture["range"] = {
+                "start_frame": message.start_frame,
+                "end_frame": message.end_frame,
+                "start_monotonic_ms": message.start_monotonic_ms,
+                "end_monotonic_ms": message.end_monotonic_ms,
+            }
+            capture["sha256"] = hashlib.sha256()
+        else:
+            if message.start_frame != current["end_frame"]:
+                raise ClientTransportError(
+                    f"audio range conflict: expected_start={current['end_frame']} "
+                    f"actual_start={message.start_frame}"
+                )
+            if message.start_monotonic_ms < current["end_monotonic_ms"]:
+                raise ClientTransportError(
+                    "audio monotonic range overlaps the earlier chunk"
+                )
+            current["end_frame"] = message.end_frame
+            current["end_monotonic_ms"] = message.end_monotonic_ms
         capture["sha256"].update(pcm)
         capture["next_frame"] = message.end_frame
-        capture["range"] = {
-            "start_frame": message.start_frame,
-            "end_frame": message.end_frame,
-            "start_monotonic_ms": message.start_monotonic_ms,
-            "end_monotonic_ms": message.end_monotonic_ms,
-        }
         return {
             "accepted": True,
             "start_frame": message.start_frame,
@@ -255,6 +270,8 @@ class VoiceClientTransport:
         digest = capture["sha256"].hexdigest()
         if message.audio_sha256 != digest:
             raise ClientTransportError("utterance_end audio hash does not match received PCM")
+        capture["range"] = None
+        capture["sha256"] = hashlib.sha256()
         return {
             "accepted": True,
             "start_frame": message.start_frame,

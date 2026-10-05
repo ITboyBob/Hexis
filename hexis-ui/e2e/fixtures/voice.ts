@@ -9,8 +9,21 @@ const uiHealthUrl = "http://127.0.0.1:3477/";
 export type VoiceServiceHandle = {
   apiProcess: ChildProcess | null;
   uiProcess: ChildProcess | null;
+  apiLogs: string[];
+  uiLogs: string[];
   close: () => Promise<void>;
 };
+
+function collectLogs(process: ChildProcess | null, target: string[]): void {
+  const append = (chunk: Buffer) => {
+    target.push(chunk.toString("utf8"));
+    while (target.reduce((size, value) => size + value.length, 0) > 2_000_000) {
+      target.shift();
+    }
+  };
+  process?.stdout?.on("data", append);
+  process?.stderr?.on("data", append);
+}
 
 function waitForHttp(url: string, timeoutMs = 60_000): Promise<void> {
   const startedAt = Date.now();
@@ -79,6 +92,8 @@ export async function startVoiceServices(): Promise<VoiceServiceHandle> {
   const uiAlreadyRunning = await isReachable(uiHealthUrl);
   let apiProcess: ChildProcess | null = null;
   let uiProcess: ChildProcess | null = null;
+  const apiLogs: string[] = [];
+  const uiLogs: string[] = [];
 
   if (!apiAlreadyRunning) {
     apiProcess = spawn(".venv/bin/python", ["-m", "apps.hexis_api"], {
@@ -87,6 +102,8 @@ export async function startVoiceServices(): Promise<VoiceServiceHandle> {
         ...process.env,
         HEXIS_BROWSER_API_URL: "http://127.0.0.1:43817",
         HEXIS_UI_ORIGIN: "http://127.0.0.1:3477",
+        HEXIS_M4_VOICE_CONFIG:
+          "/Users/itboybob/.cache/hexis/bob101-controlled-evidence/config.template.json",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -101,6 +118,8 @@ export async function startVoiceServices(): Promise<VoiceServiceHandle> {
       stdio: ["ignore", "pipe", "pipe"],
     });
   }
+  collectLogs(apiProcess, apiLogs);
+  collectLogs(uiProcess, uiLogs);
 
   try {
     await waitForHttp(apiHealthUrl);
@@ -114,6 +133,8 @@ export async function startVoiceServices(): Promise<VoiceServiceHandle> {
   return {
     apiProcess,
     uiProcess,
+    apiLogs,
+    uiLogs,
     close: async () => {
       await stopProcess(apiProcess);
       await stopProcess(uiProcess);

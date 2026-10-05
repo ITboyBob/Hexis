@@ -5,6 +5,7 @@ import {
   type NativePlaybackIdentity,
 } from "./native-player";
 import type { NativePcmSource } from "./native-output-source";
+import { NativeOutputQueue } from "../voice-realtime/output-queue";
 
 class FakeAudio extends EventTarget {
   currentTime = 3;
@@ -250,6 +251,94 @@ describe("NativeOutputPlayer", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("在流结束前起播，且仅在实际最后帧结束后报告drained", async () => {
+    const context = fakePcmContext();
+    const events: NativePlaybackEventRequest[] = [];
+    const queue = new NativeOutputQueue(2);
+    const player = new NativeOutputPlayer({
+      identity,
+      session_id: "11111111-1111-1111-1111-111111111111",
+      emit: (event) => events.push(event),
+      createContext: () => context as unknown as AudioContext,
+    });
+    queue.push({
+      data: new Uint8Array([1, 0, 2, 0]).buffer,
+      segment_id: "segment-1",
+      chunk_seq: 1,
+    });
+    player.attach({ epoch: 2, source: "real" });
+    const starting = player.start(
+      { sample_rate: 24_000, channels: 1, chunks: queue },
+      100,
+    );
+    await vi.waitFor(() => expect(events[0]?.action).toBe("open"));
+    expect(events.some((event) => event.action === "end")).toBe(false);
+
+    queue.push({
+      data: new Uint8Array([3, 0, 4, 0]).buffer,
+      segment_id: "segment-1",
+      chunk_seq: 2,
+    });
+    queue.close();
+    await starting;
+    expect(events.some((event) => event.action === "end")).toBe(false);
+    context.sources.at(-1)?.onended?.();
+    expect(events.at(-1)).toMatchObject({ action: "end", scope: "complete" });
+    await player.destroy();
+  });
+
+  it("barge-in终止本地PCM并回报有界已播时长", async () => {
+    const context = fakePcmContext();
+    const events: NativePlaybackEventRequest[] = [];
+    const player = new NativeOutputPlayer({
+      identity,
+      session_id: "11111111-1111-1111-1111-111111111111",
+      emit: (event) => events.push(event),
+      createContext: () => context as unknown as AudioContext,
+    });
+    const source: NativePcmSource = {
+      sample_rate: 24_000,
+      channels: 1,
+      chunks: (async function* () {
+        yield {
+          data: new Uint8Array(48_000).buffer,
+          segment_id: "segment-1",
+          chunk_seq: 1,
+        };
+      })(),
+    };
+    player.attach({ epoch: 2, source: "real" });
+    await player.start(source, 0);
+    context.currentTime = 0.42;
+    player.stop("barge_in");
+
+    expect(events.at(-1)).toMatchObject({
+      action: "interrupt",
+      reason: "barge_in",
+      played_ms: 400,
+    });
+    await player.destroy();
+  });
+
+  it("空PCM流报告错误且不伪造播放open", async () => {
+    const events: NativePlaybackEventRequest[] = [];
+    const player = new NativeOutputPlayer({
+      identity,
+      session_id: "11111111-1111-1111-1111-111111111111",
+      emit: (event) => events.push(event),
+      createContext: () => fakePcmContext() as unknown as AudioContext,
+    });
+    player.attach({ epoch: 2, source: "real" });
+    await expect(
+      player.start(
+        { sample_rate: 24_000, channels: 1, chunks: (async function* () {})() },
+        0,
+      ),
+    ).rejects.toThrow(/PCM流未能播放/);
+    expect(events.map((event) => event.action)).toEqual([]);
+    await player.destroy();
   });
 });
 

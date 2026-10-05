@@ -63,6 +63,8 @@ export type RealtimeServerMessage =
       media_session_id: string;
       producer_seq: number;
       response_id: string;
+      playback_id: string;
+      turn_id?: string;
       output_epoch: number;
       segment_id: string;
       segment_index: number;
@@ -76,6 +78,8 @@ export type RealtimeServerMessage =
       media_session_id: string;
       producer_seq: number;
       response_id: string;
+      playback_id: string;
+      turn_id?: string;
       output_epoch: number;
       kind: "text_delta" | "audio_transcript_delta" | "done" | "failed";
       text?: string;

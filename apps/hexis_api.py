@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import hmac
 import html
@@ -65,6 +66,7 @@ logger = logging.getLogger(__name__)
 
 _pool: asyncpg.Pool | None = None
 _voice_realtime_registry: Any | None = None
+_voice_playback_watchdog: Any | None = None
 
 
 def _dsn() -> str:
@@ -2562,6 +2564,15 @@ def _voice_realtime_session_registry():
     return _voice_realtime_registry
 
 
+def _voice_realtime_playback_watchdog():
+    global _voice_playback_watchdog
+    if _voice_playback_watchdog is None:
+        from services.voice_playback_watchdog import VoicePlaybackWatchdog
+
+        _voice_playback_watchdog = VoicePlaybackWatchdog(timeout_ms=5000)
+    return _voice_playback_watchdog
+
+
 def _browser_realtime_websocket_url(media_session_id: str) -> str:
     base = (os.getenv("HEXIS_BROWSER_API_URL") or "").strip()
     if not base:
@@ -2635,6 +2646,85 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
         )
 
     instructions = load_m4_stable_instructions()
+    m4_config_path = os.environ.get("HEXIS_M4_VOICE_CONFIG")
+    if not m4_config_path:
+        raise HTTPException(
+            status_code=503,
+            detail="HEXIS_M4_VOICE_CONFIG is not selected for the M4 realtime input gate.",
+        )
+    from pathlib import Path
+
+    from apps.voice_realtime_harness import _build_runtime, _load_config
+
+    try:
+        m4_runtime_config = _load_config(Path(m4_config_path))
+        emotion_coordinator, _runtime_summary = _build_runtime(
+            m4_runtime_config,
+            pool=_pool,
+            session_id=req.session_id,
+            stable_instructions=instructions,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"M4 input gate configuration is not usable: {type(exc).__name__}.",
+        ) from exc
+
+    async def on_input_authorized(receipt: Any) -> None:
+        logger.debug("M4 voice gate started for an authorized input")
+        gate = await emotion_coordinator.run(
+            receipt.identity.model_dump(mode="json"), receipt.transcript
+        )
+        session._input_gate_results[str(receipt.identity.input_turn_id)] = gate
+        logger.debug(
+            "M4 voice input gate completed: released=%s context_ready=%s evaluation=%s",
+            gate.released,
+            gate.context_ready,
+            gate.evaluation.get("status") if isinstance(gate.evaluation, dict) else "invalid",
+        )
+        if not gate.released or not gate.context_ready:
+            logger.warning(
+                "M4 input gate is not ready for input %s: released=%s context_ready=%s",
+                receipt.identity.input_turn_id,
+                gate.released,
+                gate.context_ready,
+            )
+            error_sink = getattr(session, "_input_error_dispatch", None)
+            if error_sink is not None:
+                await error_sink(
+                    "context",
+                    "context_not_ready",
+                    "Voice context is not ready. Stop Talk, resolve the context error, then restart.",
+                )
+            return
+        from services.voice_conversation_history import VoiceConversationHistory
+
+        turn_id = await VoiceConversationHistory(_pool).start_turn(
+            session_id=session.session_id,
+            input_turn_id=receipt.identity.input_turn_id,
+            input_order=receipt.identity.input_order,
+            user_text=receipt.transcript,
+            context_version=gate.hydration.instructions_hash,
+        )
+        session.bind_voice_turn(
+            input_turn_id=str(receipt.identity.input_turn_id),
+            input_order=receipt.identity.input_order,
+            user_text=receipt.transcript,
+            context_version=gate.hydration.instructions_hash,
+            turn_id=turn_id,
+        )
+        output = await session.start_authorized_response(
+            str(receipt.identity.input_turn_id)
+        )
+        logger.debug(
+            "M4 voice response requested: output_epoch=%s",
+            output["output_epoch"],
+        )
+        if session._response_dispatch is None:
+            await session.release_response(output["response_id"])
+            raise RuntimeError("realtime output websocket is not attached")
+        await session._response_dispatch(output)
+
     media_session_id = new_media_session_id()
     client = QwenRealtimeClient(
         endpoint=config["endpoint"],
@@ -2647,7 +2737,44 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
         session_id=req.session_id,
         media_session_id=media_session_id,
         client=client,
+        on_input_authorized=on_input_authorized,
     )
+    session._response_dispatch = None
+    session._input_error_dispatch = None
+    from services.behavior_events import BehaviorEvent, record_behavior_event
+
+    async def write_voice_event(
+        event_type: str,
+        payload: dict[str, Any],
+        producer_seq: int,
+        input_turn_id: str | None,
+        stimulus_revision: int | None,
+    ) -> None:
+        if _pool is None:
+            raise RuntimeError("database is unavailable for voice behavior events")
+        await record_behavior_event(
+            _pool,
+            BehaviorEvent(
+                event_id=uuid.uuid5(
+                    uuid.UUID(int=0),
+                    f"hexis:voice:{req.session_id}:{media_session_id}:{producer_seq}:{event_type}",
+                ),
+                schema_version=1,
+                event_type=event_type,
+                stream_id="voice-realtime-session",
+                session_id=req.session_id,
+                source="server",
+                producer_id="hexis.voice-realtime",
+                producer_seq=producer_seq,
+                channel="voice",
+                payload=payload,
+                media_session_id=media_session_id,
+                input_turn_id=input_turn_id,
+                stimulus_revision=stimulus_revision,
+            ),
+        )
+
+    session._event_sink = write_voice_event
     registry.register(req.session_id, session)
     try:
         cloud_session_id = await session.start(instructions)
@@ -2667,8 +2794,6 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
                 config["endpoint"],
                 instructions_hash,
             )
-            from services.behavior_events import BehaviorEvent, record_behavior_event
-
             ready_event = BehaviorEvent(
                 event_id=uuid.uuid5(
                     uuid.UUID(int=0),
@@ -2728,6 +2853,7 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
         parse_client_message,
     )
     from apps.voice_m4_probe import load_m4_stable_instructions
+    from services.qwen_realtime_output import OutputMappingError, QwenRealtimeOutputAdapter
 
     transport = VoiceClientTransport(
         session_id=session.session_id,
@@ -2749,6 +2875,268 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
     )
 
     close_reason = "manual"
+    speech_open = False
+    input_tasks: set[asyncio.Task[Any]] = set()
+    websocket_send_lock = asyncio.Lock()
+    websocket_producer_seq = 1
+
+    async def send_server_message(value: dict[str, Any]) -> None:
+        nonlocal websocket_producer_seq
+        async with websocket_send_lock:
+            value["producer_seq"] = websocket_producer_seq
+            websocket_producer_seq += 1
+            await websocket.send_json(value)
+
+    async def send_input_error(stage: str, code: str, message: str) -> None:
+        await send_server_message(
+            {
+                "schema_version": 1,
+                "type": "error",
+                "session_id": str(session.session_id),
+                "media_session_id": session.media_session_id,
+                "producer_seq": 0,
+                "stage": stage,
+                "code": code,
+                "message": message,
+                "recoverable": True,
+            }
+        )
+
+    session._input_error_dispatch = send_input_error
+
+    async def stream_response(output: dict[str, Any]) -> None:
+        response_id = output["response_id"]
+        pending_voice_call: dict[str, str] | None = None
+        adapter = QwenRealtimeOutputAdapter(
+            response_id=response_id,
+            output_epoch=output["output_epoch"],
+            media_session_id=session.media_session_id,
+        )
+        try:
+            while True:
+                event = await output["events"].get()
+                if session.response_is_invalidated(response_id) and event.type in {
+                    "response.audio.delta",
+                    "response.text.delta",
+                    "response_audio_transcript_delta",
+                    "response_audio_transcript_done",
+                }:
+                    continue
+                if event.type == "response.created":
+                    adapter.bind(event)
+                    continue
+                if event.type == "response.function_call_arguments.done":
+                    input_turn_id = session.authorize_voice_recall_call(
+                        response_id=response_id,
+                        call_id=event.call_id or "",
+                        name=event.tool_name or "",
+                        arguments=event.tool_arguments or "",
+                    )
+                    pending_voice_call = {
+                        "input_turn_id": input_turn_id,
+                        "call_id": event.call_id or "",
+                        "name": event.tool_name or "",
+                        "arguments": event.tool_arguments or "",
+                    }
+                    continue
+                if event.type == "response.audio.delta":
+                    chunk = adapter.accept(event)
+                    if chunk is None:
+                        continue
+                    session.record_output_chunk(response_id, chunk.pcm_bytes)
+                    await send_server_message(
+                        {
+                            "schema_version": 1,
+                            "type": "audio_chunk",
+                            "session_id": str(session.session_id),
+                            "media_session_id": session.media_session_id,
+                            "producer_seq": session._event_seq,
+                            "response_id": response_id,
+                            "playback_id": output["playback_id"],
+                            "turn_id": output.get("turn_id"),
+                            "output_epoch": output["output_epoch"],
+                            "segment_id": chunk.segment_id,
+                            "segment_index": chunk.segment_index,
+                            "chunk_seq": chunk.chunk_seq,
+                            "pcm_base64": base64.b64encode(chunk.pcm_bytes).decode("ascii"),
+                        }
+                    )
+                    continue
+                if event.type in {"response.text.delta", "response_audio_transcript_delta"}:
+                    raw = event.raw or {}
+                    kind = "text_delta" if event.type == "response.text.delta" else "audio_transcript_delta"
+                    if kind == "audio_transcript_delta":
+                        session.record_generation_text(
+                            output.get("input_turn_id", ""),
+                            response_id,
+                            event.text or raw.get("delta", ""),
+                        )
+                    await send_server_message(
+                        {
+                            "schema_version": 1,
+                            "type": "generation",
+                            "session_id": str(session.session_id),
+                            "media_session_id": session.media_session_id,
+                            "producer_seq": session._event_seq,
+                            "response_id": response_id,
+                            "playback_id": output["playback_id"],
+                            "turn_id": output.get("turn_id"),
+                            "output_epoch": output["output_epoch"],
+                            "kind": kind,
+                            "text": event.text or raw.get("delta"),
+                        }
+                    )
+                    continue
+                if event.type == "response_audio_transcript_done":
+                    session.record_generation_text(
+                        output.get("input_turn_id", ""),
+                        response_id,
+                        event.text or "",
+                        final=True,
+                    )
+                    continue
+                if event.type in {"response.done", "response.failed", "response_failed"}:
+                    adapter.finish(event)
+                    failed = event.type != "response.done" or event.status not in {None, "completed"}
+                    if session.response_is_invalidated(response_id):
+                        input_turn_id = output.get("input_turn_id", "")
+                        await session.mark_generation_done(input_turn_id, response_id)
+                        playback = session.playback_snapshot(response_id)
+                        terminal_recorded = bool(
+                            session._voice_turns.get(input_turn_id, {})
+                            .get("terminal_receipts", {})
+                            .get(response_id)
+                        )
+                        if playback is not None and not session._playback_state[response_id]["opened"]:
+                            session.record_playback_terminal(
+                                input_turn_id,
+                                response_id,
+                                output["playback_id"],
+                                "unplayed",
+                                0,
+                                output["output_epoch"],
+                            )
+                            if _pool is not None:
+                                from services.playback_history import PlaybackHistory, PlaybackIdentity
+
+                                await PlaybackHistory(
+                                    _pool,
+                                    PlaybackIdentity(
+                                        session_id=session.session_id,
+                                        response_id=response_id,
+                                        playback_id=output["playback_id"],
+                                        output_epoch=output["output_epoch"],
+                                        media_session_id=session.media_session_id,
+                                        turn_id=uuid.UUID(output["turn_id"]) if output.get("turn_id") else None,
+                                    ),
+                                ).end(scope="unplayed", played_ms=0, producer_seq=0)
+                            terminal_recorded = True
+                        await _complete_ready_voice_turn(session, input_turn_id)
+                        if terminal_recorded:
+                            await session.release_response(response_id)
+                        return
+                    if pending_voice_call is not None and not failed:
+                        if session.response_has_output(response_id):
+                            raise RuntimeError("voice recall response also contained playable PCM")
+                        await session.release_response(response_id)
+                        from services.voice_recall import VoiceRecallService
+
+                        recall_output = await VoiceRecallService(_pool).execute(
+                            session_id=session.session_id,
+                            input_turn_id=uuid.UUID(pending_voice_call["input_turn_id"]),
+                            name=pending_voice_call["name"],
+                            arguments=pending_voice_call["arguments"],
+                        )
+                        recall_status = json.loads(recall_output).get("status", "unknown")
+                        await session.emit_event(
+                            "voice_recall_executed",
+                            {
+                                "status": recall_status,
+                                "call_id": pending_voice_call["call_id"],
+                                "response_id": response_id,
+                            },
+                            input_turn_id=pending_voice_call["input_turn_id"],
+                        )
+                        followup = await session.start_voice_recall_followup(
+                            input_turn_id=pending_voice_call["input_turn_id"],
+                            call_id=pending_voice_call["call_id"],
+                            tool_output=recall_output,
+                        )
+                        if session._response_dispatch is None:
+                            await session.release_response(followup["response_id"])
+                            raise RuntimeError("realtime output websocket is not attached")
+                        await session._response_dispatch(followup)
+                        return
+                    await send_server_message(
+                        {
+                            "schema_version": 1,
+                            "type": "generation",
+                            "session_id": str(session.session_id),
+                            "media_session_id": session.media_session_id,
+                            "producer_seq": session._event_seq,
+                            "response_id": response_id,
+                            "playback_id": output["playback_id"],
+                            "turn_id": output.get("turn_id"),
+                            "output_epoch": output["output_epoch"],
+                            "kind": "failed" if failed else "done",
+                            "reason": event.error_message if failed else None,
+                        }
+                    )
+                    if not failed:
+                        input_turn_id = output.get("input_turn_id", "")
+                        await session.mark_generation_done(input_turn_id, response_id)
+                        if not session.response_has_output(response_id):
+                            session.record_playback_terminal(
+                                input_turn_id,
+                                response_id,
+                                output["playback_id"],
+                                "unplayed",
+                                0,
+                                output["output_epoch"],
+                            )
+                            if _pool is not None:
+                                from services.playback_history import PlaybackHistory, PlaybackIdentity
+
+                                await PlaybackHistory(
+                                    _pool,
+                                    PlaybackIdentity(
+                                        session_id=session.session_id,
+                                        response_id=response_id,
+                                        playback_id=output["playback_id"],
+                                        output_epoch=output["output_epoch"],
+                                        media_session_id=session.media_session_id,
+                                        turn_id=uuid.UUID(output["turn_id"]) if output.get("turn_id") else None,
+                                    ),
+                                ).end(scope="unplayed", played_ms=0, producer_seq=0)
+                            await _complete_ready_voice_turn(session, input_turn_id)
+                    if not session.response_has_output(response_id):
+                        await session.release_response(response_id)
+                    return
+        except Exception as exc:
+            logger.exception("Realtime output stream failed for response %s", response_id)
+            await session.release_response(response_id)
+            try:
+                await send_server_message(
+                    {
+                        "schema_version": 1,
+                        "type": "error",
+                        "session_id": str(session.session_id),
+                        "media_session_id": session.media_session_id,
+                        "producer_seq": session._event_seq,
+                        "stage": "output",
+                        "code": "output_stream_failed",
+                        "message": f"Voice output failed ({type(exc).__name__}). Stop Talk and retry.",
+                        "recoverable": True,
+                    }
+                )
+            except Exception:
+                logger.debug("Could not send output error to disconnected client", exc_info=True)
+
+    async def dispatch_response(output: dict[str, Any]) -> None:
+        task = asyncio.create_task(stream_response(output))
+        session.register_background_task(task)
+
+    session._response_dispatch = dispatch_response
     try:
         while True:
             raw = await websocket.receive_text()
@@ -2757,13 +3145,13 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                 message = parse_client_message(value)
                 transport.accept(message)
             except (json.JSONDecodeError, ValidationError, ClientTransportError) as exc:
-                await websocket.send_json(
+                await send_server_message(
                     {
                         "schema_version": 1,
                         "type": "error",
                         "session_id": str(session.session_id),
                         "media_session_id": session.media_session_id,
-                        "producer_seq": 1,
+                        "producer_seq": 0,
                         "stage": "transport",
                         "code": "invalid_message",
                         "message": str(exc),
@@ -2774,9 +3162,124 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                 break
 
             if message.type == "audio_chunk":
+                if not speech_open:
+                    speech_open = True
+                    await session.emit_event(
+                        "voice_speech_start",
+                        {
+                            "capture_instance_id": str(message.capture_instance_id),
+                            "start_frame": message.start_frame,
+                            "start_monotonic_ms": message.start_monotonic_ms,
+                        },
+                    )
                 await session.client.append_audio(message.pcm_base64)
             elif message.type == "utterance_end":
-                await session.client.commit_audio()
+                await session.emit_event(
+                    "voice_speech_end",
+                    {
+                        "capture_instance_id": str(message.capture_instance_id),
+                        "end_frame": message.end_frame,
+                        "end_monotonic_ms": message.end_monotonic_ms,
+                    },
+                )
+                speech_open = False
+                if len(input_tasks) >= session.queue_limit:
+                    await send_server_message(
+                        {
+                            "schema_version": 1,
+                            "type": "error",
+                            "session_id": str(session.session_id),
+                            "media_session_id": session.media_session_id,
+                            "producer_seq": 0,
+                            "stage": "input_queue",
+                            "code": "queue_overloaded",
+                            "message": "Voice input queue is full. Stop and retry after pending input completes.",
+                            "recoverable": True,
+                        }
+                    )
+                    close_reason = "error"
+                    break
+                from services.voice_input_authorization import CaptureRange
+
+                capture_range = CaptureRange(
+                    session_id=message.session_id,
+                    media_session_id=message.media_session_id,
+                    capture_instance_id=message.capture_instance_id,
+                    start_frame=message.start_frame,
+                    end_frame=message.end_frame,
+                    start_monotonic_ms=message.start_monotonic_ms,
+                    end_monotonic_ms=message.end_monotonic_ms,
+                    audio_sha256=message.audio_sha256,
+                )
+
+                async def process_input(source: Any) -> None:
+                    try:
+                        await session.process_utterance(source)
+                    except Exception as exc:
+                        from services.voice_realtime_session import VoiceTranscriptUnavailable
+
+                        if isinstance(exc, VoiceTranscriptUnavailable):
+                            stage = "input"
+                            code = "speech_not_recognized"
+                            message = "I couldn't recognize that speech. Please say it again; Talk is still listening."
+                            logger.info(
+                                "Realtime input had no usable transcript for session %s",
+                                session.session_id,
+                            )
+                        else:
+                            stage = "input"
+                            code = "input_or_context_failed"
+                            message = (
+                                "Voice input could not be prepared "
+                                f"({type(exc).__name__}). Stop Talk and retry."
+                            )
+                            logger.exception(
+                                "Realtime input authorization failed for session %s",
+                                session.session_id,
+                            )
+                        try:
+                            await send_input_error(
+                                stage,
+                                code,
+                                message,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Unable to deliver realtime input error for session %s",
+                                session.session_id,
+                                exc_info=True,
+                            )
+
+                task = asyncio.create_task(process_input(capture_range))
+                input_tasks.add(task)
+                task.add_done_callback(input_tasks.discard)
+                session.register_background_task(task)
+            elif message.type == "control" and message.action == "barge_in":
+                try:
+                    invalidated_response_id = await session.invalidate_foreground_output()
+                    if invalidated_response_id is not None:
+                        await session.emit_event(
+                            "voice_output_invalidated",
+                            {
+                                "response_id": invalidated_response_id,
+                                "reason": message.reason,
+                            },
+                        )
+                except Exception as exc:
+                    logger.exception("Could not cancel the invalidated voice response")
+                    await send_server_message(
+                        {
+                            "schema_version": 1,
+                            "type": "error",
+                            "session_id": str(session.session_id),
+                            "media_session_id": session.media_session_id,
+                            "producer_seq": session._event_seq,
+                            "stage": "barge_in",
+                            "code": "cloud_cancel_failed",
+                            "message": f"Local playback stopped, but cloud cancellation failed ({type(exc).__name__}). Keep talking or stop Talk.",
+                            "recoverable": True,
+                        }
+                    )
             elif message.type == "control" and message.action == "close":
                 break
     except WebSocketDisconnect:
@@ -2803,13 +3306,92 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
             logger.debug("realtime websocket already closed", exc_info=True)
 
 
+async def _complete_ready_voice_turn(session: Any, input_turn_id: str) -> dict[str, Any] | None:
+    if _pool is None:
+        return None
+    snapshot = await session.claim_voice_turn_completion(input_turn_id)
+    if snapshot is None:
+        return None
+    from services.voice_conversation_history import VoiceConversationHistory
+
+    terminal = snapshot["terminal"]
+    try:
+        result = await VoiceConversationHistory(_pool).complete_turn(
+            session_id=session.session_id,
+            input_turn_id=uuid.UUID(input_turn_id),
+            input_order=snapshot["input_order"],
+            stimulus_revision=snapshot["stimulus_revision"],
+            turn_id=snapshot["turn_id"],
+            user_text=snapshot["user_text"],
+            assistant_text=snapshot["assistant_text"],
+            context_version=snapshot["context_version"],
+            playback_scope=snapshot["playback_scope"],
+            metadata={
+                "final_response_id": snapshot["final_response_id"],
+                "final_playback_id": terminal["playback_id"],
+                "final_output_epoch": terminal["output_epoch"],
+                "final_played_ms": terminal["played_ms"],
+            },
+            media_session_id=session.media_session_id,
+            response_ids=snapshot["response_ids"],
+            playback_ids=snapshot["playback_ids"],
+        )
+        if result.get("status") == "repair_required":
+            logger.error(
+                "Voice turn completion requires repair for input %s; source message rows already exist",
+                input_turn_id,
+            )
+            await session.finish_voice_turn_completion(input_turn_id, success=False)
+            return result
+        memory_status = (
+            result.get("chat_result", {}).get("memory", {}).get("status")
+            if isinstance(result.get("chat_result"), dict)
+            else None
+        )
+        if memory_status == "failed":
+            logger.error(
+                "Voice turn history was saved but ordinary memory writing failed for input %s",
+                input_turn_id,
+            )
+        await session.finish_voice_turn_completion(input_turn_id, success=True)
+        return result
+    except Exception:
+        await session.finish_voice_turn_completion(input_turn_id, success=False)
+        logger.exception("Voice turn persistence failed for input %s", input_turn_id)
+        return None
+
+
 @app.post("/api/voice/playback")
 async def record_voice_playback(req: PlaybackEventRequest):
     """Record one real native playback event through the shared history service."""
 
     if _pool is None:
         raise HTTPException(status_code=503, detail="database not ready")
+    session = _voice_realtime_session_registry().get_playback_session(
+        req.session_id, req.media_session_id
+    )
+    if session is None:
+        raise HTTPException(status_code=409, detail="The realtime voice response is unknown or its playback receipt window expired.")
+    if req.action == "open" and req.start_ms is None:
+        raise HTTPException(status_code=422, detail="start_ms is required")
+    if req.action == "audible" and req.audible_ms is None:
+        raise HTTPException(status_code=422, detail="audible_ms is required")
+    if req.action == "progress" and (
+        req.played_ms is None or req.interval_ms is None or req.phase is None
+    ):
+        raise HTTPException(status_code=422, detail="played_ms, interval_ms and phase are required")
+    if req.action == "end" and (req.scope is None or req.played_ms is None):
+        raise HTTPException(status_code=422, detail="scope and played_ms are required")
+    if req.action == "interrupt" and (req.played_ms is None or req.reason is None):
+        raise HTTPException(status_code=422, detail="played_ms and reason are required")
+    from services.voice_realtime_session import VoiceRealtimeSessionError
+
+    try:
+        is_new_receipt = session.accept_playback_receipt(req)
+    except VoiceRealtimeSessionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     from services.playback_history import PlaybackHistory, PlaybackIdentity
+    from services.voice_playback_watchdog import PlaybackWatchIdentity
 
     identity = PlaybackIdentity(
         session_id=req.session_id,
@@ -2820,43 +3402,134 @@ async def record_voice_playback(req: PlaybackEventRequest):
         turn_id=req.turn_id,
     )
     history = PlaybackHistory(_pool, identity)
+    watch_identity = PlaybackWatchIdentity(
+        session_id=req.session_id,
+        media_session_id=req.media_session_id,
+        response_id=req.response_id,
+        playback_id=req.playback_id,
+        output_epoch=req.output_epoch,
+    )
+    watchdog = _voice_realtime_playback_watchdog()
     if req.action == "open":
-        if req.start_ms is None:
-            raise HTTPException(status_code=422, detail="start_ms is required")
-        return await history.open(
+        result = await history.open(
             start_ms=req.start_ms, producer_seq=req.producer_seq
         )
+        async def on_timeout(
+            timed_identity: Any, _watch_seq: int
+        ) -> None:
+            snapshot = session.playback_snapshot(timed_identity.response_id)
+            producer_seq = session.next_playback_producer_seq(timed_identity.response_id)
+            if snapshot is None or producer_seq is None or _pool is None:
+                return
+            terminal = PlaybackEventRequest(
+                action="end",
+                session_id=timed_identity.session_id,
+                response_id=timed_identity.response_id,
+                playback_id=timed_identity.playback_id,
+                producer_seq=producer_seq,
+                output_epoch=timed_identity.output_epoch,
+                media_session_id=timed_identity.media_session_id,
+                scope="unknown",
+                played_ms=snapshot["played_ms"],
+            )
+            try:
+                session.accept_playback_receipt(terminal)
+                input_turn_id = session._response_input_ids.get(timed_identity.response_id)
+                timed_history = PlaybackHistory(
+                    _pool,
+                    PlaybackIdentity(
+                        session_id=timed_identity.session_id,
+                        response_id=timed_identity.response_id,
+                        playback_id=timed_identity.playback_id,
+                        output_epoch=timed_identity.output_epoch,
+                        media_session_id=timed_identity.media_session_id,
+                        turn_id=req.turn_id,
+                    ),
+                )
+                await timed_history.end(
+                    scope="unknown",
+                    played_ms=snapshot["played_ms"],
+                    producer_seq=producer_seq,
+                )
+                if input_turn_id is not None:
+                    session.record_playback_terminal(
+                        input_turn_id,
+                        timed_identity.response_id,
+                        timed_identity.playback_id,
+                        "unknown",
+                        snapshot["played_ms"],
+                        timed_identity.output_epoch,
+                    )
+                await session.finish_response_playback(timed_identity.response_id)
+                if input_turn_id is not None:
+                    await _complete_ready_voice_turn(session, input_turn_id)
+            except Exception:
+                logger.exception("Playback watchdog could not close response %s", timed_identity.response_id)
+
+        watchdog.open(
+            watch_identity,
+            producer_seq=req.producer_seq,
+            on_timeout=on_timeout,
+        )
+        return result
     if req.action == "audible":
-        if req.audible_ms is None:
-            raise HTTPException(status_code=422, detail="audible_ms is required")
         return await history.audible(
             audible_ms=req.audible_ms, producer_seq=req.producer_seq
         )
     if req.action == "progress":
-        if req.played_ms is None or req.interval_ms is None or req.phase is None:
-            raise HTTPException(
-                status_code=422,
-                detail="played_ms, interval_ms and phase are required",
-            )
-        return await history.progress(
+        result = await history.progress(
             played_ms=req.played_ms,
             interval_ms=req.interval_ms,
             phase=req.phase,
             producer_seq=req.producer_seq,
         )
+        if is_new_receipt:
+            snapshot = session.playback_snapshot(req.response_id)
+            if snapshot is None or not watchdog.progress(
+                watch_identity,
+                producer_seq=req.producer_seq,
+                played_ms=req.played_ms,
+                scheduled_ms=snapshot["scheduled_ms"],
+            ):
+                raise HTTPException(status_code=409, detail="Playback progress did not renew the trusted watchdog.")
+        return result
     if req.action == "end":
-        if req.scope is None or req.played_ms is None:
-            raise HTTPException(
-                status_code=422, detail="scope and played_ms are required"
-            )
-        return await history.end(
+        result = await history.end(
             scope=req.scope, played_ms=req.played_ms, producer_seq=req.producer_seq
         )
-    if req.played_ms is None or req.reason is None:
-        raise HTTPException(status_code=422, detail="played_ms and reason are required")
-    return await history.interrupt(
+        watchdog.terminal(watch_identity)
+        input_turn_id = session._response_input_ids.get(req.response_id)
+        if input_turn_id is not None:
+            session.record_playback_terminal(
+                input_turn_id,
+                req.response_id,
+                req.playback_id,
+                req.scope or "unknown",
+                req.played_ms or 0,
+                req.output_epoch,
+            )
+        await session.finish_response_playback(req.response_id)
+        if input_turn_id is not None:
+            await _complete_ready_voice_turn(session, input_turn_id)
+        return result
+    result = await history.interrupt(
         reason=req.reason, played_ms=req.played_ms, producer_seq=req.producer_seq
     )
+    watchdog.terminal(watch_identity)
+    input_turn_id = session._response_input_ids.get(req.response_id)
+    if input_turn_id is not None:
+        session.record_playback_terminal(
+            input_turn_id,
+            req.response_id,
+            req.playback_id,
+            "partial",
+            req.played_ms or 0,
+            req.output_epoch,
+        )
+    await session.finish_response_playback(req.response_id)
+    if input_turn_id is not None:
+        await _complete_ready_voice_turn(session, input_turn_id)
+    return result
 
 
 @app.get("/api/voice/status")

@@ -77,6 +77,7 @@ export type Playback = {
   interval_ms: number;
   amplitude: number;
   source: Source;
+  reason?: string;
 };
 
 export type Payload =

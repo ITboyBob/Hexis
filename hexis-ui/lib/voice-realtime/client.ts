@@ -26,6 +26,8 @@ export class VoiceRealtimeClient {
   private pendingClose: Promise<void> = Promise.resolve();
   private sessionId: string | null = null;
   private mediaSessionId: string | null = null;
+  private playbackEndpoint: string | null = null;
+  private producerSequence = 0;
 
   constructor(private readonly options: Options = {}) {}
 
@@ -45,6 +47,7 @@ export class VoiceRealtimeClient {
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: {
+          channelCount: 1,
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
@@ -92,6 +95,8 @@ export class VoiceRealtimeClient {
       }
       this.sessionId = payload.session_id;
       this.mediaSessionId = payload.media_session_id;
+      this.playbackEndpoint = "/api/voice/playback";
+      this.producerSequence = 0;
 
       const socket = new WebSocket(payload.websocket_url);
       await new Promise<void>((resolve, reject) => {
@@ -136,6 +141,7 @@ export class VoiceRealtimeClient {
     const socket = this.socket;
     this.socket = null;
     this.stopStream();
+    this.playbackEndpoint = null;
     this.setState("closed");
     if (socket && socket.readyState <= WebSocket.OPEN) {
       this.pendingClose = new Promise((resolve) => {
@@ -147,7 +153,7 @@ export class VoiceRealtimeClient {
               type: "control",
               session_id: this.sessionId,
               media_session_id: this.mediaSessionId,
-              producer_seq: 0,
+              producer_seq: this.producerSequence++,
               action: "close",
               reason: "manual",
             }),
@@ -166,7 +172,112 @@ export class VoiceRealtimeClient {
     if (this.currentState !== "ready" || this.socket?.readyState !== WebSocket.OPEN) {
       throw new Error("Talk is not connected.");
     }
-    this.socket.send(JSON.stringify(message));
+    if (this.socket.bufferedAmount > 2_000_000) {
+      throw new Error("Talk audio queue is full. Stop Talk and retry when the connection is stable.");
+    }
+    this.socket.send(
+      JSON.stringify({
+        ...message,
+        session_id: this.sessionId,
+        media_session_id: this.mediaSessionId,
+        producer_seq: this.producerSequence++,
+      }),
+    );
+  }
+
+  sendControl(action: "barge_in", reason: string): void {
+    if (!reason.trim() || reason.length > 200) {
+      throw new Error("Talk control reason must contain 1 to 200 characters.");
+    }
+    this.send({
+      schema_version: 1,
+      type: "control",
+      session_id: "",
+      media_session_id: "",
+      producer_seq: 0,
+      action,
+      reason,
+    });
+  }
+
+  get mediaStream(): MediaStream | null {
+    return this.stream;
+  }
+
+  get activeSessionId(): string | null {
+    return this.sessionId;
+  }
+
+  get activeMediaSessionId(): string | null {
+    return this.mediaSessionId;
+  }
+
+  get activePlaybackEndpoint(): string | null {
+    return this.playbackEndpoint;
+  }
+
+  openCapture(captureInstanceId: string): void {
+    this.send({
+      schema_version: 1,
+      type: "capture_open",
+      session_id: "",
+      media_session_id: "",
+      producer_seq: 0,
+      capture_instance_id: captureInstanceId,
+      sample_rate: 16_000,
+      channels: 1,
+      sample_format: "s16le",
+    });
+  }
+
+  sendAudioChunk(
+    captureInstanceId: string,
+    range: {
+      startFrame: number;
+      endFrame: number;
+      startMonotonicMs: number;
+      endMonotonicMs: number;
+      pcmBase64: string;
+    },
+  ): void {
+    this.send({
+      schema_version: 1,
+      type: "audio_chunk",
+      session_id: "",
+      media_session_id: "",
+      producer_seq: 0,
+      capture_instance_id: captureInstanceId,
+      start_frame: range.startFrame,
+      end_frame: range.endFrame,
+      start_monotonic_ms: range.startMonotonicMs,
+      end_monotonic_ms: range.endMonotonicMs,
+      pcm_base64: range.pcmBase64,
+    });
+  }
+
+  endUtterance(
+    captureInstanceId: string,
+    range: {
+      startFrame: number;
+      endFrame: number;
+      startMonotonicMs: number;
+      endMonotonicMs: number;
+      audioSha256: string;
+    },
+  ): void {
+    this.send({
+      schema_version: 1,
+      type: "utterance_end",
+      session_id: "",
+      media_session_id: "",
+      producer_seq: 0,
+      capture_instance_id: captureInstanceId,
+      start_frame: range.startFrame,
+      end_frame: range.endFrame,
+      start_monotonic_ms: range.startMonotonicMs,
+      end_monotonic_ms: range.endMonotonicMs,
+      audio_sha256: range.audioSha256,
+    });
   }
 
   private stopStream() {

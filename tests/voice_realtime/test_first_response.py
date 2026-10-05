@@ -66,6 +66,7 @@ class FakeClient:
         self.committed_item_id = committed_item_id
         self.commit_calls = 0
         self.create_calls: list[tuple[str, str]] = []
+        self.pending_instructions: str | None = None
 
     async def commit_audio(self) -> None:
         self.commit_calls += 1
@@ -81,8 +82,11 @@ class FakeClient:
             raise AssertionError("final 未绑定到 commit 回执 item_id")
         return self.final_event
 
-    async def create_first_response(self, response_id: str, instructions: str) -> None:
-        self.create_calls.append((response_id, instructions))
+    async def update_session_instructions(self, instructions: str) -> None:
+        self.pending_instructions = instructions
+
+    async def create_first_response(self, response_id: str) -> None:
+        self.create_calls.append((response_id, self.pending_instructions or ""))
 
 
 class FakeSink:
