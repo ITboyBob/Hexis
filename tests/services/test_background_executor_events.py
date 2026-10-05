@@ -20,8 +20,10 @@ from core.cognitive_memory_api import HydratedContext
 from core.tools.base import ToolResult
 from core.tools.config import ToolsConfig
 from core.tools import ToolContext
+from services.behavior_events import query_behavior_events
 from services.behavior_events import BehaviorEvent
 from services.background_executor import BackgroundExecutor, BackgroundTaskRequest
+import services.background_executor as background_executor_module
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
 
@@ -340,6 +342,105 @@ async def test_terminal_event_failure_preserves_real_task_terminal_state(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_terminal_event_retry_replays_missing_terminal_event(
+    db_pool,
+    monkeypatch,
+):
+    _patch_explicit_assembly(monkeypatch)
+    original_record = background_executor_module.record_behavior_event
+    recorded: list[BehaviorEvent] = []
+    agent_runs = 0
+
+    async def failing_terminal_record(
+        pool: Any,
+        event: BehaviorEvent,
+    ) -> dict[str, Any]:
+        if event.event_type == "task_completed":
+            raise RuntimeError("terminal behavior log unavailable")
+        recorded.append(event)
+        return {
+            "event_id": str(event.event_id),
+            "seq": len(recorded),
+            "deduplicated": False,
+        }
+
+    monkeypatch.setattr(
+        background_executor_module,
+        "record_behavior_event",
+        failing_terminal_record,
+    )
+
+    async def fake_agent_run(
+        self: AgentLoop,
+        user_message: str,
+        history: list[dict[str, Any]] | None = None,
+        user_content: Any | None = None,
+    ) -> AgentLoopResult:
+        nonlocal agent_runs
+        agent_runs += 1
+        return _loop_result()
+
+    monkeypatch.setattr(AgentLoop, "run", fake_agent_run)
+
+    async with db_pool.acquire() as conn:
+        session_id = await conn.fetchval(
+            "INSERT INTO chat_sessions DEFAULT VALUES RETURNING id"
+        )
+
+    command_id = uuid4()
+    executor = BackgroundExecutor(db_pool)
+    request = BackgroundTaskRequest(
+        session_id=session_id,
+        command_id=command_id,
+        instruction="replay missing terminal event",
+        success_criteria="text",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="task_completed event write failed",
+    ):
+        await executor.run(request)
+
+    monkeypatch.setattr(
+        background_executor_module,
+        "record_behavior_event",
+        original_record,
+    )
+    outcome = await executor.run(request)
+
+    assert agent_runs == 1
+    assert outcome["task_updated"] is True
+    assert outcome["succeeded"] is True
+    assert outcome.get("existing_terminal") is True
+
+    async with db_pool.acquire() as conn:
+        task = await conn.fetchrow(
+            """
+            SELECT id, current_execution_id
+            FROM background_tasks WHERE command_id=$1
+            """,
+            command_id,
+        )
+
+    page = await query_behavior_events(
+        db_pool,
+        session_id=session_id,
+        task_id=str(task["id"]),
+        limit=100,
+    )
+    terminal_events = [
+        event
+        for event in page["events"]
+        if event["event_type"] == "task_completed"
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0]["payload"]["execution_id"] == str(
+        task["current_execution_id"]
+    )
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_event_retry_reuses_event_object_and_id(db_pool, monkeypatch):
     recorded: list[BehaviorEvent] = []
 
@@ -482,3 +583,76 @@ async def test_tool_start_event_failure_fails_task_and_propagates(
     assert execution["status"] == "failed"
     assert "behavior log unavailable" in execution["error"]
     assert execution["turn_id"] == UUID(result.turn_id)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_missing_tool_call_id_fails_task_without_unbound_event(
+    db_pool,
+    monkeypatch,
+):
+    _patch_explicit_assembly(monkeypatch)
+
+    async def fake_agent_run(
+        self: AgentLoop,
+        user_message: str,
+        history: list[dict[str, Any]] | None = None,
+        user_content: Any | None = None,
+    ) -> AgentLoopResult:
+        await self.config.on_event(
+            AgentEventData(
+                event=AgentEvent.TOOL_START,
+                data={
+                    "tool_name": "recall",
+                    "arguments": {},
+                    "iteration": 1,
+                },
+            )
+        )
+        return _loop_result(
+            text="done",
+            tool_results=[{"name": "recall", "success": True}],
+        )
+
+    monkeypatch.setattr(AgentLoop, "run", fake_agent_run)
+
+    async with db_pool.acquire() as conn:
+        session_id = await conn.fetchval(
+            "INSERT INTO chat_sessions DEFAULT VALUES RETURNING id"
+        )
+
+    command_id = uuid4()
+    executor = BackgroundExecutor(db_pool)
+    request = BackgroundTaskRequest(
+        session_id=session_id,
+        command_id=command_id,
+        instruction="tool event must carry call_id",
+        success_criteria="text_and_tool",
+    )
+
+    with pytest.raises(ValueError, match="tool event call_id is required"):
+        await executor.run(request)
+
+    async with db_pool.acquire() as conn:
+        task = await conn.fetchrow(
+            """
+            SELECT id, status, error
+            FROM background_tasks WHERE command_id=$1
+            """,
+            command_id,
+        )
+
+    page = await query_behavior_events(
+        db_pool,
+        session_id=session_id,
+        task_id=str(task["id"]),
+        limit=100,
+    )
+    tool_events = [
+        event
+        for event in page["events"]
+        if event["event_type"] in {"TOOL_START", "TOOL_RESULT"}
+    ]
+
+    assert task["status"] == "failed"
+    assert "tool event call_id is required" in task["error"]
+    assert tool_events == []

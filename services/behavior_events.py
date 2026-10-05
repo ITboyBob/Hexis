@@ -99,6 +99,24 @@ def _validate(event: BehaviorEvent) -> None:
         raise ValueError("payload must be a JSON object")
 
 
+def _cursor(value: Any) -> dict[str, int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not value:
+        raise ValueError("cursor must be a non-empty stream_id to after_seq mapping")
+    normalized: dict[str, int] = {}
+    for stream_id, after_seq in value.items():
+        _required_text(stream_id, "cursor stream_id")
+        if (
+            not isinstance(after_seq, int)
+            or isinstance(after_seq, bool)
+            or after_seq < 0
+        ):
+            raise ValueError("cursor after_seq must be a non-negative integer")
+        normalized[stream_id] = after_seq
+    return normalized
+
+
 async def record_behavior_event(pool: Any, event: BehaviorEvent) -> dict[str, Any]:
     """Record one producer-owned event; exact retries deduplicate in Postgres."""
     if pool is None:
@@ -154,7 +172,8 @@ async def query_behavior_events(
     call_id: str | None = None,
     limit: int = 100,
     offset: int = 0,
-) -> list[dict[str, Any]]:
+    cursor: dict[str, int] | None = None,
+) -> dict[str, Any]:
     """Query persisted envelopes newest-first for diagnostics and projections."""
     if pool is None:
         raise ValueError("a database pool is required to query behavior events")
@@ -162,12 +181,13 @@ async def query_behavior_events(
         raise ValueError("limit must be a positive integer")
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         raise ValueError("offset must be a non-negative integer")
+    normalized_cursor = _cursor(cursor)
     async with pool.acquire() as conn:
         raw = await conn.fetchval(
             """
             SELECT get_behavior_events(
                 $1::uuid, $2, $3, $4::uuid, $5, $6, $7, $8,
-                $9::int, $10::int
+                $9::int, $10::int, $11::jsonb
             )
             """,
             session_id,
@@ -180,10 +200,11 @@ async def query_behavior_events(
             call_id,
             limit,
             offset,
+            json.dumps(normalized_cursor) if normalized_cursor is not None else None,
         )
     result = _json(raw)
-    if not isinstance(result, list):
-        raise RuntimeError("the database did not return a behavior event list")
+    if not isinstance(result, dict):
+        raise RuntimeError("the database did not return a behavior event page")
     return result
 
 
@@ -193,6 +214,7 @@ async def replay_behavior_events(
     session_id: UUID,
     stream_id: str | None = None,
     limit: int = 10000,
+    cursor: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Return per-stream replay order and sequence-gap diagnostics."""
     if pool is None:
@@ -201,12 +223,14 @@ async def replay_behavior_events(
         raise ValueError("session_id must be a UUID")
     if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
         raise ValueError("limit must be a positive integer")
+    normalized_cursor = _cursor(cursor)
     async with pool.acquire() as conn:
         raw = await conn.fetchval(
-            "SELECT replay_behavior_events($1::uuid, $2, $3::int)",
+            "SELECT replay_behavior_events($1::uuid, $2, $3::int, $4::jsonb)",
             session_id,
             stream_id,
             limit,
+            json.dumps(normalized_cursor) if normalized_cursor is not None else None,
         )
     result = _json(raw)
     if not isinstance(result, dict):

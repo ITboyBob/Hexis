@@ -432,6 +432,8 @@ async def _run_new_first_response_turn(
             _event(
                 event_type="voice_response_created",
                 session_id=capture_range.session_id,
+                input_turn_id=str(receipt.identity.input_turn_id),
+                stimulus_revision=receipt.identity.stimulus_revision,
                 response_id=response_id,
                 payload={
                     "response_id": response_id,

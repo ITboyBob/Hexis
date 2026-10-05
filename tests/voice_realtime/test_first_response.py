@@ -167,6 +167,8 @@ async def test_first_response_waits_for_release_and_hydration_in_parallel():
     ]
     assert all(isinstance(event, BehaviorEvent) for event in sink.events)
     assert all(event.session_id == identity.session_id for event in sink.events)
+    assert sink.events[2].input_turn_id == str(identity.input_turn_id)
+    assert sink.events[2].stimulus_revision == identity.stimulus_revision
 
 
 @pytest.mark.asyncio(loop_scope="function")

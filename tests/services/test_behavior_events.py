@@ -35,11 +35,15 @@ async def test_python_service_records_queries_and_replays(db_pool):
 
     first = await record_behavior_event(db_pool, event)
     retry = await record_behavior_event(db_pool, event)
-    rows = await query_behavior_events(db_pool, session_id=session_id)
+    page = await query_behavior_events(db_pool, session_id=session_id)
     replay = await replay_behavior_events(db_pool, session_id=session_id)
+    rows = page["events"]
 
     assert first["deduplicated"] is False
     assert retry["deduplicated"] is True
+    assert page["has_more"] is False
+    assert page["truncated"] is False
+    assert page["next_cursor"] is None
     assert rows[0]["event_id"] == str(event_id)
     assert replay["event_count"] == 1
     assert replay["streams"][0]["events"][0]["event_id"] == str(event_id)

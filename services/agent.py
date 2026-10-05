@@ -632,6 +632,14 @@ def render_interlocutor_block(
         )
         return "\n".join(lines)
 
+    if where == "background":
+        lines.append(
+            "You are operating in an autonomous task context on behalf of your "
+            "primary user. Treat the task input as authorized by them, and keep "
+            "the task context separate from a direct conversation."
+        )
+        return "\n".join(lines)
+
     named = interlocutor.strip() if interlocutor and interlocutor.strip() else None
     who = named or "someone you have not identified"
     room = "a group conversation" if is_group else "a direct message"

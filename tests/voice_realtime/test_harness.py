@@ -6,7 +6,7 @@ import sys
 import wave
 from dataclasses import replace
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 from urllib.parse import parse_qsl, urlsplit
 
 import pytest
@@ -17,6 +17,7 @@ from apps.voice_realtime_harness import (
     CEmotionReleaseAdapter,
     HarnessRunResult,
     HarnessStageError,
+    _UUID_NAMESPACE,
     _emotion_runtime_config,
     _default_connect_factory,
     _resolve_db_dsn,
@@ -27,8 +28,13 @@ from apps.voice_realtime_harness import (
     sanitize_protocol_event,
     write_evidence,
 )
-from services.behavior_events import BehaviorEvent
+from services.behavior_events import (
+    BehaviorEvent,
+    query_behavior_events,
+    replay_behavior_events,
+)
 from services.qwen_realtime_protocol import ProtocolEvent, parse_event
+from services.qwen_realtime_output import OutputPlaybackFacts
 from services.voice_emotion_gate import VoiceEmotionCoordinator
 from services.voice_first_response import run_first_response_turn
 from services.voice_input_authorization import (
@@ -60,6 +66,8 @@ def config(tmp_path, *, wav_name: str = "input.wav"):
         "input_turn_id": str(uuid4()),
         "timeout": 2,
         "stable_instructions": "稳定层",
+        "output_epoch": 1,
+        "playback_id": "play-1",
     }
 
 
@@ -262,6 +270,7 @@ async def test_harness_success_creates_bounded_evidence(tmp_path, monkeypatch):
     write_wav(wav)
     value = config(tmp_path)
     monkeypatch.setenv(value["api_key_env"], "secret-key-value")
+    response_id = f"resp-{uuid5(_UUID_NAMESPACE, value['input_turn_id'])}"
     websocket = FakeWebSocket(
         [
             {"type": "session.updated", "session": {"id": "cloud-session-1"}},
@@ -276,7 +285,15 @@ async def test_harness_success_creates_bounded_evidence(tmp_path, monkeypatch):
                 "transcript": "请继续",
                 "is_final": True,
             },
-            {"type": "response.done", "response_id": "resp-1"},
+            {"type": "response.created", "response": {"id": response_id}},
+            {
+                "type": "response.audio.delta",
+                "response_id": response_id,
+                "item_id": "item-audio-1",
+                "output_index": 0,
+                "delta": "AQIDBA==",
+            },
+            {"type": "response.done", "response": {"id": response_id}},
         ]
     )
     observed = {}
@@ -300,6 +317,21 @@ async def test_harness_success_creates_bounded_evidence(tmp_path, monkeypatch):
             memory_count=1,
         )
 
+    class FakePlaybackBridge:
+        async def start(self, chunk):
+            return OutputPlaybackFacts(
+                started=True,
+                start_ms=0,
+                audible_ms=0,
+            )
+
+        async def finish(self):
+            return OutputPlaybackFacts(
+                terminal="ended",
+                scope="complete",
+                played_ms=0,
+            )
+
     result = await run_harness(
         value,
         wav,
@@ -312,6 +344,7 @@ async def test_harness_success_creates_bounded_evidence(tmp_path, monkeypatch):
         ),
         behavior_pool=FakeBehaviorDB(),
         source="simulated",
+        playback_bridge=FakePlaybackBridge(),
     )
 
     assert result.ok is True
@@ -335,6 +368,22 @@ async def test_harness_success_creates_bounded_evidence(tmp_path, monkeypatch):
     assert evidence["hydration"]["memory_count"] == 1
     assert evidence["response_created"] is True
     assert evidence["response_create_monotonic_ms"] >= 0
+    assert evidence["response_stream"]["awaited_terminal"] is True
+    assert evidence["response_stream"]["created"]["type"] == "response.created"
+    assert evidence["response_stream"]["first_delta"]["type"] == "response.audio.delta"
+    assert evidence["response_stream"]["terminal"]["type"] == "response.done"
+    assert [item["event_type"] for item in evidence["behavior_events"]] == [
+        "voice_commit_sent",
+        "voice_transcript_final",
+        "voice_input_committed",
+        "voice_hydrate_done",
+        "voice_response_created",
+        "voice_first_audio_delta",
+        "voice_playback_started",
+        "voice_first_audible",
+        "voice_response_done",
+        "voice_playback_ended",
+    ]
     assert evidence["unknown_events"][0]["type"] == "vendor.unknown"
     assert all(event["source"] == "simulated" for event in evidence["protocol_events"])
     assert "secret-key-value" not in serialized
@@ -343,6 +392,175 @@ async def test_harness_success_creates_bounded_evidence(tmp_path, monkeypatch):
     assert '"raw"' not in serialized
     assert websocket.sent[-1]["type"] == "response.create"
     assert websocket.closed is True
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_harness_full_chain_replays_from_a(db_pool, tmp_path, monkeypatch):
+    wav = tmp_path / "input.wav"
+    write_wav(wav)
+    value = config(tmp_path)
+    monkeypatch.setenv(value["api_key_env"], "secret-key-value")
+    response_id = f"resp-{uuid5(_UUID_NAMESPACE, value['input_turn_id'])}"
+    websocket = FakeWebSocket(
+        [
+            {"type": "session.updated", "session": {"id": "cloud-session-1"}},
+            {"type": "input_audio_buffer.committed", "item_id": "item-1"},
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "item-1",
+                "transcript": "请继续",
+                "is_final": True,
+            },
+            {"type": "response.created", "response": {"id": response_id}},
+            {
+                "type": "response.audio.delta",
+                "response_id": response_id,
+                "item_id": "item-audio-1",
+                "output_index": 0,
+                "delta": "AQIDBA==",
+            },
+            {"type": "response.done", "response": {"id": response_id}},
+        ]
+    )
+
+    async def connect_factory(_endpoint, *, extra_headers):
+        return websocket
+
+    async def context_reader(_identity):
+        return {"identity": {}}
+
+    async def evaluator(_message, _context):
+        return {"label": "calm"}
+
+    async def hydrator(_identity, _message):
+        return SimpleNamespace(
+            per_response_instructions="每轮上下文",
+            instructions_hash="b" * 64,
+            hydrate_ms=1.0,
+            memory_count=1,
+        )
+
+    class FakePlaybackBridge:
+        async def start(self, chunk):
+            return OutputPlaybackFacts(started=True, start_ms=0, audible_ms=0)
+
+        async def finish(self):
+            return OutputPlaybackFacts(
+                terminal="ended", scope="complete", played_ms=0
+            )
+
+    result = await run_harness(
+        value,
+        wav,
+        connect_factory=connect_factory,
+        coordinator=VoiceEmotionCoordinator(
+            context_reader=context_reader,
+            evaluator=evaluator,
+            hydrator=hydrator,
+            emotion_timeout_ms=1000,
+        ),
+        behavior_pool=db_pool,
+        source="simulated",
+        playback_bridge=FakePlaybackBridge(),
+    )
+
+    assert result.ok is True
+    page = await query_behavior_events(
+        db_pool, session_id=UUID(value["session_id"]), limit=100
+    )
+    replay = await replay_behavior_events(
+        db_pool, session_id=UUID(value["session_id"]), limit=100
+    )
+    expected = [
+        "voice_commit_sent",
+        "voice_transcript_final",
+        "voice_input_committed",
+        "voice_hydrate_done",
+        "voice_response_created",
+        "voice_first_audio_delta",
+        "voice_playback_started",
+        "voice_first_audible",
+        "voice_response_done",
+        "voice_playback_ended",
+    ]
+
+    assert page["has_more"] is False
+    assert page["truncated"] is False
+    assert page["filter_omitted_count"] == 0
+    assert [event["event_type"] for event in page["events"]] == expected
+    assert all(
+        event["input_turn_id"] == value["input_turn_id"]
+        for event in page["events"]
+    )
+    assert replay["event_count"] == 10
+    assert replay["filter_omitted_count"] == 0
+    assert replay["has_more"] is False
+    assert replay["streams"][0]["sequence_gaps"] == []
+    assert [
+        event["event_type"] for event in replay["streams"][0]["events"]
+    ] == expected
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_harness_response_failed_is_explicit_not_timeout(tmp_path, monkeypatch):
+    wav = tmp_path / "input.wav"
+    write_wav(wav)
+    value = config(tmp_path)
+    monkeypatch.setenv(value["api_key_env"], "secret-key-value")
+    websocket = FakeWebSocket(
+        [
+            {"type": "session.updated", "session": {"id": "cloud-session-1"}},
+            {"type": "input_audio_buffer.committed", "item_id": "item-1"},
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "item-1",
+                "transcript": "请继续",
+                "is_final": True,
+            },
+            {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp-created",
+                    "error": {"code": "server_error", "message": "Cloud failed"},
+                },
+            },
+        ]
+    )
+
+    async def connect_factory(_endpoint, *, extra_headers):
+        return websocket
+
+    async def context_reader(_identity):
+        return {"identity": {}}
+
+    async def evaluator(_message, _context):
+        return {"label": "calm"}
+
+    async def hydrator(_identity, _message):
+        return SimpleNamespace(per_response_instructions="每轮上下文")
+
+    result = await run_harness(
+        value,
+        wav,
+        connect_factory=connect_factory,
+        coordinator=VoiceEmotionCoordinator(
+            context_reader=context_reader,
+            evaluator=evaluator,
+            hydrator=hydrator,
+            emotion_timeout_ms=1000,
+        ),
+        behavior_pool=FakeBehaviorDB(),
+        source="simulated",
+    )
+
+    assert result.ok is False
+    assert result.evidence["failure"]["stage"] == "response_stream"
+    terminal = result.evidence["response_stream"]["terminal"]
+    assert terminal["type"] == "response.failed"
+    assert terminal["response_id"] == "resp-created"
+    assert terminal["error_code"] == "server_error"
+    assert terminal["error_message"] == "Cloud failed"
+    assert isinstance(terminal["elapsed_ms"], int)
 
 
 @pytest.mark.asyncio(loop_scope="function")
@@ -371,6 +589,20 @@ def test_resolve_db_dsn_requires_explicit_env_value(monkeypatch):
 
     with pytest.raises(HarnessStageError, match="HEXIS_TEST_DSN"):
         _resolve_db_dsn({"db_dsn_env": "HEXIS_TEST_DSN"})
+
+
+def test_resolve_db_dsn_rejects_missing_explicit_source():
+    with pytest.raises(HarnessStageError, match="db_source"):
+        _resolve_db_dsn({})
+
+
+def test_resolve_db_dsn_accepts_explicit_hexis_env(monkeypatch):
+    dsn = "postgresql://user:password@localhost:43815/hexis_memory"
+    monkeypatch.setattr(
+        "apps.voice_realtime_harness.db_dsn_from_env", lambda: dsn
+    )
+
+    assert _resolve_db_dsn({"db_source": "hexis-env"}) == (dsn, "hexis-env")
 
 
 def test_resolve_db_dsn_uses_explicit_env_value(monkeypatch):
@@ -456,7 +688,15 @@ async def test_run_real_harness_builds_and_closes_runtime_pool(tmp_path, monkeyp
             "stable_instructions_hash": "a" * 64,
         }
 
-    async def fake_run_harness(_config, _wav, *, coordinator, behavior_pool, source):
+    async def fake_run_harness(
+        _config,
+        _wav,
+        *,
+        coordinator,
+        behavior_pool,
+        source,
+        playback_bridge=None,
+    ):
         return HarnessRunResult(
             ok=True,
             evidence={

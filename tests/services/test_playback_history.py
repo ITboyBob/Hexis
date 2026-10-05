@@ -51,9 +51,11 @@ async def test_records_playback_events_and_aggregates_history(db_pool):
         "event_count": 4,
     }
 
-    events = await query_behavior_events(
+    events = (
+        await query_behavior_events(
         db_pool, session_id=identity.session_id, response_id=identity.response_id
-    )
+        )
+    )["events"]
     assert {event["event_type"] for event in events} == {
         "voice_playback_started",
         "voice_first_audible",
@@ -77,14 +79,53 @@ async def test_explicit_producer_seq_does_not_break_internal_increment(db_pool):
     await history.audible(audible_ms=100, producer_seq=11)
     await history.progress(played_ms=200, interval_ms=100, phase="playing")
 
-    events = await query_behavior_events(
+    events = (
+        await query_behavior_events(
         db_pool,
         session_id=identity.session_id,
         response_id=identity.response_id,
-    )
+        )
+    )["events"]
     assert [event["producer_seq"] for event in sorted(
         events, key=lambda event: event["producer_seq"]
     )] == [10, 11, 12]
+
+
+async def test_same_playback_event_retry_keeps_stable_event_id(db_pool):
+    identity = _identity()
+    history = PlaybackHistory(db_pool, identity)
+
+    first = await history.open(start_ms=100, producer_seq=1)
+    retry = await history.open(start_ms=100, producer_seq=1)
+
+    assert first["event_id"] == retry["event_id"]
+    assert first["deduplicated"] is False
+    assert retry["deduplicated"] is True
+    assert await history.get() == {
+        "playback_id": identity.playback_id,
+        "response_id": identity.response_id,
+        "output_epoch": identity.output_epoch,
+        "media_session_id": identity.media_session_id,
+        "scope": "unknown",
+        "played_ms": 0,
+        "event_count": 1,
+    }
+
+
+async def test_stable_event_id_does_not_merge_playback_instances(db_pool):
+    first_identity = _identity(playback_id="play-1")
+    second_identity = _identity(playback_id="play-2")
+
+    first = await PlaybackHistory(db_pool, first_identity).open(
+        start_ms=100, producer_seq=1
+    )
+    second = await PlaybackHistory(db_pool, second_identity).open(
+        start_ms=100, producer_seq=1
+    )
+
+    assert first["event_id"] != second["event_id"]
+    assert first["deduplicated"] is False
+    assert second["deduplicated"] is False
 
 
 async def test_invalid_explicit_producer_seq_is_rejected_before_write(db_pool):
@@ -115,14 +156,16 @@ async def test_get_orders_concurrent_events_by_producer_seq(db_pool, monkeypatch
         history.interrupt(reason="user-stop", played_ms=900, producer_seq=2),
     )
 
-    events = await query_behavior_events(
-        db_pool,
-        session_id=identity.session_id,
-        response_id=identity.response_id,
-    )
+    events = (
+        await query_behavior_events(
+            db_pool,
+            session_id=identity.session_id,
+            response_id=identity.response_id,
+        )
+    )["events"]
     assert [event["event_type"] for event in events] == [
-        "voice_playback_interrupted",
         "voice_playback_ended",
+        "voice_playback_interrupted",
     ]
 
     result = await history.get()
@@ -288,4 +331,3 @@ async def test_mismatched_media_receipts_are_excluded_from_scope_aggregation(db_
     assert result["scope"] == "unknown"
     assert result["played_ms"] == 300
     assert result["event_count"] == 3
-

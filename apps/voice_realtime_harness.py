@@ -14,7 +14,7 @@ import wave
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping, Protocol
 from uuid import UUID, uuid5
 
 from core.agent_api import db_dsn_from_env
@@ -25,6 +25,12 @@ from services.qwen_realtime_client import (
     QwenRealtimeConnectionError,
 )
 from services.qwen_realtime_protocol import ProtocolEvent
+from services.qwen_realtime_output import (
+    NativeAudioChunk,
+    OutputMappingError,
+    OutputPlaybackFacts,
+    QwenRealtimeOutputAdapter,
+)
 from services.voice_emotion_gate import VoiceEmotionCoordinator
 from services.voice_context_hydration import hydrate_voice_context
 from services.voice_first_response import FirstResponseGate
@@ -46,6 +52,7 @@ _REQUIRED_CONFIG = (
     "input_turn_id",
     "timeout",
     "stable_instructions",
+    "output_epoch",
 )
 _OPTIONAL_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _KNOWN_EVENT_TYPES = {
@@ -59,10 +66,14 @@ _KNOWN_EVENT_TYPES = {
     "conversation.item.input_audio_transcription.partial",
     "conversation.item.input_audio_transcription.completed",
     "response.create",
+    "response.created",
     "response.text.delta",
     "response.audio.delta",
     "response.done",
     "response.failed",
+    "error",
+    "input_audio_transcription.failed",
+    "conversation.item.input_audio_transcription.failed",
 }
 _UUID_NAMESPACE = uuid5(UUID(int=0), "hexis:bob101:harness")
 
@@ -93,6 +104,14 @@ class AudioInput:
 class HarnessRunResult:
     ok: bool
     evidence: dict[str, Any]
+
+
+class PlaybackBridge(Protocol):
+    async def start(self, chunk: NativeAudioChunk) -> OutputPlaybackFacts:
+        ...
+
+    async def finish(self) -> OutputPlaybackFacts:
+        ...
 
 
 @dataclass(frozen=True)
@@ -285,6 +304,9 @@ def sanitize_protocol_event(
         response = raw.get("response") or {}
         payload["response_id"] = response.get("id")
         payload["instructions"] = _text_summary(response.get("instructions"))
+    elif event_type == "response.created":
+        response = raw.get("response") or {}
+        payload["response_id"] = response.get("id")
     elif event_type == "response.audio.delta":
         payload["audio"] = _audio_summary(raw.get("delta"))
     elif event_type == "response.text.delta":
@@ -297,7 +319,22 @@ def sanitize_protocol_event(
     }:
         payload["transcript"] = _preview_summary(raw.get("transcript"))
     elif event_type in {"response.done", "response.failed"}:
-        payload["response_id"] = raw.get("response_id")
+        response = raw.get("response") or {}
+        payload["response_id"] = response.get("id") or raw.get("response_id")
+        if event_type == "response.failed":
+            error = response.get("error") if isinstance(response, dict) else None
+            if isinstance(error, dict):
+                payload["error_code"] = error.get("code")
+                payload["error_message"] = error.get("message")
+            elif isinstance(error, str):
+                payload["error_message"] = error
+    elif event_type == "error":
+        error = raw.get("error")
+        if isinstance(error, dict):
+            payload["error_code"] = error.get("code")
+            payload["error_message"] = error.get("message")
+        elif isinstance(error, str):
+            payload["error_message"] = error
 
     return {
         "type": event_type,
@@ -343,6 +380,7 @@ def _stable_behavior_event_id(event: BehaviorEvent) -> UUID:
         "input_turn_id": event.input_turn_id,
         "response_id": event.response_id,
         "media_session_id": event.media_session_id,
+        "output_epoch": event.output_epoch,
     }
     canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
     return uuid5(_UUID_NAMESPACE, canonical)
@@ -358,6 +396,7 @@ def _behavior_event(
     media_session_id: str,
     stimulus_revision: int = 0,
     response_id: str | None = None,
+    output_epoch: int | None = None,
 ) -> BehaviorEvent:
     return BehaviorEvent(
         event_id=uuid5(_UUID_NAMESPACE, event_type),
@@ -375,6 +414,7 @@ def _behavior_event(
         input_turn_id=input_turn_id,
         response_id=response_id,
         media_session_id=media_session_id,
+        output_epoch=output_epoch,
     )
 
 
@@ -395,7 +435,11 @@ def _resolve_db_dsn(config: Mapping[str, Any]) -> tuple[str, str]:
             raise HarnessStageError("db", f"环境变量 {db_dsn_env} 未显式提供数据库 DSN")
         return dsn, db_dsn_env
 
-    db_source = config.get("db_source", "hexis-env")
+    if "db_source" not in config:
+        raise HarnessStageError(
+            "config", "必须显式提供 db_source=hexis-env 或 db_dsn_env"
+        )
+    db_source = config["db_source"]
     if db_source != "hexis-env":
         raise HarnessStageError(
             "config", "db_source 仅支持 hexis-env 或显式 db_dsn_env"
@@ -523,6 +567,8 @@ def _initial_evidence(config: Mapping[str, Any], source: str) -> dict[str, Any]:
             "input_turn_id": config.get("input_turn_id"),
             "timeout": config.get("timeout"),
             "stable_instructions": _text_summary(instructions),
+            "output_epoch": config.get("output_epoch"),
+            "playback_id": config.get("playback_id"),
         },
         "audio": None,
         "capture": None,
@@ -535,6 +581,12 @@ def _initial_evidence(config: Mapping[str, Any], source: str) -> dict[str, Any]:
         "unknown_events": [],
         "response_created": False,
         "response_create_monotonic_ms": None,
+        "response_stream": {
+            "awaited_terminal": False,
+            "created": None,
+            "first_delta": None,
+            "terminal": None,
+        },
         "failure": None,
     }
 
@@ -561,6 +613,21 @@ def _validate_config(config: Mapping[str, Any], wav_path: str | Path) -> dict[st
     if timeout <= 0:
         raise HarnessStageError("config", "timeout 必须是正数秒")
 
+    output_epoch = config["output_epoch"]
+    if (
+        not isinstance(output_epoch, int)
+        or isinstance(output_epoch, bool)
+        or output_epoch < 0
+    ):
+        raise HarnessStageError("config", "output_epoch 必须是非负整数")
+    playback_id = config.get("playback_id")
+    if playback_id is not None and (
+        not isinstance(playback_id, str)
+        or not playback_id.strip()
+        or playback_id != playback_id.strip()
+    ):
+        raise HarnessStageError("config", "playback_id 必须是非空 trimmed 字符串")
+
     try:
         session_id = UUID(str(config["session_id"]))
         input_turn_id = UUID(str(config["input_turn_id"]))
@@ -584,6 +651,8 @@ def _validate_config(config: Mapping[str, Any], wav_path: str | Path) -> dict[st
         "input_turn_id": input_turn_id,
         "timeout": float(timeout),
         "stable_instructions": config["stable_instructions"],
+        "output_epoch": output_epoch,
+        "playback_id": playback_id,
     }
 
 
@@ -616,6 +685,19 @@ def _hydration_evidence(value: Any) -> dict[str, Any]:
     return evidence
 
 
+def _response_stream_event(event: ProtocolEvent, elapsed_ms: int) -> dict[str, Any]:
+    value: dict[str, Any] = {
+        "type": event.type,
+        "response_id": event.response_id,
+        "elapsed_ms": elapsed_ms,
+    }
+    if event.error_code is not None:
+        value["error_code"] = event.error_code
+    if event.error_message is not None:
+        value["error_message"] = event.error_message
+    return value
+
+
 async def _default_connect_factory(endpoint: str, *, extra_headers: dict[str, str]):
     import websockets
 
@@ -630,6 +712,7 @@ async def run_harness(
     coordinator: VoiceEmotionCoordinator,
     behavior_pool: Any,
     source: str = "real",
+    playback_bridge: PlaybackBridge | None = None,
 ) -> HarnessRunResult:
     if source not in {"real", "simulated"}:
         raise ValueError("source must be real or simulated")
@@ -653,8 +736,15 @@ async def run_harness(
                 "input_turn_id": str(value["input_turn_id"]),
                 "timeout": value["timeout"],
                 "stable_instructions": _text_summary(value["stable_instructions"]),
+                "output_epoch": value["output_epoch"],
+                "playback_id": value["playback_id"],
             }
         )
+
+        if playback_bridge is not None and not value["playback_id"]:
+            raise HarnessStageError(
+                "config", "playback_id 是 playback_bridge 的必填身份字段"
+            )
 
         api_key = os.environ.get(value["api_key_env"])
         if api_key is None:
@@ -735,12 +825,12 @@ async def run_harness(
                     event_type="voice_commit_sent",
                     session_id=value["session_id"],
                     payload={
-                        "capture_instance_id": str(capture.capture_instance_id),
-                    },
-                    producer_seq=0,
-                    input_turn_id=input_turn_id,
-                    media_session_id=capture.media_session_id,
-                )
+                    "capture_instance_id": str(capture.capture_instance_id),
+                },
+                producer_seq=len(sink.event_types),
+                input_turn_id=input_turn_id,
+                media_session_id=capture.media_session_id,
+            )
             )
 
             committed_event = await client.wait_for_input_committed()
@@ -770,6 +860,21 @@ async def run_harness(
                 "transcript_version": final.transcript_version,
                 "is_final": final.is_final,
             }
+            await sink(
+                _behavior_event(
+                    event_type="voice_transcript_final",
+                    session_id=value["session_id"],
+                    payload={
+                        "input_turn_id": input_turn_id,
+                        "transcript": final.transcript,
+                        "transcript_version": final.transcript_version,
+                        "is_final": final.is_final,
+                    },
+                    producer_seq=len(sink.event_types),
+                    input_turn_id=input_turn_id,
+                    media_session_id=capture.media_session_id,
+                )
+            )
 
             receipt = await InputAuthorizationService().commit(final, capture)
             evidence["authorization_receipt"] = {
@@ -784,12 +889,12 @@ async def run_harness(
                     session_id=value["session_id"],
                     payload={
                         "capture_instance_id": str(capture.capture_instance_id),
-                        "deduplicated": receipt.deduplicated,
-                    },
-                    producer_seq=1,
-                    input_turn_id=input_turn_id,
-                    media_session_id=capture.media_session_id,
-                )
+                    "deduplicated": receipt.deduplicated,
+                },
+                producer_seq=len(sink.event_types),
+                input_turn_id=input_turn_id,
+                media_session_id=capture.media_session_id,
+            )
             )
 
             gate = FirstResponseGate()
@@ -829,6 +934,22 @@ async def run_harness(
                 "visual_window": emotion_adapter.last_result.visual_window,
             }
             evidence["hydration"] = _hydration_evidence(hydration)
+            hydration_evidence = evidence["hydration"]
+            await sink(
+                _behavior_event(
+                    event_type="voice_hydrate_done",
+                    session_id=value["session_id"],
+                    payload={
+                        "hydrate_ms": hydration_evidence.get("hydrate_ms"),
+                        "instructions_hash": hydration_evidence.get(
+                            "instructions_hash"
+                        ),
+                    },
+                    producer_seq=len(sink.event_types),
+                    input_turn_id=input_turn_id,
+                    media_session_id=capture.media_session_id,
+                )
+            )
 
             response_id = f"resp-{uuid5(_UUID_NAMESPACE, input_turn_id)}"
             started = time.monotonic_ns() // 1_000_000
@@ -841,13 +962,188 @@ async def run_harness(
                 _behavior_event(
                     event_type="voice_response_created",
                     session_id=value["session_id"],
-                    payload={"response_id": response_id},
-                    producer_seq=2,
+                    payload={
+                        "response_id": response_id,
+                        "output_epoch": value["output_epoch"],
+                    },
+                    producer_seq=len(sink.event_types),
                     input_turn_id=input_turn_id,
                     media_session_id=capture.media_session_id,
                     response_id=response_id,
                 )
             )
+            stream_started = time.monotonic_ns() // 1_000_000
+            output_adapter = QwenRealtimeOutputAdapter(
+                response_id=response_id,
+                output_epoch=value["output_epoch"],
+                media_session_id=capture.media_session_id,
+            )
+            first_audio_delta_recorded = False
+            playback_started_recorded = False
+            first_audible_recorded = False
+            playback_bridge_started = False
+            async for event in client.events():
+                elapsed_ms = time.monotonic_ns() // 1_000_000 - stream_started
+                if event.type == "response.created":
+                    output_adapter.bind(event)
+                    if evidence["response_stream"]["created"] is None:
+                        evidence["response_stream"]["created"] = (
+                            _response_stream_event(event, elapsed_ms)
+                    )
+                    continue
+                if event.type in {"response.text.delta", "response.audio.delta"}:
+                    if evidence["response_stream"]["first_delta"] is None:
+                        evidence["response_stream"]["first_delta"] = (
+                            _response_stream_event(event, elapsed_ms)
+                        )
+                    if event.type == "response.audio.delta":
+                        chunk = output_adapter.accept(event)
+                        if chunk is None:
+                            continue
+                        if not first_audio_delta_recorded:
+                            first_audio_delta_recorded = True
+                            await sink(
+                                _behavior_event(
+                                    event_type="voice_first_audio_delta",
+                                    session_id=value["session_id"],
+                                    payload={
+                                        "response_id": response_id,
+                                        "ttfa_ms": elapsed_ms,
+                                        "segment_id": chunk.segment_id,
+                                        "chunk_seq": chunk.chunk_seq,
+                                    },
+                                    producer_seq=len(sink.event_types),
+                                    input_turn_id=input_turn_id,
+                                    media_session_id=capture.media_session_id,
+                                    response_id=response_id,
+                                    output_epoch=value["output_epoch"],
+                                )
+                            )
+                        if playback_bridge is not None:
+                            playback_bridge_started = True
+                            facts = await playback_bridge.start(chunk)
+                            if facts.started and not playback_started_recorded:
+                                playback_started_recorded = True
+                                await sink(
+                                    _behavior_event(
+                                        event_type="voice_playback_started",
+                                        session_id=value["session_id"],
+                                        payload={
+                                            "playback_id": value["playback_id"],
+                                            "response_id": response_id,
+                                            "start_ms": facts.start_ms or 0,
+                                        },
+                                        producer_seq=len(sink.event_types),
+                                        input_turn_id=input_turn_id,
+                                        media_session_id=capture.media_session_id,
+                                        response_id=response_id,
+                                        output_epoch=value["output_epoch"],
+                                    )
+                                )
+                            if (
+                                facts.audible_ms is not None
+                                and not first_audible_recorded
+                            ):
+                                first_audible_recorded = True
+                                await sink(
+                                    _behavior_event(
+                                        event_type="voice_first_audible",
+                                        session_id=value["session_id"],
+                                        payload={
+                                            "playback_id": value["playback_id"],
+                                            "audible_ms": facts.audible_ms,
+                                        },
+                                        producer_seq=len(sink.event_types),
+                                        input_turn_id=input_turn_id,
+                                        media_session_id=capture.media_session_id,
+                                        response_id=response_id,
+                                        output_epoch=value["output_epoch"],
+                                    )
+                                )
+                    continue
+                if event.type in {
+                    "response.done",
+                    "response.failed",
+                    "response_failed",
+                }:
+                    output_adapter.finish(event)
+                    evidence["response_stream"]["terminal"] = _response_stream_event(
+                        event, elapsed_ms
+                    )
+                    evidence["response_stream"]["awaited_terminal"] = True
+                    if event.type == "response.done":
+                        await sink(
+                            _behavior_event(
+                                event_type="voice_response_done",
+                                session_id=value["session_id"],
+                                payload={
+                                    "response_id": response_id,
+                                    "done_ms": elapsed_ms,
+                                },
+                                producer_seq=len(sink.event_types),
+                                input_turn_id=input_turn_id,
+                                media_session_id=capture.media_session_id,
+                                response_id=response_id,
+                                output_epoch=value["output_epoch"],
+                            )
+                        )
+                    else:
+                        await sink(
+                            _behavior_event(
+                                event_type="voice_response_failed",
+                                session_id=value["session_id"],
+                                payload={
+                                    "response_id": response_id,
+                                    "error_code": event.error_code,
+                                    "error_message": event.error_message,
+                                },
+                                producer_seq=len(sink.event_types),
+                                input_turn_id=input_turn_id,
+                                media_session_id=capture.media_session_id,
+                                response_id=response_id,
+                                output_epoch=value["output_epoch"],
+                            )
+                        )
+                    if playback_bridge is not None and playback_bridge_started:
+                        facts = await playback_bridge.finish()
+                        if facts.terminal == "ended":
+                            await sink(
+                                _behavior_event(
+                                    event_type="voice_playback_ended",
+                                    session_id=value["session_id"],
+                                    payload={
+                                        "playback_id": value["playback_id"],
+                                        "scope": facts.scope or "unknown",
+                                        "played_ms": facts.played_ms,
+                                    },
+                                    producer_seq=len(sink.event_types),
+                                    input_turn_id=input_turn_id,
+                                    media_session_id=capture.media_session_id,
+                                    response_id=response_id,
+                                    output_epoch=value["output_epoch"],
+                                )
+                            )
+                        elif facts.terminal == "interrupted":
+                            await sink(
+                                _behavior_event(
+                                    event_type="voice_playback_interrupted",
+                                    session_id=value["session_id"],
+                                    payload={
+                                        "playback_id": value["playback_id"],
+                                        "reason": facts.reason or "error",
+                                        "played_ms": facts.played_ms,
+                                    },
+                                    producer_seq=len(sink.event_types),
+                                    input_turn_id=input_turn_id,
+                                    media_session_id=capture.media_session_id,
+                                    response_id=response_id,
+                                    output_epoch=value["output_epoch"],
+                                )
+                            )
+                    if event.type != "response.done":
+                        message = event.error_message or "云端 response 未成功完成"
+                        raise HarnessStageError("response_stream", message)
+                    break
             evidence["behavior_events"] = [
                 {"event_type": event_type, **receipt}
                 for event_type, receipt in zip(
@@ -864,6 +1160,9 @@ async def run_harness(
     except QwenRealtimeConnectionError as exc:
         evidence["failure"] = _failure("connection", exc)
         return HarnessRunResult(ok=False, evidence=evidence)
+    except OutputMappingError as exc:
+        evidence["failure"] = _failure("output_mapping", exc)
+        return HarnessRunResult(ok=False, evidence=evidence)
     except Exception as exc:
         stage = getattr(exc, "stage", "turn")
         evidence["failure"] = _failure(stage, exc)
@@ -874,7 +1173,9 @@ async def run_harness(
 
 
 async def _run_real_harness(
-    config: Mapping[str, Any], wav_path: str | Path
+    config: Mapping[str, Any],
+    wav_path: str | Path,
+    playback_bridge: PlaybackBridge | None = None,
 ) -> HarnessRunResult:
     """Build the real A/C runtime, then run one controlled voice turn."""
     import asyncpg
@@ -895,6 +1196,7 @@ async def _run_real_harness(
             coordinator=coordinator,
             behavior_pool=pool,
             source="real",
+            playback_bridge=playback_bridge,
         )
         result.evidence["runtime"] = runtime_summary
         return result

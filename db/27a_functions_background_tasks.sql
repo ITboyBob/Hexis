@@ -12,6 +12,7 @@ CREATE OR REPLACE FUNCTION create_background_task(
 LANGUAGE plpgsql AS $$
 DECLARE
     v_id UUID;
+    v_existing background_tasks%ROWTYPE;
 BEGIN
     INSERT INTO background_tasks (session_id, command_id, input)
     VALUES (p_session_id, p_command_id, p_input)
@@ -19,8 +20,16 @@ BEGIN
     RETURNING id INTO v_id;
 
     IF v_id IS NULL THEN
-        SELECT id INTO v_id FROM background_tasks
+        SELECT * INTO v_existing FROM background_tasks
         WHERE command_id = p_command_id;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'background task insert conflict without existing row: %', p_command_id;
+        END IF;
+        IF v_existing.session_id IS DISTINCT FROM p_session_id
+           OR v_existing.input IS DISTINCT FROM p_input THEN
+            RAISE EXCEPTION 'background task command_id conflict: %', p_command_id;
+        END IF;
+        v_id := v_existing.id;
     END IF;
 
     RETURN v_id;

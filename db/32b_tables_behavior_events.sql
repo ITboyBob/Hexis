@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS behavior_events (
     call_id TEXT,
     seq BIGINT NOT NULL CHECK (seq > 0),
     ts TIMESTAMPTZ,
-    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     source TEXT NOT NULL
         CHECK (btrim(source) <> '' AND source = btrim(source)),
     producer_id TEXT NOT NULL

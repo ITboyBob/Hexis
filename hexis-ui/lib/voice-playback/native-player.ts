@@ -1,5 +1,6 @@
 import type { Playback } from "../avatar-preview/contracts";
 import { LocalPlayer } from "../avatar-preview/player";
+import { isNativePcmSource, type NativePcmSource } from "./native-output-source";
 
 export type NativePlaybackIdentity = {
   playback_id: string;
@@ -10,6 +11,7 @@ export type NativePlaybackIdentity = {
 
 type NativePlaybackAction =
   | "open"
+  | "audible"
   | "progress"
   | "end"
   | "interrupt";
@@ -23,6 +25,7 @@ export type NativePlaybackEventRequest = {
   output_epoch: number;
   media_session_id: string;
   start_ms?: number;
+  audible_ms?: number;
   played_ms?: number;
   interval_ms?: number;
   phase?: Playback["phase"];
@@ -38,15 +41,163 @@ type NativeOutputPlayerOptions = {
   createContext?: () => AudioContext;
 };
 
+class NativePcmPlayer {
+  private context?: AudioContext;
+  private analyser?: AnalyserNode;
+  private samples?: Uint8Array<ArrayBuffer>;
+  private sources: AudioBufferSourceNode[] = [];
+  private raf = 0;
+  private audibleTimer?: ReturnType<typeof setTimeout>;
+  private dead = false;
+  private started = false;
+  private closed = true;
+  private playing = false;
+  private current?: { id: string; epoch: number; response_id: string; media_session_id: string };
+  private lastFeedbackAt = 0;
+  private startAt = 0;
+
+  constructor(
+    private readonly emit: (value: Playback) => void,
+    private readonly createContext: () => AudioContext,
+  ) {}
+
+  async start(
+    source: NativePcmSource,
+    identity: { id: string; epoch: number; response_id: string; media_session_id: string },
+  ): Promise<void> {
+    if (this.dead || this.started) {
+      throw new Error("每个播放窗口只能启动一次；请创建新播放器实例和epoch");
+    }
+    this.started = true;
+    this.current = identity;
+    this.closed = false;
+    try {
+      this.context = this.createContext();
+      this.analyser = this.context.createAnalyser();
+      this.samples = new Uint8Array(this.analyser.fftSize) as Uint8Array<ArrayBuffer>;
+      this.analyser.connect(this.context.destination);
+      await this.context.resume();
+      if (this.dead || this.closed || this.current !== identity) return;
+
+      let nextTime = this.context.currentTime + 0.02;
+      let first = true;
+      let lastSource: AudioBufferSourceNode | undefined;
+      for await (const chunk of source.chunks) {
+        if (this.dead || this.closed || this.current !== identity) return;
+        if (source.channels !== 1) throw new Error("PCM播放仅支持mono");
+        const bytes = new Uint8Array(chunk.data);
+        if (bytes.byteLength === 0 || bytes.byteLength % 2 !== 0) {
+          throw new Error("PCM chunk必须是16-bit mono帧");
+        }
+        const frames = bytes.byteLength / 2;
+        const buffer = this.context.createBuffer(1, frames, source.sample_rate);
+        const channel = buffer.getChannelData(0);
+        const view = new DataView(chunk.data);
+        for (let index = 0; index < frames; index += 1) {
+          channel[index] = view.getInt16(index * 2, true) / 32768;
+        }
+        const node = this.context.createBufferSource();
+        node.buffer = buffer;
+        node.connect(this.analyser);
+        node.start(nextTime);
+        nextTime += frames / source.sample_rate;
+        if (first) {
+          this.startAt = nextTime - frames / source.sample_rate;
+          this.audibleTimer = setTimeout(() => {
+            this.audibleTimer = undefined;
+            this.feedback("playing");
+          }, 20);
+          first = false;
+        }
+        lastSource = node;
+        this.sources.push(node);
+      }
+      if (!lastSource) throw new Error("PCM source不包含音频帧");
+      lastSource.onended = () => this.feedback("drained");
+    } catch {
+      if (!this.dead && !this.closed && this.current === identity) {
+        this.feedback("error");
+      }
+      throw new Error("PCM流未能播放；请检查音频格式后重试");
+    }
+  }
+
+  stop(): void {
+    if (this.dead) return;
+    const previous = this.current;
+    this.current = undefined;
+    this.closed = true;
+    this.playing = false;
+    if (this.audibleTimer !== undefined) clearTimeout(this.audibleTimer);
+    cancelAnimationFrame(this.raf);
+    for (const source of this.sources) source.stop();
+    if (previous) this.emitFeedback(previous, "cancel", 0);
+  }
+
+  async destroy(): Promise<void> {
+    if (this.dead) return;
+    this.stop();
+    this.dead = true;
+    this.sources = [];
+    try {
+      await this.context?.close();
+    } catch {
+      throw new Error("播放器视觉反馈已停止，但AudioContext关闭失败；可刷新预览后重试");
+    }
+  }
+
+  private feedback(phase: Playback["phase"]): void {
+    if (this.dead || this.closed || !this.current) return;
+    this.playing = phase === "playing";
+    if (["drained", "cancel", "error"].includes(phase)) this.closed = true;
+    cancelAnimationFrame(this.raf);
+    this.emitFeedback(this.current, phase, 0);
+    if (this.playing) this.frame();
+  }
+
+  private emitFeedback(
+    identity: { id: string; epoch: number; response_id: string; media_session_id: string },
+    phase: Playback["phase"],
+    amplitude: number,
+  ): void {
+    const now = performance.now();
+    const interval_ms = this.lastFeedbackAt ? Math.max(0, now - this.lastFeedbackAt) : 0;
+    this.lastFeedbackAt = now;
+    const elapsedSeconds = this.context ? Math.max(0, this.context.currentTime - this.startAt) : 0;
+    this.emit({
+      playback_id: identity.id,
+      output_epoch: identity.epoch,
+      response_id: identity.response_id,
+      media_session_id: identity.media_session_id,
+      phase,
+      progress: elapsedSeconds,
+      played_ms: Math.round(elapsedSeconds * 1000),
+      interval_ms,
+      amplitude,
+      source: "real",
+    });
+  }
+
+  private frame = (): void => {
+    if (this.dead || this.closed || !this.current || !this.playing || !this.analyser || !this.samples) return;
+    this.analyser.getByteTimeDomainData(this.samples);
+    const sum = this.samples.reduce((total, byte) => total + ((byte - 128) / 128) ** 2, 0);
+    const amplitude = Math.sqrt(sum / this.samples.length);
+    this.emitFeedback(this.current, "playing", Math.max(0, Math.min(1, amplitude)));
+    this.raf = requestAnimationFrame(this.frame);
+  };
+}
+
 export class NativeOutputPlayer {
   private closed = false;
   private attached = false;
   private started = false;
-  private player?: LocalPlayer;
+  private player?: LocalPlayer | NativePcmPlayer;
   private pendingFeedback: Playback[] = [];
   private lastProgressPhase?: Playback["phase"];
   private suppressingProgressEcho = false;
   private producerSeq = 0;
+  private audibleEmitted = false;
 
   constructor(private readonly options: NativeOutputPlayerOptions) {}
 
@@ -63,7 +214,7 @@ export class NativeOutputPlayer {
     this.attached = true;
   }
 
-  async start(file: File, start_ms: number): Promise<void> {
+  async start(input: File | NativePcmSource, start_ms: number): Promise<void> {
     if (!this.attached || this.closed) {
       throw new Error("播放窗口未接受当前real输出");
     }
@@ -71,17 +222,28 @@ export class NativeOutputPlayer {
       throw new Error("每个播放实例只能启动一次");
     }
 
-    this.player = new LocalPlayer((feedback) => this.handleFeedback(feedback), {
-      audio: this.options.audio,
-      createContext: this.options.createContext,
-    });
+    const identity = {
+      id: this.options.identity.playback_id,
+      epoch: this.options.identity.output_epoch,
+      response_id: this.options.identity.response_id,
+      media_session_id: this.options.identity.media_session_id,
+    };
     try {
-      await this.player.start(file, {
-        id: this.options.identity.playback_id,
-        epoch: this.options.identity.output_epoch,
-        response_id: this.options.identity.response_id,
-        media_session_id: this.options.identity.media_session_id,
-      });
+      if (isNativePcmSource(input)) {
+        const pcmPlayer = new NativePcmPlayer(
+          (feedback) => this.handleFeedback(feedback),
+          this.options.createContext ?? (() => new AudioContext()),
+        );
+        this.player = pcmPlayer;
+        await pcmPlayer.start(input, identity);
+      } else {
+        const localPlayer = new LocalPlayer((feedback) => this.handleFeedback(feedback), {
+          audio: this.options.audio,
+          createContext: this.options.createContext,
+        });
+        this.player = localPlayer;
+        await localPlayer.start(input, identity);
+      }
       this.started = true;
       this.emit({
         action: "open",
@@ -100,8 +262,8 @@ export class NativeOutputPlayer {
   }
 
   async destroy(): Promise<void> {
-    await this.player?.destroy();
     this.close();
+    await this.player?.destroy();
   }
 
   close(): void {
@@ -135,6 +297,14 @@ export class NativeOutputPlayer {
   }
 
   private emitPlaybackFeedback(feedback: Playback): void {
+    if (feedback.phase === "playing" && !this.audibleEmitted) {
+      this.audibleEmitted = true;
+      this.emit({
+        action: "audible",
+        audible_ms: feedback.played_ms,
+      });
+      return;
+    }
     if (feedback.phase === "drained") {
       this.emit({
         action: "end",
@@ -155,8 +325,8 @@ export class NativeOutputPlayer {
     }
     if (feedback.phase === "error") {
       this.emit({
-        action: "end",
-        scope: "unknown",
+        action: "interrupt",
+        reason: "error",
         played_ms: feedback.played_ms,
       });
       this.close();

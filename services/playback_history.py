@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID, uuid5
 
 from services.behavior_events import (
     BehaviorEvent,
@@ -17,6 +17,7 @@ _SCOPES = {"complete", "partial", "unplayed", "unknown"}
 _TERMINAL_EVENT_TYPES = {"voice_playback_ended", "voice_playback_interrupted"}
 _PAGE_SIZE = 1000
 _MAX_EVENTS = 10000
+_EVENT_NAMESPACE = uuid5(UUID(int=0), "hexis:voice-playback")
 
 
 def _fold_played_ms(played_ms: int, payload: dict[str, Any]) -> int:
@@ -48,6 +49,25 @@ def _optional_uuid(value: Any, name: str) -> UUID | None:
     if not isinstance(value, UUID):
         raise ValueError(f"{name} must be a UUID when provided")
     return value
+
+
+def _stable_event_id(
+    identity: PlaybackIdentity, event_type: str, producer_seq: int
+) -> UUID:
+    canonical = json.dumps(
+        {
+            "session_id": str(identity.session_id),
+            "response_id": identity.response_id,
+            "playback_id": identity.playback_id,
+            "output_epoch": identity.output_epoch,
+            "media_session_id": identity.media_session_id,
+            "producer_seq": producer_seq,
+            "event_type": event_type,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return uuid5(_EVENT_NAMESPACE, canonical)
 
 
 @dataclass(frozen=True)
@@ -86,19 +106,20 @@ class PlaybackHistory:
         else:
             producer_seq = _nonnegative(producer_seq, "producer_seq")
             self._producer_seq = max(self._producer_seq, producer_seq)
+        effective_producer_seq = (
+            self._producer_seq if producer_seq is None else producer_seq
+        )
         event = BehaviorEvent(
-            event_id=uuid4(),
+            event_id=_stable_event_id(
+                self._identity, event_type, effective_producer_seq
+            ),
             schema_version=1,
             event_type=event_type,
             stream_id="voice-playback",
             session_id=self._identity.session_id,
             source="voice-playback",
             producer_id="voice-playback-client",
-            producer_seq=(
-                self._producer_seq
-                if producer_seq is None
-                else producer_seq
-            ),
+            producer_seq=effective_producer_seq,
             channel="voice",
             payload={
                 **payload,
@@ -111,7 +132,7 @@ class PlaybackHistory:
             media_session_id=self._identity.media_session_id,
             output_epoch=self._identity.output_epoch,
             turn_id=self._identity.turn_id,
-            ts=datetime.now(timezone.utc),
+            ts=None,
         )
         return await record_behavior_event(self._pool, event)
 
@@ -187,8 +208,8 @@ class PlaybackHistory:
                 limit=_PAGE_SIZE,
                 offset=offset,
             )
-            events.extend(page)
-            if len(page) < _PAGE_SIZE:
+            events.extend(page["events"])
+            if not page["has_more"]:
                 break
         receipts = [
             event

@@ -18,10 +18,13 @@ pytestmark = [pytest.mark.asyncio(loop_scope="function")]
 
 
 class FakeWebSocket:
-    def __init__(self, incoming: list[dict]):
+    def __init__(self, incoming: list[dict | BaseException]):
         self.incoming: asyncio.Queue[str] = asyncio.Queue()
         for value in incoming:
-            self.incoming.put_nowait(json.dumps(value))
+            if isinstance(value, BaseException):
+                self.incoming.put_nowait(value)
+            else:
+                self.incoming.put_nowait(json.dumps(value))
         self.sent: list[dict] = []
         self.closed = False
 
@@ -29,14 +32,17 @@ class FakeWebSocket:
         self.sent.append(json.loads(message))
 
     async def recv(self) -> str:
-        return await self.incoming.get()
+        value = await self.incoming.get()
+        if isinstance(value, BaseException):
+            raise value
+        return value
 
     async def close(self) -> None:
         self.closed = True
 
 
 def make_client(
-    incoming: list[dict],
+    incoming: list[dict | BaseException],
     *,
     connect_factory=None,
     endpoint: str = "wss://qwen.example/realtime",
@@ -322,4 +328,22 @@ async def test_connection_failure_preserves_structured_error():
         await client.connect("稳定层")
 
     assert error.value.endpoint == "wss://qwen.example/realtime"
+    assert error.value.__cause__ is failure
+
+
+async def test_receive_failure_raises_structured_error_to_event_consumer():
+    failure = OSError("connection closed before terminal event")
+    client, _ = make_client(
+        [
+            {"type": "session.updated", "session": {"id": "qwen-1"}},
+            failure,
+        ]
+    )
+    await client.connect("稳定层")
+
+    with pytest.raises(QwenRealtimeProtocolError) as error:
+        async for _event in client.events():
+            pass
+
+    assert "connection closed before terminal event" in str(error.value)
     assert error.value.__cause__ is failure

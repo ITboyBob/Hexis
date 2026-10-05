@@ -1,6 +1,7 @@
 import json
 from uuid import uuid4
 
+import asyncpg
 import pytest
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
@@ -100,6 +101,59 @@ async def test_background_task_lifecycle_and_execution_guard(db_pool):
                 )
                 is None
             )
+        finally:
+            await transaction.rollback()
+
+
+async def test_same_command_id_conflict_fails_loud(db_pool):
+    async with db_pool.acquire() as conn:
+        transaction = conn.transaction()
+        await transaction.start()
+        try:
+            session_id = await conn.fetchval(
+                "INSERT INTO chat_sessions DEFAULT VALUES RETURNING id"
+            )
+            other_session_id = await conn.fetchval(
+                "INSERT INTO chat_sessions DEFAULT VALUES RETURNING id"
+            )
+            command_id = uuid4()
+            input_value = {"instruction": "测试任务", "success_criteria": "text"}
+            task_id = await conn.fetchval(
+                "SELECT create_background_task($1::uuid, $2::uuid, $3::jsonb)",
+                session_id,
+                command_id,
+                json.dumps(input_value),
+            )
+
+            with pytest.raises(asyncpg.RaiseError, match="command_id conflict"):
+                async with conn.transaction():
+                    await conn.fetchval(
+                        "SELECT create_background_task($1::uuid, $2::uuid, $3::jsonb)",
+                        other_session_id,
+                        command_id,
+                        json.dumps(input_value),
+                    )
+            with pytest.raises(asyncpg.RaiseError, match="command_id conflict"):
+                async with conn.transaction():
+                    await conn.fetchval(
+                        "SELECT create_background_task($1::uuid, $2::uuid, $3::jsonb)",
+                        session_id,
+                        command_id,
+                        json.dumps(
+                            {
+                                "instruction": "不同任务",
+                                "success_criteria": "text",
+                            }
+                        ),
+                    )
+
+            retry_id = await conn.fetchval(
+                "SELECT create_background_task($1::uuid, $2::uuid, $3::jsonb)",
+                session_id,
+                command_id,
+                json.dumps(input_value),
+            )
+            assert str(retry_id) == str(task_id)
         finally:
             await transaction.rollback()
 

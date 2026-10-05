@@ -50,3 +50,15 @@ def test_a_group_on_a_primary_surface_is_not_treated_as_private():
     # Surface alone does not confer principal status; a shared room never does.
     block = render_interlocutor_block(interlocutor=None, surface="api", is_group=True)
     assert "**This is not your primary user.**" in block
+
+
+def test_background_is_an_autonomous_task_context_on_behalf_of_the_primary_user():
+    block = render_interlocutor_block(
+        interlocutor=None,
+        surface="background",
+        is_group=False,
+    )
+
+    assert "autonomous task context" in block
+    assert "on behalf of your primary user" in block
+    assert "not your primary user" not in block

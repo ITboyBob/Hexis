@@ -30,10 +30,11 @@ BEGIN
 
     -- The relational natural-key upsert runs first and takes the same-key row
     -- lock; the AGE write rides the same transaction so the two substrates
-    -- cannot diverge. A CONTRADICTS report also clears any legacy reverse key.
+    -- cannot diverge. A CONTRADICTS report clears any legacy reverse key; the
+    -- canonical key itself is upsert-merged (never reset), mirroring the AGE
+    -- MERGE accumulation so repeated reports keep both substrates identical.
     IF p_relationship_type = 'CONTRADICTS' THEN
-        PERFORM delete_memory_edge('memory', p_to_id::text, 'CONTRADICTS', 'memory', p_from_id::text);
-        PERFORM delete_memory_edge('memory', p_from_id::text, 'CONTRADICTS', 'memory', p_to_id::text);
+        PERFORM delete_memory_edge('memory', v_to::text, 'CONTRADICTS', 'memory', v_from::text);
     END IF;
     PERFORM upsert_memory_edge(v_from, v_to, p_relationship_type, v_props);
 
@@ -1638,3 +1639,538 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+
+-- ============================================================================
+-- One-time stock cleanup. Same transaction as the mirrors above: any failure
+-- rolls the whole migration back (functions + data + edges + bookkeeping).
+-- Deterministic rules (plan §8): keep newest per legit group, merge edge
+-- properties rel-first then AGE-by-graphid, never invent AGE edges for
+-- rel-only keys, snapshot before-state once, and report every count.
+-- ============================================================================
+DO $bob96$
+DECLARE
+    v_uuid_re CONSTANT TEXT := '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
+    v_dup RECORD;
+    v_grp RECORD;
+    v_edge RECORD;
+    v_rel RECORD;
+    v_row RECORD;
+    v_arch memories%ROWTYPE;
+    v_ret memories%ROWTYPE;
+    v_final JSONB;
+    v_set TEXT;
+    v_w FLOAT;
+    v_src_label TEXT; v_src_prop TEXT;
+    v_dst_label TEXT; v_dst_prop TEXT;
+    v_before JSONB;
+    v_sup UUID;
+    v_filed JSONB;
+    v_conf FLOAT;
+    v_tension TEXT;
+    v_window FLOAT;
+    v_ids UUID[];
+    v_times TIMESTAMPTZ[];
+    i INT; j INT; n INT;
+    c_age_groups INT := 0; c_age_deleted INT := 0; c_age_rebuilt INT := 0;
+    c_age_clean INT := 0; c_age_skipped INT := 0;
+    c_rel_merged INT := 0; c_rel_skipped INT := 0;
+    c_obs_candidates INT := 0; c_obs_invalid INT := 0;
+    c_obs_kept INT := 0; c_obs_archived INT := 0;
+    c_boot_new INT := 0; c_boot_existing INT := 0; c_boot_terminal INT := 0;
+    c_boot_rejected INT := 0; c_boot_terminal_pending INT := 0;
+BEGIN
+    ------------------------------------------------------------------
+    -- 0) Pre-checks: unique node identity, no future created_at on
+    --    candidates. Any violation fails the whole migration loudly.
+    ------------------------------------------------------------------
+    FOR v_dup IN
+        SELECT btrim(k::text, '"') AS key, count(*) AS n
+        FROM ag_catalog.cypher('memory_graph', $q$
+            MATCH (m:MemoryNode) WHERE m.memory_id IS NOT NULL RETURN m.memory_id
+        $q$) AS (k agtype)
+        GROUP BY 1 HAVING count(*) > 1
+    LOOP
+        RAISE EXCEPTION
+            'migration_0252: duplicate MemoryNode identity for memory_id % (% nodes)',
+            v_dup.key, v_dup.n;
+    END LOOP;
+    FOR v_dup IN
+        SELECT btrim(k::text, '"') AS key, count(*) AS n
+        FROM ag_catalog.cypher('memory_graph', $q$
+            MATCH (c:ConceptNode) WHERE c.name IS NOT NULL RETURN c.name
+        $q$) AS (k agtype)
+        GROUP BY 1 HAVING count(*) > 1
+    LOOP
+        RAISE EXCEPTION
+            'migration_0252: duplicate ConceptNode identity for name % (% nodes)',
+            v_dup.key, v_dup.n;
+    END LOOP;
+    IF (SELECT count(*) FROM ag_catalog.cypher('memory_graph', $q$
+            MATCH (s:SelfNode) RETURN s $q$) AS (s agtype)) > 1 THEN
+        RAISE EXCEPTION 'migration_0252: ambiguous SelfNode identity (multiple SelfNode nodes)';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM memories
+        WHERE type = 'strategic' AND status = 'active'
+          AND created_at > CURRENT_TIMESTAMP
+          AND metadata->'supporting_evidence'->>'kind' IN
+              ('relationship_change', 'contradiction', 'consolidation')
+    ) THEN
+        RAISE EXCEPTION
+            'migration_0252: illegal future created_at on active strategic observation(s)';
+    END IF;
+
+    ------------------------------------------------------------------
+    -- 1) AGE target edges: group by natural key, merge properties
+    --    deterministically, keep one canonical representative edge.
+    --    Scope: MemoryNode-MemoryNode CONTRADICTS/ASSOCIATED,
+    --    MemoryNode->ConceptNode INSTANCE_OF, SelfNode->ConceptNode
+    --    ASSOCIATED. Nothing else is touched.
+    ------------------------------------------------------------------
+    DROP TABLE IF EXISTS pg_temp._b96_age;
+    CREATE TEMP TABLE _b96_age ON COMMIT DROP AS
+    SELECT
+        e.eid::text::bigint AS eid,
+        btrim(e.la::text, '"') AS la,
+        CASE WHEN COALESCE(e.pa::text, '') IN ('', 'null') THEN '{}'::jsonb
+             ELSE (e.pa::text)::jsonb END AS pa,
+        btrim(e.lb::text, '"') AS lb,
+        CASE WHEN COALESCE(e.pb::text, '') IN ('', 'null') THEN '{}'::jsonb
+             ELSE (e.pb::text)::jsonb END AS pb,
+        btrim(e.rt::text, '"') AS rt,
+        CASE WHEN COALESCE(e.pr::text, '') IN ('', 'null') THEN '{}'::jsonb
+             ELSE (e.pr::text)::jsonb END AS props
+    FROM ag_catalog.cypher('memory_graph', $q$
+        MATCH (a)-[r]->(b)
+        WHERE (type(r) IN ['CONTRADICTS','ASSOCIATED'] AND label(a)='MemoryNode' AND label(b)='MemoryNode')
+           OR (type(r)='INSTANCE_OF' AND label(a)='MemoryNode' AND label(b)='ConceptNode')
+           OR (type(r)='ASSOCIATED' AND label(a)='SelfNode' AND label(b)='ConceptNode')
+        RETURN id(r), label(a), properties(a), label(b), properties(b), type(r), properties(r)
+    $q$) AS e(eid agtype, la agtype, pa agtype, lb agtype, pb agtype, rt agtype, pr agtype);
+
+    ALTER TABLE _b96_age
+        ADD COLUMN src_type TEXT, ADD COLUMN src_key TEXT,
+        ADD COLUMN dst_type TEXT, ADD COLUMN dst_key TEXT,
+        ADD COLUMN group_key TEXT, ADD COLUMN is_canonical BOOLEAN;
+
+    UPDATE _b96_age SET
+        src_type = (_memory_edge_node_ref(la, pa))[1],
+        src_key  = (_memory_edge_node_ref(la, pa))[2],
+        dst_type = (_memory_edge_node_ref(lb, pb))[1],
+        dst_key  = (_memory_edge_node_ref(lb, pb))[2];
+
+    UPDATE _b96_age SET
+        group_key = CASE
+            WHEN rt = 'CONTRADICTS' AND src_type = 'memory' AND dst_type = 'memory'
+                THEN 'CONTRADICTS|' || LEAST(src_key, dst_key) || '|' || GREATEST(src_key, dst_key)
+            ELSE src_type || '|' || src_key || '|' || rt || '|' || dst_type || '|' || dst_key
+        END,
+        is_canonical = CASE
+            WHEN rt = 'CONTRADICTS' AND src_type = 'memory' AND dst_type = 'memory'
+                THEN src_key < dst_key
+            ELSE TRUE
+        END
+    WHERE src_key IS NOT NULL AND dst_key IS NOT NULL
+      AND btrim(src_key) <> '' AND btrim(dst_key) <> '';
+
+    SELECT count(*) INTO c_age_skipped FROM _b96_age WHERE group_key IS NULL;
+
+    DROP TABLE IF EXISTS pg_temp._b96_groups;
+    CREATE TEMP TABLE _b96_groups ON COMMIT DROP AS
+    SELECT group_key,
+           max(rt) AS rt,
+           max(src_type) AS src_type,
+           max(dst_type) AS dst_type,
+           CASE WHEN max(rt) = 'CONTRADICTS'
+                THEN LEAST(min(src_key), min(dst_key)) ELSE min(src_key) END AS c_src,
+           CASE WHEN max(rt) = 'CONTRADICTS'
+                THEN GREATEST(max(src_key), max(dst_key)) ELSE max(dst_key) END AS c_dst,
+           count(*) AS n_edges,
+           (array_agg(eid ORDER BY is_canonical DESC, eid ASC))[1] AS rep_eid,
+           (array_agg(props ORDER BY is_canonical DESC, eid ASC))[1] AS rep_props,
+           bool_or(is_canonical) AS has_canonical
+    FROM _b96_age
+    WHERE group_key IS NOT NULL
+    GROUP BY group_key;
+
+    FOR v_grp IN SELECT * FROM _b96_groups ORDER BY group_key
+    LOOP
+        c_age_groups := c_age_groups + 1;
+
+        -- Final properties: matching memory_edges first (updated_at ASC,
+        -- id ASC), then AGE edges by graphid ASC (AGE wins conflicts).
+        v_final := '{}'::jsonb;
+        FOR v_rel IN
+            SELECT me.properties
+            FROM memory_edges me
+            WHERE (v_grp.rt = 'CONTRADICTS'
+                   AND me.rel_type = 'CONTRADICTS'
+                   AND me.src_type = 'memory' AND me.dst_type = 'memory'
+                   AND ((me.src_id = v_grp.c_src AND me.dst_id = v_grp.c_dst)
+                        OR (me.src_id = v_grp.c_dst AND me.dst_id = v_grp.c_src)))
+               OR (v_grp.rt <> 'CONTRADICTS'
+                   AND me.src_type = v_grp.src_type AND me.src_id = v_grp.c_src
+                   AND me.rel_type = v_grp.rt
+                   AND me.dst_type = v_grp.dst_type AND me.dst_id = v_grp.c_dst)
+            ORDER BY me.updated_at ASC, me.id ASC
+        LOOP
+            v_final := v_final || v_rel.properties;
+        END LOOP;
+        FOR v_edge IN
+            SELECT props FROM _b96_age WHERE group_key = v_grp.group_key ORDER BY eid ASC
+        LOOP
+            v_final := v_final || v_edge.props;
+        END LOOP;
+
+        BEGIN
+            v_w := COALESCE((v_final->>'strength')::float,
+                            (v_final->>'confidence')::float, 1.0);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE EXCEPTION
+                'migration_0252: unparseable strength/confidence in edge group %',
+                v_grp.group_key;
+        END;
+
+        -- Already-normalized groups are skipped so a replay is a true no-op.
+        IF v_grp.n_edges = 1 AND v_grp.has_canonical
+           AND v_grp.rep_props = v_final
+           AND EXISTS (
+               SELECT 1 FROM memory_edges me
+               WHERE me.src_type = v_grp.src_type AND me.src_id = v_grp.c_src
+                 AND me.rel_type = v_grp.rt
+                 AND me.dst_type = v_grp.dst_type AND me.dst_id = v_grp.c_dst
+                 AND me.properties = v_final
+                 AND me.weight = v_w
+                 AND me.kind IS NOT DISTINCT FROM v_final->>'kind'
+                 AND me.source IS NOT DISTINCT FROM v_final->>'source'
+           )
+        THEN
+            c_age_clean := c_age_clean + 1;
+            CONTINUE;
+        END IF;
+
+        FOR v_edge IN
+            SELECT eid FROM _b96_age WHERE group_key = v_grp.group_key ORDER BY eid
+        LOOP
+            EXECUTE format(
+                'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
+                    MATCH ()-[r]->() WHERE id(r) = %s DELETE r
+                $q$) AS (v agtype)', v_edge.eid);
+            c_age_deleted := c_age_deleted + 1;
+        END LOOP;
+
+        IF v_grp.rt = 'CONTRADICTS' THEN
+            DELETE FROM memory_edges
+            WHERE rel_type = 'CONTRADICTS' AND src_type = 'memory' AND dst_type = 'memory'
+              AND ((src_id = v_grp.c_src AND dst_id = v_grp.c_dst)
+                OR (src_id = v_grp.c_dst AND dst_id = v_grp.c_src));
+        ELSE
+            DELETE FROM memory_edges
+            WHERE src_type = v_grp.src_type AND src_id = v_grp.c_src
+              AND rel_type = v_grp.rt
+              AND dst_type = v_grp.dst_type AND dst_id = v_grp.c_dst;
+        END IF;
+
+        -- Rebuild one canonical representative (CONTRADICTS: LEAST->GREATEST).
+        v_set := NULL;
+        SELECT string_agg(format('r.`%s` = %s', replace(k, '`', ''), val::text), ', ')
+          INTO v_set
+          FROM jsonb_each(v_final) AS x(k, val);
+
+        v_src_label := CASE v_grp.src_type
+            WHEN 'memory' THEN 'MemoryNode' WHEN 'concept' THEN 'ConceptNode'
+            WHEN 'self' THEN 'SelfNode' END;
+        v_src_prop  := CASE v_grp.src_type
+            WHEN 'memory' THEN 'memory_id' WHEN 'concept' THEN 'name' END;
+        v_dst_label := CASE v_grp.dst_type
+            WHEN 'memory' THEN 'MemoryNode' WHEN 'concept' THEN 'ConceptNode'
+            WHEN 'self' THEN 'SelfNode' END;
+        v_dst_prop  := CASE v_grp.dst_type
+            WHEN 'memory' THEN 'memory_id' WHEN 'concept' THEN 'name' END;
+
+        IF v_grp.src_type = 'self' THEN
+            EXECUTE format(
+                'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
+                    MATCH (a:SelfNode), (b:%s {%s: %L})
+                    MERGE (a)-[r:%s]->(b) %s RETURN r
+                $q$) AS (v agtype)',
+                v_dst_label, v_dst_prop, v_grp.c_dst, v_grp.rt,
+                CASE WHEN v_set IS NULL THEN '' ELSE 'SET ' || v_set END);
+        ELSE
+            EXECUTE format(
+                'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
+                    MATCH (a:%s {%s: %L}), (b:%s {%s: %L})
+                    MERGE (a)-[r:%s]->(b) %s RETURN r
+                $q$) AS (v agtype)',
+                v_src_label, v_src_prop, v_grp.c_src,
+                v_dst_label, v_dst_prop, v_grp.c_dst, v_grp.rt,
+                CASE WHEN v_set IS NULL THEN '' ELSE 'SET ' || v_set END);
+        END IF;
+        c_age_rebuilt := c_age_rebuilt + 1;
+
+        -- Relational canonical row; weight/kind/source extracted from the
+        -- same final properties with the db/44 mapping.
+        PERFORM upsert_memory_edge(
+            v_grp.src_type, v_grp.c_src, v_grp.rt, v_grp.dst_type, v_grp.c_dst,
+            v_w, v_final->>'kind', v_final->>'source', v_final);
+    END LOOP;
+
+    ------------------------------------------------------------------
+    -- 2) Rel-only CONTRADICTS: fold non-canonical directions into the
+    --    canonical key. No AGE edge is invented for rel-only keys.
+    ------------------------------------------------------------------
+    FOR v_grp IN
+        SELECT me.src_id AS hi, me.dst_id AS lo
+        FROM memory_edges me
+        WHERE me.rel_type = 'CONTRADICTS'
+          AND me.src_type = 'memory' AND me.dst_type = 'memory'
+          AND me.src_id > me.dst_id
+          AND me.src_id ~* v_uuid_re AND me.dst_id ~* v_uuid_re
+        ORDER BY me.src_id, me.dst_id
+    LOOP
+        v_final := '{}'::jsonb;
+        FOR v_rel IN
+            SELECT properties FROM memory_edges
+            WHERE rel_type = 'CONTRADICTS' AND src_type = 'memory' AND dst_type = 'memory'
+              AND ((src_id = v_grp.lo AND dst_id = v_grp.hi)
+                OR (src_id = v_grp.hi AND dst_id = v_grp.lo))
+            ORDER BY updated_at ASC, id ASC
+        LOOP
+            v_final := v_final || v_rel.properties;
+        END LOOP;
+        DELETE FROM memory_edges
+        WHERE rel_type = 'CONTRADICTS' AND src_type = 'memory' AND dst_type = 'memory'
+          AND ((src_id = v_grp.lo AND dst_id = v_grp.hi)
+            OR (src_id = v_grp.hi AND dst_id = v_grp.lo));
+        BEGIN
+            v_w := COALESCE((v_final->>'strength')::float,
+                            (v_final->>'confidence')::float, 1.0);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE EXCEPTION
+                'migration_0252: unparseable strength/confidence in rel-only CONTRADICTS pair %|%',
+                v_grp.lo, v_grp.hi;
+        END;
+        PERFORM upsert_memory_edge('memory', v_grp.lo, 'CONTRADICTS', 'memory', v_grp.hi,
+                                   v_w, v_final->>'kind', v_final->>'source', v_final);
+        c_rel_merged := c_rel_merged + 1;
+    END LOOP;
+    SELECT count(*) INTO c_rel_skipped
+    FROM memory_edges me
+    WHERE me.rel_type = 'CONTRADICTS'
+      AND me.src_type = 'memory' AND me.dst_type = 'memory'
+      AND NOT (me.src_id ~* v_uuid_re AND me.dst_id ~* v_uuid_re);
+
+    ------------------------------------------------------------------
+    -- 3) Strategic observation dedup (exactly the three runtime kinds).
+    --    Keep newest per legit group; archive the rest with a durable
+    --    supersession and a one-time before-snapshot.
+    ------------------------------------------------------------------
+    DROP TABLE IF EXISTS pg_temp._b96_obs;
+    CREATE TEMP TABLE _b96_obs ON COMMIT DROP AS
+    SELECT m.id, m.created_at, m.content, m.metadata,
+           m.metadata->'supporting_evidence' AS ev,
+           m.metadata->'supporting_evidence'->>'kind' AS kind
+    FROM memories m
+    WHERE m.type = 'strategic' AND m.status = 'active'
+      AND (m.valid_until IS NULL OR m.valid_until > CURRENT_TIMESTAMP)
+      AND m.metadata->'supporting_evidence'->>'kind' IN
+          ('relationship_change', 'contradiction', 'consolidation');
+    SELECT count(*) INTO c_obs_candidates FROM _b96_obs;
+
+    ALTER TABLE _b96_obs ADD COLUMN group_key TEXT;
+    UPDATE _b96_obs SET group_key = CASE
+        WHEN kind = 'contradiction'
+             AND (ev->>'memory_a') ~* v_uuid_re AND (ev->>'memory_b') ~* v_uuid_re
+             AND (ev->>'memory_a')::uuid <> (ev->>'memory_b')::uuid
+            THEN 'contradiction|' || LEAST((ev->>'memory_a')::uuid, (ev->>'memory_b')::uuid)
+                 || '|' || GREATEST((ev->>'memory_a')::uuid, (ev->>'memory_b')::uuid)
+        WHEN kind = 'consolidation'
+            THEN 'consolidation|' || (
+                SELECT string_agg(u::text, ',' ORDER BY u)
+                FROM (SELECT DISTINCT x::uuid AS u
+                      FROM jsonb_array_elements_text(ev->'memory_ids') AS t(x)
+                      WHERE x ~* v_uuid_re) d
+                HAVING count(*) >= 2)
+        WHEN kind = 'relationship_change'
+             AND NULLIF(btrim(COALESCE(ev->>'entity', '')), '') IS NOT NULL
+            THEN 'relationship|' || lower(btrim(ev->>'entity'))
+        ELSE NULL
+    END;
+    SELECT count(*) INTO c_obs_invalid FROM _b96_obs WHERE group_key IS NULL;
+
+    DROP TABLE IF EXISTS pg_temp._b96_pairs;
+    CREATE TEMP TABLE _b96_pairs ON COMMIT DROP AS
+    SELECT o.id AS arch_id, k.keep_id, o.kind
+    FROM _b96_obs o
+    JOIN (
+        SELECT group_key, kind,
+               (array_agg(id ORDER BY created_at DESC, id DESC))[1] AS keep_id
+        FROM _b96_obs
+        WHERE group_key IS NOT NULL AND kind IN ('contradiction', 'consolidation')
+        GROUP BY group_key, kind
+        HAVING count(*) > 1
+    ) k ON k.group_key = o.group_key AND k.kind = o.kind
+    WHERE o.id <> k.keep_id;
+
+    -- relationship: same config window as runtime; anchor-based grouping so
+    -- gaps never chain into multi-hour groups.
+    SELECT COALESCE(get_config_float('maintenance.subconscious_relationship_dedup_hours'), 1)
+      INTO v_window;
+    IF v_window IS NULL OR v_window <> v_window
+       OR v_window IN ('Infinity'::float, '-Infinity'::float) OR v_window <= 0 THEN
+        RAISE EXCEPTION
+            'migration_0252: maintenance.subconscious_relationship_dedup_hours must be a positive finite number, got %',
+            v_window;
+    END IF;
+    FOR v_grp IN
+        SELECT group_key,
+               array_agg(id ORDER BY created_at DESC, id DESC) AS ids,
+               array_agg(created_at ORDER BY created_at DESC, id DESC) AS times
+        FROM _b96_obs
+        WHERE kind = 'relationship_change' AND group_key IS NOT NULL
+        GROUP BY group_key
+    LOOP
+        v_ids := v_grp.ids; v_times := v_grp.times;
+        n := array_length(v_ids, 1); i := 1;
+        WHILE i <= n
+        LOOP
+            j := i + 1;
+            WHILE j <= n AND v_times[j] >= v_times[i] - make_interval(secs => v_window * 3600)
+            LOOP
+                INSERT INTO _b96_pairs (arch_id, keep_id, kind)
+                VALUES (v_ids[j], v_ids[i], 'relationship_change');
+                j := j + 1;
+            END LOOP;
+            i := j;
+        END LOOP;
+    END LOOP;
+
+    FOR v_row IN
+        SELECT arch_id, keep_id FROM _b96_pairs ORDER BY arch_id
+    LOOP
+        SELECT * INTO v_ret FROM memories WHERE id = v_row.keep_id FOR UPDATE;
+        IF COALESCE(v_ret.metadata, '{}'::jsonb) #> '{migration_0252,before}' IS NULL THEN
+            v_before := jsonb_build_object(
+                'status', v_ret.status,
+                'embedding_status', v_ret.embedding_status,
+                'embedding_claimed_at', v_ret.embedding_claimed_at,
+                'valid_from', v_ret.valid_from,
+                'valid_until', v_ret.valid_until,
+                'superseded_by', v_ret.superseded_by,
+                'metadata', v_ret.metadata,
+                'valid_from_after',
+                LEAST(COALESCE(v_ret.valid_from, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP));
+            UPDATE memories
+               SET metadata = metadata || jsonb_build_object(
+                       'migration_0252', jsonb_build_object('before', v_before))
+             WHERE id = v_ret.id;
+        END IF;
+
+        SELECT * INTO v_arch FROM memories WHERE id = v_row.arch_id FOR UPDATE;
+        IF COALESCE(v_arch.metadata, '{}'::jsonb) #> '{migration_0252,before}' IS NULL THEN
+            v_before := jsonb_build_object(
+                'status', v_arch.status,
+                'embedding_status', v_arch.embedding_status,
+                'embedding_claimed_at', v_arch.embedding_claimed_at,
+                'valid_from', v_arch.valid_from,
+                'valid_until', v_arch.valid_until,
+                'superseded_by', v_arch.superseded_by,
+                'metadata', v_arch.metadata);
+            UPDATE memories
+               SET metadata = metadata || jsonb_build_object(
+                       'migration_0252', jsonb_build_object('before', v_before))
+             WHERE id = v_arch.id;
+        END IF;
+
+        v_sup := record_supersession(v_row.arch_id, v_row.keep_id,
+                                     '重复观测清理', 'migration_0252', 'active');
+
+        UPDATE memories SET
+            status = 'archived',
+            metadata = metadata || jsonb_build_object(
+                'archived_by', 'migration_0252',
+                'migration_0252', COALESCE(metadata->'migration_0252', '{}'::jsonb)
+                    || jsonb_build_object('supersession_id', to_jsonb(v_sup))),
+            embedding_status = CASE embedding_status
+                WHEN 'pending' THEN 'skipped' WHEN 'in_progress' THEN 'skipped'
+                ELSE embedding_status END,
+            embedding_claimed_at = CASE WHEN embedding_status IN ('pending', 'in_progress')
+                THEN NULL ELSE embedding_claimed_at END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = v_row.arch_id;
+        c_obs_archived := c_obs_archived + 1;
+    END LOOP;
+    SELECT count(*) - c_obs_archived INTO c_obs_kept
+    FROM _b96_obs WHERE group_key IS NOT NULL;
+
+    ------------------------------------------------------------------
+    -- 4) Bootstrap retained contradiction observations into the ledger.
+    --    Real confidence only; existing pending refreshes, terminal pairs
+    --    never reopen, and a terminal+pending pair is flagged for human
+    --    review instead of being silently decided.
+    ------------------------------------------------------------------
+    FOR v_row IN
+        SELECT o.id, o.ev, o.content, o.metadata AS meta,
+               (o.ev->>'memory_a')::uuid AS a, (o.ev->>'memory_b')::uuid AS b
+        FROM _b96_obs o
+        WHERE o.kind = 'contradiction' AND o.group_key IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM _b96_pairs p WHERE p.arch_id = o.id)
+        ORDER BY o.id
+    LOOP
+        IF NOT EXISTS (
+            SELECT 1 FROM memories
+            WHERE id IN (v_row.a, v_row.b)
+              AND type IN ('semantic', 'worldview', 'episodic')
+              AND status = 'active'
+              AND (valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP)
+            HAVING count(*) = 2
+        ) THEN
+            c_boot_rejected := c_boot_rejected + 1;
+            CONTINUE;
+        END IF;
+        v_conf := NULL;
+        BEGIN
+            v_conf := NULLIF(btrim(COALESCE(v_row.ev->>'confidence', '')), '')::float;
+        EXCEPTION WHEN OTHERS THEN v_conf := NULL;
+        END;
+        IF v_conf IS NULL THEN
+            BEGIN
+                v_conf := NULLIF(btrim(COALESCE(v_row.meta->>'confidence_score', '')), '')::float;
+            EXCEPTION WHEN OTHERS THEN v_conf := NULL;
+            END;
+        END IF;
+        v_conf := COALESCE(v_conf, 0.0);
+        v_tension := COALESCE(NULLIF(btrim(COALESCE(v_row.ev->>'tension', '')), ''), v_row.content);
+        v_filed := file_contradiction_case(
+            v_row.a, v_row.b, NULL, v_tension, v_conf, 'subconscious',
+            jsonb_build_object('observation_memory_id', v_row.id,
+                               'bootstrap', 'migration_0252'));
+        IF COALESCE((v_filed->>'created')::boolean, FALSE) THEN
+            c_boot_new := c_boot_new + 1;
+        ELSIF v_filed->>'reason' = 'already_decided' THEN
+            c_boot_terminal := c_boot_terminal + 1;
+            IF EXISTS (
+                SELECT 1 FROM contradiction_cases
+                WHERE LEAST(memory_a, memory_b) = LEAST(v_row.a, v_row.b)
+                  AND GREATEST(memory_a, memory_b) = GREATEST(v_row.a, v_row.b)
+                  AND status = 'pending'
+            ) THEN
+                c_boot_terminal_pending := c_boot_terminal_pending + 1;
+            END IF;
+        ELSIF v_filed->>'case_id' IS NOT NULL THEN
+            c_boot_existing := c_boot_existing + 1;
+        ELSE
+            c_boot_rejected := c_boot_rejected + 1;
+        END IF;
+    END LOOP;
+
+    RAISE NOTICE 'migration_0252: age_groups=% age_deleted=% age_rebuilt=% age_already_clean=% age_unresolvable_skipped=%',
+        c_age_groups, c_age_deleted, c_age_rebuilt, c_age_clean, c_age_skipped;
+    RAISE NOTICE 'migration_0252: rel_only_merged=% rel_unparseable_kept=%',
+        c_rel_merged, c_rel_skipped;
+    RAISE NOTICE 'migration_0252: obs_candidates=% obs_invalid_skipped=% obs_kept=% obs_archived=%',
+        c_obs_candidates, c_obs_invalid, c_obs_kept, c_obs_archived;
+    RAISE NOTICE 'migration_0252: bootstrap_new=% bootstrap_pending_refreshed=% bootstrap_terminal=% bootstrap_terminal_with_stale_pending=% bootstrap_rejected=%',
+        c_boot_new, c_boot_existing, c_boot_terminal, c_boot_terminal_pending, c_boot_rejected;
+END;
+$bob96$;

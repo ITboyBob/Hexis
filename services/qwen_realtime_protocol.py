@@ -18,6 +18,10 @@ _PARTIAL_TRANSCRIPT_EVENTS = {
     "input_audio_transcription.partial",
     "conversation.item.input_audio_transcription.partial",
 }
+_FAILED_TRANSCRIPT_EVENTS = {
+    "input_audio_transcription.failed",
+    "conversation.item.input_audio_transcription.failed",
+}
 
 
 @dataclass(frozen=True)
@@ -29,6 +33,22 @@ class ProtocolEvent:
     transcript: str | None = None
     is_final: bool | None = None
     response_id: str | None = None
+    audio: str | None = None
+    output_index: int | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+def _error_fields(value: dict[str, Any]) -> dict[str, str | None]:
+    error = value.get("error")
+    if isinstance(error, dict):
+        return {
+            "error_code": error.get("code"),
+            "error_message": error.get("message"),
+        }
+    if isinstance(error, str):
+        return {"error_code": None, "error_message": error}
+    return {"error_code": None, "error_message": None}
 
 
 def parse_event(value: dict[str, Any]) -> ProtocolEvent:
@@ -65,12 +85,56 @@ def parse_event(value: dict[str, Any]) -> ProtocolEvent:
             transcript=value.get("transcript"),
             is_final=False,
         )
+    if event_type in _FAILED_TRANSCRIPT_EVENTS:
+        return ProtocolEvent(
+            type="input_transcript_failed",
+            raw=value,
+            item_id=value.get("item_id"),
+            **_error_fields(value),
+        )
+    if event_type == "response.created":
+        response = value.get("response") or {}
+        return ProtocolEvent(
+            type="response.created",
+            raw=value,
+            response_id=response.get("id"),
+        )
+    if event_type == "response.done":
+        response = value.get("response") or {}
+        return ProtocolEvent(
+            type="response.done",
+            raw=value,
+            response_id=response.get("id") or value.get("response_id"),
+        )
+    if event_type == "response.failed":
+        response = value.get("response") or {}
+        error = response.get("error") if isinstance(response, dict) else None
+        error_value = {"error": error} if error is not None else value
+        return ProtocolEvent(
+            type="response.failed",
+            raw=value,
+            response_id=response.get("id") or value.get("response_id"),
+            **_error_fields(error_value),
+        )
+    if event_type == "error":
+        return ProtocolEvent(
+            type="response_failed",
+            raw=value,
+            **_error_fields(value),
+        )
     if event_type in {
         "response.text.delta",
         "response.audio.delta",
-        "response.done",
-        "response.failed",
     }:
+        if event_type == "response.audio.delta":
+            return ProtocolEvent(
+                type=event_type,
+                raw=value,
+                response_id=value.get("response_id"),
+                item_id=value.get("item_id"),
+                output_index=value.get("output_index"),
+                audio=value.get("delta"),
+            )
         return ProtocolEvent(
             type=event_type, raw=value, response_id=value.get("response_id")
         )

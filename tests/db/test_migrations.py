@@ -48,11 +48,17 @@ async def test_migrations_recorded_and_idempotent(db_pool):
         assert "0016_cross_session_fts" in st["applied"]
         assert "0254_behavior_events" in st["applied"]
         assert "0255_background_tasks" in st["applied"]
+        assert "0256_behavior_event_replay_contract" in st["applied"]
+        assert "0257_background_task_command_id_conflict" in st["applied"]
         assert await conn.fetchval(
             "SELECT to_regclass('public.behavior_events') IS NOT NULL"
         )
         assert await conn.fetchval(
             "SELECT to_regprocedure('public.record_behavior_event(uuid,integer,text,text,uuid,text,integer,text,text,text,integer,uuid,text,text,timestamptz,text,text,bigint,text,jsonb)') IS NOT NULL"
+        )
+        assert await conn.fetchval(
+            "SELECT to_regprocedure('public.get_behavior_events(uuid,text,text,uuid,text,text,text,text,integer,integer,jsonb)') IS NOT NULL "
+            "AND to_regprocedure('public.replay_behavior_events(uuid,text,integer,jsonb)') IS NOT NULL"
         )
         assert await conn.fetchval(
             "SELECT to_regclass('public.background_tasks') IS NOT NULL "

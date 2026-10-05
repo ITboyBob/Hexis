@@ -230,9 +230,11 @@ async def test_playback_api_records_real_events_through_shared_history(
         ]
 
     assert [response.status_code for response in responses] == [200, 200, 200]
-    events = await query_behavior_events(
-        db_pool, session_id=identity.session_id, response_id=identity.response_id
-    )
+    events = (
+        await query_behavior_events(
+            db_pool, session_id=identity.session_id, response_id=identity.response_id
+        )
+    )["events"]
     assert [event["producer_seq"] for event in sorted(
         events, key=lambda event: event["producer_seq"]
     )] == [1, 2, 3]
@@ -246,6 +248,41 @@ async def test_playback_api_records_real_events_through_shared_history(
         "played_ms": 900,
         "event_count": 3,
     }
+
+
+async def test_playback_api_retry_deduplicates_with_stable_event_id(
+    db_pool, monkeypatch
+):
+    identity = PlaybackIdentity(
+        session_id=uuid4(),
+        response_id=f"resp-{uuid4()}",
+        playback_id=f"play-{uuid4()}",
+        output_epoch=1,
+        media_session_id=f"media-{uuid4()}",
+    )
+    monkeypatch.setattr(hexis_api, "_pool", db_pool)
+    body = {
+        "action": "open",
+        "session_id": str(identity.session_id),
+        "response_id": identity.response_id,
+        "playback_id": identity.playback_id,
+        "producer_seq": 1,
+        "output_epoch": identity.output_epoch,
+        "media_session_id": identity.media_session_id,
+        "start_ms": 100,
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=hexis_api.app),
+        base_url="http://test",
+    ) as http:
+        first = await http.post("/api/voice/playback", json=body)
+        retry = await http.post("/api/voice/playback", json=body)
+
+    assert first.status_code == 200
+    assert retry.status_code == 200
+    assert first.json()["event_id"] == retry.json()["event_id"]
+    assert first.json()["deduplicated"] is False
+    assert retry.json()["deduplicated"] is True
 
 
 async def test_playback_api_concurrent_requests_keep_producer_stream_order(
@@ -293,9 +330,11 @@ async def test_playback_api_concurrent_requests_keep_producer_stream_order(
         responses = await asyncio.gather(open_request, interrupt_request)
 
     assert [response.status_code for response in responses] == [200, 200]
-    events = await query_behavior_events(
-        db_pool, session_id=identity.session_id, response_id=identity.response_id
-    )
+    events = (
+        await query_behavior_events(
+            db_pool, session_id=identity.session_id, response_id=identity.response_id
+        )
+    )["events"]
     ordered = sorted(events, key=lambda event: event["producer_seq"])
     assert [event["producer_seq"] for event in ordered] == [1, 2]
     assert [event["event_type"] for event in ordered] == [

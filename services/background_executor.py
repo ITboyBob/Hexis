@@ -291,6 +291,79 @@ class BackgroundExecutor:
             raise _TerminalEventError(event_type, exc) from exc
         return True
 
+    async def _replay_terminal_task(
+        self,
+        task: Any,
+        request: BackgroundTaskRequest,
+    ) -> dict[str, Any]:
+        execution_id = task["current_execution_id"]
+        if execution_id is None:
+            raise RuntimeError("terminal background task has no execution identity")
+
+        state = _EventBridgeState(
+            task_id=str(task["id"]),
+            execution_id=str(execution_id),
+            session_id=request.session_id,
+        )
+        event_type = "task_completed" if task["status"] == "completed" else "task_failed"
+        payload: dict[str, Any]
+        if task["status"] == "completed":
+            result = task["result"]
+            if isinstance(result, str):
+                result = json.loads(result)
+            payload = {"result": result or {}}
+        else:
+            payload = {"error": task["error"] or "task_failed"}
+
+        async with self._pool.acquire() as conn:
+            task_id = str(task["id"])
+            existing_event = await conn.fetchval(
+                """
+                SELECT EXISTS(
+                    SELECT 1 FROM behavior_events
+                    WHERE task_id=$1
+                      AND event_type=$2
+                      AND payload->>'execution_id'=$3
+                )
+                """,
+                task_id,
+                event_type,
+                str(execution_id),
+            )
+            state.producer_seq = await conn.fetchval(
+                """
+                SELECT COALESCE(MAX(producer_seq), 0)
+                FROM behavior_events WHERE task_id=$1
+                """,
+                task_id,
+            )
+            turn_id = await conn.fetchval(
+                "SELECT turn_id FROM background_task_executions WHERE id=$1",
+                execution_id,
+            )
+
+        replayed = False
+        if not existing_event:
+            event_turn_id = await self._event_turn_id(turn_id)
+            await self._emit_task_event(
+                state,
+                event_type=event_type,
+                payload=payload,
+                turn_id=event_turn_id,
+            )
+            replayed = True
+
+        succeeded = task["status"] == "completed"
+        return {
+            "task_id": str(task["id"]),
+            "execution_id": str(execution_id),
+            "criteria_met": succeeded,
+            "task_updated": True,
+            "succeeded": succeeded,
+            "existing_terminal": True,
+            "terminal_event_replayed": replayed,
+        }
+
     async def run(self, request: BackgroundTaskRequest) -> dict[str, Any]:
         if request.success_criteria not in _SUCCESS_CRITERIA:
             raise ValueError("unsupported success criteria")
@@ -307,6 +380,24 @@ class BackgroundExecutor:
                     }
                 ),
             )
+            task = await conn.fetchrow(
+                """
+                SELECT id, status, result, error, current_execution_id
+                FROM background_tasks WHERE id=$1
+                """,
+                task_id,
+            )
+            if task["status"] in {"completed", "failed"}:
+                return await self._replay_terminal_task(task, request)
+            if task["status"] == "running":
+                return {
+                    "task_id": str(task["id"]),
+                    "execution_id": str(task["current_execution_id"]),
+                    "criteria_met": False,
+                    "task_updated": False,
+                    "succeeded": False,
+                    "existing_terminal": False,
+                }
             execution_id = await conn.fetchval(
                 "SELECT claim_background_task($1::uuid)", task_id
             )

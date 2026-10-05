@@ -1915,10 +1915,11 @@ BEGIN
 
     -- The relational natural-key upsert runs first and takes the same-key row
     -- lock; the AGE write rides the same transaction so the two substrates
-    -- cannot diverge. A CONTRADICTS report also clears any legacy reverse key.
+    -- cannot diverge. A CONTRADICTS report clears any legacy reverse key; the
+    -- canonical key itself is upsert-merged (never reset), mirroring the AGE
+    -- MERGE accumulation so repeated reports keep both substrates identical.
     IF p_relationship_type = 'CONTRADICTS' THEN
-        PERFORM delete_memory_edge('memory', p_to_id::text, 'CONTRADICTS', 'memory', p_from_id::text);
-        PERFORM delete_memory_edge('memory', p_from_id::text, 'CONTRADICTS', 'memory', p_to_id::text);
+        PERFORM delete_memory_edge('memory', v_to::text, 'CONTRADICTS', 'memory', v_from::text);
     END IF;
     PERFORM upsert_memory_edge(v_from, v_to, p_relationship_type, v_props);
 

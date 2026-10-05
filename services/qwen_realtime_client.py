@@ -68,6 +68,7 @@ class QwenRealtimeClient:
         self._receive_task: asyncio.Task[None] | None = None
         self._session_ready: asyncio.Future[ProtocolEvent] | None = None
         self._events: asyncio.Queue[ProtocolEvent] = asyncio.Queue()
+        self._terminal_error: Exception | None = None
 
     @property
     def websocket(self) -> Any:
@@ -123,6 +124,8 @@ class QwenRealtimeClient:
 
             receive_task = self._require_receive_task()
             if receive_task.done():
+                if self._terminal_error is not None:
+                    raise self._terminal_error
                 receive_task.result()
                 return
             await asyncio.sleep(0)
@@ -187,9 +190,9 @@ class QwenRealtimeClient:
                 logger.warning("未知 Qwen Realtime 事件: %s", exc)
                 continue
             except Exception as exc:
-                self._fail_session(
-                    QwenRealtimeProtocolError(f"Qwen Realtime 消息解析失败: {exc}")
-                )
+                error = QwenRealtimeProtocolError(f"Qwen Realtime 连接中断: {exc}")
+                error.__cause__ = exc
+                self._fail_session(error)
                 return
 
             await self._events.put(event)
@@ -218,5 +221,6 @@ class QwenRealtimeClient:
             self._session_ready.set_result(event)
 
     def _fail_session(self, error: Exception) -> None:
+        self._terminal_error = error
         if self._session_ready is not None and not self._session_ready.done():
             self._session_ready.set_exception(error)

@@ -71,9 +71,11 @@ def _evidence(session_id=None):
 async def test_import_avatar_preview_evidence_maps_and_reports_rejections(db_pool):
     evidence = _evidence()
     summary = await import_avatar_preview_evidence(db_pool, evidence)
-    rows = await query_behavior_events(
-        db_pool, session_id=UUID(evidence["session_id"]), limit=10
-    )
+    rows = (
+        await query_behavior_events(
+            db_pool, session_id=UUID(evidence["session_id"]), limit=10
+        )
+    )["events"]
 
     assert summary["accepted"] == 2
     assert summary["deduplicated"] == 0
@@ -94,9 +96,11 @@ async def test_retrying_avatar_import_deduplicates_without_new_rows(db_pool):
     evidence["events"] = evidence["events"][:2]
     first = await import_avatar_preview_evidence(db_pool, evidence)
     retry = await import_avatar_preview_evidence(db_pool, evidence)
-    rows = await query_behavior_events(
-        db_pool, session_id=UUID(evidence["session_id"]), limit=10
-    )
+    rows = (
+        await query_behavior_events(
+            db_pool, session_id=UUID(evidence["session_id"]), limit=10
+        )
+    )["events"]
 
     assert first["accepted"] == 2
     assert retry["accepted"] == 0
@@ -124,7 +128,9 @@ async def test_real_page_event_ids_import_and_retry_deduplicates(db_pool):
 
     first = await import_avatar_preview_evidence(db_pool, evidence)
     retry = await import_avatar_preview_evidence(db_pool, evidence)
-    rows = await query_behavior_events(db_pool, session_id=session_id, limit=10)
+    rows = (
+        await query_behavior_events(db_pool, session_id=session_id, limit=10)
+    )["events"]
 
     assert first["accepted"] == 3
     assert first["rejected"] == 0
@@ -198,7 +204,9 @@ async def test_playback_events_map_envelope_identity_columns(db_pool):
 
     summary = await import_avatar_preview_evidence(db_pool, evidence)
     rows = sorted(
-        await query_behavior_events(db_pool, session_id=session_id, limit=10),
+        (
+            await query_behavior_events(db_pool, session_id=session_id, limit=10)
+        )["events"],
         key=lambda row: row["producer_seq"],
     )
 

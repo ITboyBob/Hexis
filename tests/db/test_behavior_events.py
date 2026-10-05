@@ -13,7 +13,15 @@ def _json(value):
     return json.loads(value) if isinstance(value, str) else value
 
 
-async def _record(conn, event_id, stream_id, session_id, payload, *, producer_seq=0):
+async def _record(
+    conn,
+    event_id,
+    stream_id,
+    session_id,
+    payload,
+    *,
+    producer_seq=0,
+):
     return _json(
         await conn.fetchval(
             """
@@ -148,5 +156,131 @@ async def test_replay_groups_streams_and_reports_sequence_gaps(db_pool):
                 )
                 == 0
             )
+        finally:
+            await tr.rollback()
+
+
+async def test_get_behavior_events_returns_page_contract_and_stream_order(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            session_id = uuid4()
+            for producer_seq in range(3):
+                await _record(
+                    conn,
+                    uuid4(),
+                    "a",
+                    session_id,
+                    {"type": "control", "action": str(producer_seq)},
+                    producer_seq=producer_seq,
+                )
+
+            page = _json(
+                await conn.fetchval(
+                    "SELECT get_behavior_events($1::uuid, $2, NULL, NULL, NULL, NULL, NULL, NULL, 2)",
+                    session_id,
+                    "a",
+                )
+            )
+
+            assert set(page) == {
+                "events",
+                "has_more",
+                "next_cursor",
+                "truncated",
+                "filter_omitted_count",
+            }
+            assert [event["seq"] for event in page["events"]] == [1, 2]
+            assert page["has_more"] is True
+            assert page["truncated"] is True
+            assert page["next_cursor"] == {"a": 2}
+            assert page["filter_omitted_count"] == 0
+        finally:
+            await tr.rollback()
+
+
+async def test_replay_separates_filter_omissions_from_sequence_gaps(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            session_id = uuid4()
+            other_session_id = uuid4()
+            await _record(
+                conn,
+                uuid4(),
+                "a",
+                session_id,
+                {"type": "control", "action": "one"},
+                producer_seq=0,
+            )
+            await _record(
+                conn,
+                uuid4(),
+                "a",
+                other_session_id,
+                {"type": "control", "action": "omitted"},
+                producer_seq=1,
+            )
+            await _record(
+                conn,
+                uuid4(),
+                "a",
+                session_id,
+                {"type": "control", "action": "three"},
+                producer_seq=2,
+            )
+
+            replay = _json(
+                await conn.fetchval(
+                    "SELECT replay_behavior_events($1::uuid, $2)", session_id, "a"
+                )
+            )
+
+            assert replay["filter_omitted_count"] == 1
+            assert replay["has_more"] is False
+            assert replay["truncated"] is False
+            assert replay["next_cursor"] is None
+            assert [event["seq"] for event in replay["events"]] == [1, 3]
+            assert replay["streams"][0]["sequence_gaps"] == []
+        finally:
+            await tr.rollback()
+
+
+async def test_recorded_at_advances_within_transaction(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            session_id = uuid4()
+            await _record(
+                conn,
+                uuid4(),
+                "a",
+                session_id,
+                {"type": "control", "action": "first"},
+            )
+            await conn.execute("SELECT pg_sleep(0.002)")
+            await _record(
+                conn,
+                uuid4(),
+                "a",
+                session_id,
+                {"type": "control", "action": "second"},
+                producer_seq=1,
+            )
+
+            times = await conn.fetch(
+                """
+                SELECT recorded_at
+                FROM behavior_events
+                WHERE session_id = $1
+                ORDER BY seq
+                """,
+                session_id,
+            )
+
+            assert times[1]["recorded_at"] > times[0]["recorded_at"]
         finally:
             await tr.rollback()

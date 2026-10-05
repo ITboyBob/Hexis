@@ -178,12 +178,14 @@ async def _behavior_events(
     session_id: UUID,
     task_id: UUID,
 ) -> list[dict[str, Any]]:
-    return await query_behavior_events(
-        db_pool,
-        session_id=session_id,
-        task_id=str(task_id),
-        limit=100,
-    )
+    return (
+        await query_behavior_events(
+            db_pool,
+            session_id=session_id,
+            task_id=str(task_id),
+            limit=100,
+        )
+    )["events"]
 
 
 def _tool_summary(
