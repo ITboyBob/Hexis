@@ -22,6 +22,7 @@ from core.tools.base import ToolContext
 from core.tools.config import ContextOverrides
 from services.prompt_resources import (
     compose_compact_personhood_prompt,
+    load_background_conversation_prompt,
     load_conversation_prompt,
     load_heartbeat_agentic_prompt,
     load_heartbeat_task_mode_prompt,
@@ -717,7 +718,12 @@ async def build_system_prompt(
 
     # Base prompt
     if mode == "chat":
-        stable.append(load_conversation_prompt().strip())
+        conversation_prompt = (
+            load_background_conversation_prompt()
+            if surface == "background"
+            else load_conversation_prompt()
+        )
+        stable.append(conversation_prompt.strip())
         if is_group:
             from services.prompt_resources import load_channel_context_prompt
 
@@ -792,7 +798,11 @@ async def build_system_prompt(
             except Exception:
                 available = []
                 logger.debug("Failed to load skill catalog for prompt", exc_info=True)
-        volatile.append(format_skills_prompt(active_skills or [], available or []))
+        volatile.append(
+            format_skills_prompt(
+                active_skills or [], available or [], surface=surface
+            )
+        )
 
     # Energy costs, derived from the actual ToolSpecs of this turn's allowed
     # tools (#44) — never hardcoded prose. Heartbeat only: chat is unbudgeted.
@@ -803,9 +813,13 @@ async def build_system_prompt(
 
     # Personhood modules
     personhood_kind = (
-        "group"
-        if (mode == "chat" and is_group)
-        else ("conversation" if mode == "chat" else "heartbeat")
+        "background"
+        if mode == "chat" and surface == "background"
+        else (
+            "group"
+            if mode == "chat" and is_group
+            else ("conversation" if mode == "chat" else "heartbeat")
+        )
     )
     try:
         personhood = compose_compact_personhood_prompt(personhood_kind)

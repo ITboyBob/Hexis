@@ -129,7 +129,9 @@ async def test_prepare_orders_hydration_continuity_selection_and_record(monkeypa
     assert prepared.session_id == str(session_id)
     assert prepared.history == [{"role": "user", "content": "authoritative history"}]
     assert prepared.selection is selection
-    assert prepared.user_message == "continuity context\n\nmemory context\n\nsummarize this"
+    assert prepared.user_message == (
+        "continuity context\n\nmemory context\n\n[USER MESSAGE]\nsummarize this"
+    )
     assert prepared.user_content[0] == {"type": "input_text", "text": prepared.user_message}
     assert prepared.user_content[2]["type"] == "input_image"
     with pytest.raises(FrozenInstanceError):

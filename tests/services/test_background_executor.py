@@ -302,7 +302,8 @@ async def test_run_explicitly_assembles_real_agent_loop(db_pool, monkeypatch):
     assert "recall" in config.registry.list_names()
     assert "remember" in config.registry.list_names()
     assert captured["user_message"] == (
-        "continuity context\n\nmemory context\n\nsummarize the current context"
+        "continuity context\n\nmemory context\n\n"
+        "[USER MESSAGE]\nsummarize the current context"
     )
 
     async with db_pool.acquire() as conn:

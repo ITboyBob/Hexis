@@ -45,6 +45,21 @@ async def _actual_tool_names(registry: Any) -> set[str]:
     return specified & {str(name) for name in registry.list_names()}
 
 
+def assemble_background_user_content(
+    continuity: str,
+    memory: str,
+    user_message: str,
+    visual_attachments: list[dict[str, Any]] | None = None,
+) -> tuple[str, str | list[dict[str, Any]]]:
+    """Combine rendered DB context with the untouched user request."""
+    assembled = "\n\n".join(
+        part
+        for part in (continuity, memory, f"[USER MESSAGE]\n{user_message}")
+        if part
+    )
+    return assembled, _user_content_with_visuals(assembled, visual_attachments)
+
+
 async def _loop_options(
     pool: Any,
     session_id: str,
@@ -143,13 +158,11 @@ async def prepare_background_turn(
         surface="background",
         prompt_addenda=prompt_addenda,
     )
-    assembled_user_message = "\n\n".join(
-        part
-        for part in (continuity, memory_context, user_message)
-        if part
-    )
-    user_content = _user_content_with_visuals(
-        assembled_user_message, visual_attachments
+    assembled_user_message, user_content = assemble_background_user_content(
+        continuity,
+        memory_context,
+        user_message,
+        visual_attachments,
     )
     resolved_loop_options = await _loop_options(
         pool, session_id, llm_config, loop_options

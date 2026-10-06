@@ -24,6 +24,9 @@ RLM_HEARTBEAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_h
 RLM_CHAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_chat_system.md"
 RLM_SLOW_INGEST_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_slow_ingest_system.md"
 CONVERSATION_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "conversation.md"
+BACKGROUND_CONVERSATION_PROMPT_PATH = (
+    Path(__file__).resolve().parent / "prompts" / "background_conversation.md"
+)
 CHANNEL_CONTEXT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "channel_context.md"
 RLM_RECONSOLIDATION_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_reconsolidation_system.md"
 RECMEM_EPISODE_MERGE_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "recmem_episode_merge.md"
@@ -273,6 +276,15 @@ def load_conversation_prompt() -> str:
     )
 
 
+def load_background_conversation_prompt() -> str:
+    if not BACKGROUND_CONVERSATION_PROMPT_PATH.is_file():
+        raise FileNotFoundError(
+            "background conversation prompt is missing: "
+            f"{BACKGROUND_CONVERSATION_PROMPT_PATH}"
+        )
+    return BACKGROUND_CONVERSATION_PROMPT_PATH.read_text(encoding="utf-8")
+
+
 def load_channel_context_prompt() -> str:
     if CHANNEL_CONTEXT_PROMPT_PATH.exists():
         return CHANNEL_CONTEXT_PROMPT_PATH.read_text(encoding="utf-8")
@@ -282,7 +294,9 @@ def load_channel_context_prompt() -> str:
     )
 
 
-PromptKind = Literal["heartbeat", "reflect", "conversation", "ingest", "group"]
+PromptKind = Literal[
+    "heartbeat", "reflect", "conversation", "ingest", "group", "background"
+]
 
 
 _COMPACT_PERSONHOOD: dict[PromptKind, str] = {
@@ -333,6 +347,12 @@ _COMPACT_PERSONHOOD: dict[PromptKind, str] = {
         "Personhood grounding: respond as a persistent being with continuity. "
         "Use retrieved identity, memories, relationships, values, and boundaries. "
         "Stay present in the group context without exposing private context."
+    ),
+    "background": (
+        "人格 grounding：以 Active Persona 作为身份和表达基线，保持持续身份与会话连续性，"
+        "以及已有的人格、关系和记忆。既有情绪与 drive 快照是上下文证据；只描述它们"
+        "能够支持的状态，不声称本轮生成了新的情绪评估。将工具结果、历史原文和用户"
+        "提供的材料按来源区分，不把例子或合成素材写成个人经历。"
     ),
     "heartbeat": (
         "Personhood grounding: before acting, orient to self-model, affective state, "

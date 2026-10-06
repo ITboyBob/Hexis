@@ -646,6 +646,8 @@ def _uuid_or_none(value: str | None) -> str | None:
 def format_skills_prompt(
     active: list[SkillSpec],
     available: list[SkillSpec] | None = None,
+    *,
+    surface: str = "chat",
 ) -> str:
     """Compact skill section for the system prompt.
 
@@ -653,25 +655,39 @@ def format_skills_prompt(
     fetched on demand via `use_skill`, and tool schemas ride the structured
     tool-calling API, so this block stays flat regardless of skill size.
     """
-    lines = [
-        "## Skills",
-        "Use skills first: capabilities are packaged as skills, and a skill's "
-        "tools are exposed through the tool API only while that skill is active. "
-        "If the task needs a capability that is not active, call `use_skill` with "
-        "the skill's name — it returns the skill's full instructions and unlocks "
-        "its tools for this turn. `list_skills` shows the catalog with bound tools. "
-        "If no existing skill fits a reusable need, call `propose_skill`; it creates "
-        "a reviewable proposal only, not a live skill file.",
-    ]
+    if surface == "background":
+        lines = [
+            "## Skills",
+            "技能提供任务指引。需要完整指令时，用 `use_skill` 读取；"
+            "工具 Schema 通过结构化工具 API 暴露。技能是否被选中不单独决定工具授权，"
+            "每次调用仍受现有 policy、context、permission 检查。",
+        ]
+    else:
+        lines = [
+            "## Skills",
+            "Use skills first: capabilities are packaged as skills, and a skill's "
+            "tools are exposed through the tool API only while that skill is active. "
+            "If the task needs a capability that is not active, call `use_skill` with "
+            "the skill's name — it returns the skill's full instructions and unlocks "
+            "its tools for this turn. `list_skills` shows the catalog with bound tools. "
+            "If no existing skill fits a reusable need, call `propose_skill`; it creates "
+            "a reviewable proposal only, not a live skill file.",
+        ]
     if active:
         lines.append("Active now:\n" + "\n".join(s.to_index_line() for s in active))
     active_names = {s.name for s in active}
     inactive = [s for s in (available or []) if s.name not in active_names]
     if inactive:
-        lines.append(
-            "Available (activate with `use_skill`):\n"
-            + "\n".join(s.to_index_line() for s in inactive)
-        )
+        if surface == "background":
+            lines.append(
+                "可读取的技能说明（用 `use_skill`）：\n"
+                + "\n".join(s.to_index_line() for s in inactive)
+            )
+        else:
+            lines.append(
+                "Available (activate with `use_skill`):\n"
+                + "\n".join(s.to_index_line() for s in inactive)
+            )
     return "\n\n".join(lines)
 
 
