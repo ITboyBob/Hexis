@@ -16,17 +16,37 @@ test.afterAll(async () => {
   services = null;
 });
 
+test.afterEach(async ({ page }) => {
+  const stop = page.getByRole("button", { name: "Stop Talk mode" });
+  if (await stop.isVisible().catch(() => false)) {
+    await stop.click({ timeoutMs: 5_000 });
+    await expect(page.getByRole("button", { name: "Start Talk mode" })).toBeVisible({ timeout: 10_000 });
+  }
+});
+
 test("test-injected WAV becomes contiguous PCM and one utterance range", async ({ page }) => {
   test.setTimeout(120_000);
   const encodedWav = (await readFile(inputWav)).toString("base64");
   const sentFrames: Array<{ payload: string; atMs: number }> = [];
   const receivedTypes: string[] = [];
+  const avatarEvents: Array<{ type: string; seq: number; producerSeq: number; payload: Record<string, unknown> }> = [];
   const socketUrls: string[] = [];
   const browserErrors: string[] = [];
+  const sessionSetupFailures: string[] = [];
   page.on("console", (message) => {
     if (message.type() === "error") browserErrors.push(message.text());
   });
   page.on("pageerror", (error) => browserErrors.push(error.message));
+  page.on("response", async (response) => {
+    if (!response.url().endsWith("/api/voice/realtime/sessions") || response.status() < 400) return;
+    try {
+      const body = await response.json() as { detail?: unknown; error?: unknown };
+      const detail = body.detail ?? body.error;
+      sessionSetupFailures.push(typeof detail === "string" ? detail : `HTTP ${response.status()}`);
+    } catch {
+      sessionSetupFailures.push(`HTTP ${response.status()}`);
+    }
+  });
   await page.context().grantPermissions(["microphone"]);
   await page.addInitScript((wavBase64: string) => {
     (window as Window & { __voiceWavProbe?: Record<string, unknown> }).__voiceWavProbe = {};
@@ -142,11 +162,30 @@ test("test-injected WAV becomes contiguous PCM and one utterance range", async (
     socket.on("framereceived", (frame) => {
       const payload = typeof frame.payload === "string" ? frame.payload : frame.payload.toString();
       try {
-        const value = JSON.parse(payload) as { type?: unknown; kind?: unknown };
+        const value = JSON.parse(payload) as {
+          type?: unknown;
+          kind?: unknown;
+          event?: {
+            event_type?: unknown;
+            seq?: unknown;
+            producer_seq?: unknown;
+            payload?: unknown;
+          };
+        };
         if (typeof value.type === "string") {
           receivedTypes.push(value.type === "generation" && typeof value.kind === "string"
             ? `generation:${value.kind}`
             : value.type);
+        }
+        if (value.type === "event" && typeof value.event?.event_type === "string"
+          && Number.isInteger(value.event.seq) && Number.isInteger(value.event.producer_seq)
+          && value.event.payload && typeof value.event.payload === "object") {
+          avatarEvents.push({
+            type: value.event.event_type,
+            seq: value.event.seq as number,
+            producerSeq: value.event.producer_seq as number,
+            payload: value.event.payload as Record<string, unknown>,
+          });
         }
       } catch {
         receivedTypes.push("non-json");
@@ -175,13 +214,14 @@ test("test-injected WAV becomes contiguous PCM and one utterance range", async (
     .filter((line) => /Realtime input authorization failed|M4 input gate is not ready|M4 voice input gate completed|M4 voice response requested|Realtime output stream failed|HydrationUnavailable|VoiceInstructionError|QwenRealtimeProtocolError/.test(line))
     .map((line) => line.slice(0, 300));
   console.log(`M4 realtime frame types: ${JSON.stringify({ sent: types, received: receivedTypes, serverDiagnostics: serverDiagnosticLines })}`);
+  console.log(`M4 avatar event envelope: ${JSON.stringify(avatarEvents.map(({ type, seq, producerSeq }) => ({ type, seq, producerSeq })))}`);
   await test.info().attach("voice-realtime-frame-types", {
-    body: JSON.stringify({ sent: types, received: receivedTypes }),
+    body: JSON.stringify({ sent: types, received: receivedTypes, avatarEvents }),
     contentType: "application/json",
   });
   expect(
     types.filter((type) => type === "utterance_end"),
-    JSON.stringify({ types, socketUrls, probe, bodyText, browserErrors }),
+    JSON.stringify({ types, socketUrls, probe, bodyText, browserErrors, sessionSetupFailures }),
   ).toHaveLength(1);
 
   const messages = sentFrames.map(({ payload }) => JSON.parse(payload) as Record<string, unknown>);
@@ -214,4 +254,19 @@ test("test-injected WAV becomes contiguous PCM and one utterance range", async (
     createHash("sha256").update(Buffer.concat(pcmParts)).digest("hex"),
   );
   expect(browserErrors).toEqual([]);
+  const committedEvent = avatarEvents.find((event) => event.type === "voice_input_committed");
+  expect(committedEvent).toBeDefined();
+  const committedIdentity = committedEvent?.payload.identity as Record<string, unknown> | undefined;
+  expect(committedIdentity).toMatchObject({
+    session_id: expect.any(String),
+    input_turn_id: expect.any(String),
+    input_order: expect.any(Number),
+    stimulus_revision: expect.any(Number),
+  });
+  expect(avatarEvents.some((event) => event.type === "voice_visual_window")).toBe(true);
+  expect(avatarEvents.some((event) => event.type === "voice_model_call_started")).toBe(true);
+  expect(avatarEvents.every((event, index, events) => index === 0 || event.seq > events[index - 1].seq)).toBe(true);
+  expect(avatarEvents.every((event) => Number.isInteger(event.producerSeq))).toBe(true);
+  await page.getByRole("button", { name: "Stop Talk mode" }).click();
+  await expect(page.getByRole("button", { name: "Start Talk mode" })).toBeVisible();
 });

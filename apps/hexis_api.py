@@ -2760,7 +2760,7 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
     )
     session._response_dispatch = None
     session._input_error_dispatch = None
-    from services.behavior_events import record_behavior_event
+    from services.behavior_events import BehaviorEvent, record_behavior_event
     from services.voice_avatar_events import build_voice_behavior_event, voice_behavior_envelope
 
     async def write_voice_event(

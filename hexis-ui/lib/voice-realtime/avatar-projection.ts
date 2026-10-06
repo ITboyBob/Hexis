@@ -163,6 +163,17 @@ export function applyVoiceBehaviorEvent(
   return state;
 }
 
+export function replayVoiceBehaviorEvents(
+  state: VoiceAvatarState,
+  events: readonly VoiceBehaviorEvent[],
+): VoiceAvatarState {
+  const ordered = [...events].sort((left, right) =>
+    left.stream_id.localeCompare(right.stream_id)
+    || left.seq - right.seq
+    || left.event_id.localeCompare(right.event_id));
+  return ordered.reduce(applyVoiceBehaviorEvent, state);
+}
+
 export function applyLocalPlaybackFeedback(
   state: VoiceAvatarState,
   value: LocalPlayback,

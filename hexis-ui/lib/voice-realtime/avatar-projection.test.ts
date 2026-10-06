@@ -4,6 +4,7 @@ import {
   applyVoiceBehaviorEvent,
   initialVoiceAvatarState,
   projectVoiceAvatar,
+  replayVoiceBehaviorEvents,
 } from "./avatar-projection";
 import type { VoiceBehaviorEvent } from "./avatar-projection";
 
@@ -27,8 +28,9 @@ function event(
     seq,
     session_id: identity.session_id,
     producer_id: "hexis.voice-realtime",
-    producer_seq: seq,
+    producer_seq: seq + 100,
     source: "server",
+    channel: "voice",
     payload,
     media_session_id: "media-1",
   };
@@ -39,6 +41,43 @@ function committed(seq = 1, inputIdentity = identity) {
 }
 
 describe("voice avatar production event projection", () => {
+  it("replays A events by database sequence rather than producer sequence", () => {
+    const events = [
+      committed(1),
+      event(2, "voice_visual_window", {
+        identity,
+        wordset_version: "v1",
+        fact: { status: "open", owner: "service", decision_seq: 0 },
+      }),
+      event(3, "voice_visual_window", {
+        identity,
+        wordset_version: "v1",
+        fact: { status: "accepted", owner: "service", decision_seq: 1 },
+        label: "curious",
+      }),
+      event(4, "voice_model_call_started", {
+        identity,
+        activity_id: "response-1",
+        state: "started",
+      }),
+      event(5, "voice_recall_started", {
+        identity,
+        activity_id: "call-1",
+        state: "started",
+      }),
+    ];
+    const initialState = initialVoiceAvatarState(identity.session_id, "media-1");
+    const live = events.reduce(applyVoiceBehaviorEvent, initialState);
+    const replayed = replayVoiceBehaviorEvents(initialState, [...events].reverse());
+
+    expect(projectVoiceAvatar(replayed)).toEqual(projectVoiceAvatar(live));
+    expect(projectVoiceAvatar(replayed)).toMatchObject({
+      bubble: "recalling",
+      composition: { eye: "curious", pose: "thinking" },
+    });
+    expect(replayed.preview.seq["voice-realtime-session"]).toBe(3);
+  });
+
   it("accepts only the current complete identity and projects recall over thinking", () => {
     let state = initialVoiceAvatarState(identity.session_id, "media-1");
     state = applyVoiceBehaviorEvent(state, committed());

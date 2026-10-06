@@ -35,7 +35,7 @@ from services.voice_context_hydration import hydrate_voice_context
 
 SCHEMA = "voice-m4-probe-v1"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_BASELINE = "e401c3c3ce0b15d4552e8a10d2eb8e5887c107a6"
+EXPECTED_BASELINE = "3aa3dfe8c0135078899622359e524ecb863e69b9"
 _MODES = {"preflight", "protocol", "devices", "calibration"}
 _SELECTED_REALTIME_CONFIG = Path(
     "/Users/itboybob/.cache/hexis/batch3-serial-voice-2026-10-05/config-real-2.json"

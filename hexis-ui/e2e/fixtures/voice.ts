@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { request } from "node:http";
 import { resolve } from "node:path";
+import type { Page } from "@playwright/test";
 
 const root = resolve(process.cwd(), "..");
 const apiHealthUrl = "http://127.0.0.1:43817/health";
@@ -13,6 +14,46 @@ export type VoiceServiceHandle = {
   uiLogs: string[];
   close: () => Promise<void>;
 };
+
+export async function installVoiceWavFeed(
+  page: Page,
+  wavs: Record<string, string>,
+): Promise<void> {
+  await page.context().grantPermissions(["microphone"]);
+  await page.addInitScript((encodedWavs: Record<string, string>) => {
+    let audioContext: AudioContext | null = null;
+    let destination: MediaStreamAudioDestinationNode | null = null;
+    const target = window as Window & {
+      __voiceWavFeed?: { play: (name: string) => Promise<void> };
+    };
+    target.__voiceWavFeed = {
+      async play(name: string): Promise<void> {
+        if (!audioContext || !destination) throw new Error("Talk microphone stream is not ready");
+        const encoded = encodedWavs[name];
+        if (!encoded) throw new Error(`Unknown voice fixture: ${name}`);
+        const bytes = Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0));
+        const buffer = await audioContext.decodeAudioData(bytes.buffer);
+        const source = audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(destination);
+        await new Promise<void>((resolvePlayback, rejectPlayback) => {
+          source.onended = () => resolvePlayback();
+          try {
+            source.start();
+          } catch (error) {
+            rejectPlayback(error);
+          }
+        });
+      },
+    };
+    navigator.mediaDevices.getUserMedia = async () => {
+      audioContext = new AudioContext();
+      await audioContext.resume();
+      destination = audioContext.createMediaStreamDestination();
+      return destination.stream;
+    };
+  }, wavs);
+}
 
 function collectLogs(process: ChildProcess | null, target: string[]): void {
   const append = (chunk: Buffer) => {
