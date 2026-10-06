@@ -77,6 +77,7 @@ describe("TalkMode", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     captureMocks.start.mockClear();
     captureMocks.close.mockClear();
     captureMocks.onBargeIn = undefined;
@@ -312,6 +313,59 @@ describe("TalkMode", () => {
     await waitFor(() => expect(PlaybackContext.instances).toHaveLength(2));
     expect(PlaybackContext.instances[0].close).toHaveBeenCalled();
     expect(PlaybackContext.instances[1].sources).toHaveLength(1);
+    expect(await screen.findByText("Speaking")).toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Stop Talk mode" })));
+  });
+
+  it("首可听时显示Speaking，生成结束后保持到播放完毕才恢复Listening", async () => {
+    await startPlaybackTalk();
+    vi.useFakeTimers();
+    await act(async () => sendOutput("response-1", 0, btoa("\0".repeat(4800))));
+    expect(screen.getByText("Listening")).toBeInTheDocument();
+    await act(async () => vi.advanceTimersByTimeAsync(20));
+    expect(screen.getByText("Speaking")).toBeInTheDocument();
+    expect(screen.queryByText(/Talk is starting/)).not.toBeInTheDocument();
+    await act(async () => sendGeneration("response-1", "done"));
+    expect(screen.getByText("Speaking")).toBeInTheDocument();
+    const context = PlaybackContext.instances[0];
+    context.currentTime = 0.12;
+    await act(async () => context.sources[0].onended?.());
+    expect(screen.getByText("Listening")).toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Stop Talk mode" })));
+    expect(screen.queryByText("Speaking")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start Talk mode" })).toBeInTheDocument();
+  });
+
+  it("说话打断后立即恢复Listening，迟到包不改变状态，下一轮再显示Speaking", async () => {
+    await startPlaybackTalk();
+    vi.useFakeTimers();
+    await act(async () => sendOutput("response-1", 0, btoa("\0".repeat(4800))));
+    await act(async () => vi.advanceTimersByTimeAsync(20));
+    expect(screen.getByText("Speaking")).toBeInTheDocument();
+    await act(async () => captureMocks.onBargeIn?.());
+    expect(screen.getByText("Listening")).toBeInTheDocument();
+    await act(async () => sendOutput("response-1", 1, btoa("\0\0")));
+    expect(screen.getByText("Listening")).toBeInTheDocument();
+    await act(async () => sendOutput("response-2", 0, btoa("\0".repeat(4800))));
+    await act(async () => vi.advanceTimersByTimeAsync(20));
+    expect(screen.getByText("Speaking")).toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Stop Talk mode" })));
+    expect(screen.queryByText("Speaking")).not.toBeInTheDocument();
+  });
+
+  it("某个响应播放结束时，其他仍在播放的响应保持Speaking", async () => {
+    await startPlaybackTalk();
+    vi.useFakeTimers();
+    await act(async () => {
+      sendOutput("response-1", 0, btoa("\0".repeat(4800)));
+      sendOutput("response-2", 0, btoa("\0".repeat(4800)));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(20));
+    await act(async () => sendGeneration("response-1", "done"));
+    PlaybackContext.instances[0].currentTime = 0.12;
+    await act(async () => PlaybackContext.instances[0].sources[0].onended?.());
+    expect(screen.getByText("Speaking")).toBeInTheDocument();
+    await act(async () => sendGeneration("response-2", "failed"));
     expect(screen.getByText("Listening")).toBeInTheDocument();
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Stop Talk mode" })));
   });

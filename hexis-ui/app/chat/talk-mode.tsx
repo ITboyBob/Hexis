@@ -12,7 +12,7 @@ import type { NativePcmSource } from "@/lib/voice-playback/native-output-source"
 import type { NativePlaybackEventRequest } from "@/lib/voice-playback/native-player";
 
 type TalkPhase = "idle" | "connecting" | "listening" | "failed";
-type TalkOutput = { queue: NativeOutputQueue; player: NativeOutputPlayer; failed: boolean };
+type TalkOutput = { queue: NativeOutputQueue; player: NativeOutputPlayer; failed: boolean; speaking: boolean };
 
 async function postPlaybackReceipt(
   endpoint: string,
@@ -50,6 +50,7 @@ export function TalkMode({
   onSessionId?: (sessionId: string) => void;
 }) {
   const [phase, setPhase] = useState<TalkPhase>("idle");
+  const [speaking, setSpeaking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [retryAvailable, setRetryAvailable] = useState(false);
   const clientRef = useRef<VoiceRealtimeClient | null>(null);
@@ -59,6 +60,12 @@ export function TalkMode({
   const activeRef = useRef(false);
   const mountedRef = useRef(true);
   const sessionIdRef = useRef(sessionId);
+
+  const refreshSpeaking = useCallback(() => {
+    if (mountedRef.current) {
+      setSpeaking(activeRef.current && [...outputsRef.current.values()].some((output) => output.speaking));
+    }
+  }, []);
 
   const invalidateResponse = useCallback((responseId: string) => {
     if (invalidatedResponsesRef.current.size >= 256) {
@@ -74,6 +81,7 @@ export function TalkMode({
     const failure = cause instanceof Error ? cause : new Error("Voice output failed. Retry Talk to continue.");
     invalidateResponse(responseId);
     outputsRef.current.delete(responseId);
+    refreshSpeaking();
     output.queue.fail(failure);
     output.player.stop("error");
     void output.player.destroy().catch(() => undefined);
@@ -81,28 +89,30 @@ export function TalkMode({
       setError(failure.message);
       setRetryAvailable(true);
     }
-  }, [invalidateResponse]);
+  }, [invalidateResponse, refreshSpeaking]);
 
   const stopOutputs = useCallback(async () => {
     const outputs = [...outputsRef.current.values()];
     outputsRef.current.clear();
+    refreshSpeaking();
     for (const output of outputs) {
       output.player.stop();
       await output.queue[Symbol.asyncIterator]().return?.();
       await output.player.destroy().catch(() => undefined);
     }
-  }, []);
+  }, [refreshSpeaking]);
 
   const stopOutputsForBargeIn = useCallback(() => {
     const outputs = [...outputsRef.current.entries()];
     outputsRef.current.clear();
+    refreshSpeaking();
     for (const [responseId, output] of outputs) {
       invalidateResponse(responseId);
       output.player.stop("barge_in");
       void output.queue[Symbol.asyncIterator]().return?.();
       void output.player.destroy().catch(() => undefined);
     }
-  }, [invalidateResponse]);
+  }, [invalidateResponse, refreshSpeaking]);
 
   const stopTalk = useCallback(async (message?: string) => {
     activeRef.current = false;
@@ -192,9 +202,14 @@ export function TalkMode({
                 session_id: message.session_id,
                 emit: (event: NativePlaybackEventRequest) => {
                   const endpoint = clientRef.current?.activePlaybackEndpoint ?? "";
+                  if (event.action === "audible" && output) {
+                    output.speaking = true;
+                    refreshSpeaking();
+                  }
                   if (event.action === "end" || event.action === "interrupt") {
                     invalidateResponse(message.response_id);
                     outputsRef.current.delete(message.response_id);
+                    refreshSpeaking();
                     void queue[Symbol.asyncIterator]().return?.();
                     void player.destroy().catch(() => undefined);
                   }
@@ -207,7 +222,7 @@ export function TalkMode({
                 },
               });
               player.attach({ epoch: message.output_epoch, source: "real" });
-              output = { queue, player, failed: false };
+              output = { queue, player, failed: false, speaking: false };
               outputsRef.current.set(message.response_id, output);
               const source: NativePcmSource = { sample_rate: REALTIME_OUTPUT_SAMPLE_RATE, channels: 1, chunks: queue };
               void player.start(source, Math.round(performance.now())).catch((playbackError: unknown) => {
@@ -275,12 +290,12 @@ export function TalkMode({
       setError(startError instanceof Error ? startError.message : "Talk could not start.");
       setRetryAvailable(true);
     }
-  }, [onSessionId, stopOutputsForBargeIn, stopTalk, failOutput, invalidateResponse]);
+  }, [onSessionId, stopOutputsForBargeIn, stopTalk, failOutput, invalidateResponse, refreshSpeaking]);
 
   const phaseLabel: Record<TalkPhase, string> = {
     idle: "Talk off",
     connecting: "Connecting Talk",
-    listening: "Listening",
+    listening: speaking ? "Speaking" : "Listening",
     failed: "Talk needs attention",
   };
 
@@ -314,7 +329,7 @@ export function TalkMode({
           <p className="text-xs font-semibold">{phaseLabel[phase]}</p>
           <p className="mt-2 text-[11px] text-[var(--ink-soft)]">
             {phase === "listening"
-              ? "The microphone stays open while Hexis listens."
+              ? speaking ? "Hexis is speaking. You can interrupt by speaking." : "The microphone stays open while Hexis listens."
               : "Talk is starting. Grant microphone permission if your browser asks."}
           </p>
         </div>
