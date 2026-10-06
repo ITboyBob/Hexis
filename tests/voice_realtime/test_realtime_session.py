@@ -364,6 +364,14 @@ async def test_authorized_response_uses_server_identity_and_binds_playback_recei
         evaluation={"status": "missing"},
         visual_window={"status": "closed", "owner": "service"},
     )
+    turn_id = uuid4()
+    session.bind_voice_turn(
+        input_turn_id="turn-output",
+        input_order=2,
+        user_text="authorized user request",
+        context_version="a" * 64,
+        turn_id=turn_id,
+    )
 
     output = await session.start_authorized_response("turn-output")
     assert output["input_turn_id"] == "turn-output"
@@ -388,10 +396,11 @@ async def test_authorized_response_uses_server_identity_and_binds_playback_recei
             "session_id": session.session_id,
             "response_id": output["response_id"],
             "playback_id": output["playback_id"],
-            "producer_seq": seq,
-            "output_epoch": output["output_epoch"],
-            "media_session_id": session.media_session_id,
-            **extra,
+                "producer_seq": seq,
+                "output_epoch": output["output_epoch"],
+                "media_session_id": session.media_session_id,
+                "turn_id": turn_id,
+                **extra,
         }
         return SimpleNamespace(**value, model_dump=lambda mode="json": {
             **value,
@@ -509,6 +518,13 @@ async def test_voice_recall_followup_requires_the_exact_authorized_call_once():
         evaluation={"status": "missing"},
         visual_window={"status": "closed", "owner": "service"},
     )
+    session.bind_voice_turn(
+        input_turn_id=input_turn_id,
+        input_order=1,
+        user_text="authorized user request",
+        context_version="a" * 64,
+        turn_id=uuid4(),
+    )
     output = await session.start_authorized_response(input_turn_id)
     session.authorize_voice_recall_call(
         response_id=output["response_id"],
@@ -518,7 +534,7 @@ async def test_voice_recall_followup_requires_the_exact_authorized_call_once():
     )
     await session.release_response(output["response_id"])
 
-    with pytest.raises(VoiceRealtimeSessionError, match="authorized input"):
+    with pytest.raises(VoiceRealtimeSessionError, match="authorized call"):
         await session.start_voice_recall_followup(
             input_turn_id=input_turn_id,
             call_id="unbound-call",
@@ -535,7 +551,7 @@ async def test_voice_recall_followup_requires_the_exact_authorized_call_once():
     assert followup["input_turn_id"] == input_turn_id
 
     await session.release_response(followup["response_id"])
-    with pytest.raises(VoiceRealtimeSessionError, match="authorized input"):
+    with pytest.raises(VoiceRealtimeSessionError, match="authorized call"):
         await session.start_voice_recall_followup(
             input_turn_id=input_turn_id,
             call_id="call-1",

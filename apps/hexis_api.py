@@ -251,6 +251,7 @@ class VoiceRealtimeSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: uuid.UUID
+    tool_surface: Literal["m4", "m5"] = "m4"
 
 
 class WebPushKeys(BaseModel):
@@ -2645,7 +2646,13 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
             detail=f"{config['api_key_env']} is not configured for the selected realtime model.",
         )
 
-    instructions = load_m4_stable_instructions()
+    tool_surface = req.tool_surface
+    if tool_surface == "m5":
+        from services.voice_instructions import load_m5_instructions
+
+        instructions = load_m5_instructions().stable
+    else:
+        instructions = load_m4_stable_instructions()
     m4_config_path = os.environ.get("HEXIS_M4_VOICE_CONFIG")
     if not m4_config_path:
         raise HTTPException(
@@ -2792,7 +2799,9 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
     session._event_sink = write_voice_event
     registry.register(req.session_id, session)
     try:
-        cloud_session_id = await session.start(instructions)
+        cloud_session_id = await session.start(
+            instructions, tool_surface=tool_surface
+        )
         receiver = asyncio.create_task(session.run_receiver())
         session.register_background_task(receiver)
         instructions_hash = hashlib.sha256(instructions.encode("utf-8")).hexdigest()
@@ -2825,6 +2834,7 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
                 payload={
                     "qwen_session_id": cloud_session_id,
                     "instructions_hash": instructions_hash,
+                    "tool_surface": tool_surface,
                     "gate": True,
                 },
                 media_session_id=media_session_id,
@@ -2867,7 +2877,6 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
         VoiceClientTransport,
         parse_client_message,
     )
-    from apps.voice_m4_probe import load_m4_stable_instructions
     from services.qwen_realtime_output import OutputMappingError, QwenRealtimeOutputAdapter
 
     transport = VoiceClientTransport(
@@ -2875,7 +2884,7 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
         media_session_id=session.media_session_id,
     )
     instructions_hash = hashlib.sha256(
-        load_m4_stable_instructions().encode("utf-8")
+        session.stable_instructions.encode("utf-8")
     ).hexdigest()
     await websocket.send_json(
         {
@@ -2963,7 +2972,7 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                 stimulus_revision=identity["stimulus_revision"],
             )
 
-        pending_voice_call: dict[str, str] | None = None
+        pending_voice_calls: dict[str, Any] = {}
         adapter = QwenRealtimeOutputAdapter(
             response_id=response_id,
             output_epoch=output["output_epoch"],
@@ -2986,18 +2995,14 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                         model_call_open = True
                     continue
                 if event.type == "response.function_call_arguments.done":
-                    input_turn_id = session.authorize_voice_recall_call(
-                        response_id=response_id,
-                        call_id=event.call_id or "",
-                        name=event.tool_name or "",
-                        arguments=event.tool_arguments or "",
+                    from services.m5_tool_bridge import bind_tool_event
+
+                    bind_tool_event(
+                        session,
+                        pending_voice_calls,
+                        expected_response_id=response_id,
+                        event=event,
                     )
-                    pending_voice_call = {
-                        "input_turn_id": input_turn_id,
-                        "call_id": event.call_id or "",
-                        "name": event.tool_name or "",
-                        "arguments": event.tool_arguments or "",
-                    }
                     continue
                 if event.type == "response.audio.delta":
                     chunk = adapter.accept(event)
@@ -3098,72 +3103,107 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                         if terminal_recorded:
                             await session.release_response(response_id)
                         return
-                    if pending_voice_call is not None and not failed:
+                    if pending_voice_calls and not failed:
                         if session.response_has_output(response_id):
-                            raise RuntimeError("voice recall response also contained playable PCM")
+                            raise RuntimeError("voice tool response also contained playable PCM")
                         await session.release_response(response_id)
+                        from services.m5_tool_bridge import execute_bound_tool
                         from services.voice_recall import VoiceRecallService
 
-                        recall_input_id = pending_voice_call["input_turn_id"]
-                        voice_turn = session._voice_turns.get(recall_input_id)
-                        if voice_turn is None:
-                            raise RuntimeError("recall activity has no authorized voice input")
-                        recall_identity = {
-                            "session_id": str(session.session_id),
-                            "input_turn_id": recall_input_id,
-                            "input_order": voice_turn["input_order"],
-                            "stimulus_revision": voice_turn["stimulus_revision"],
-                        }
-                        recall_activity = {
-                            "identity": recall_identity,
-                            "activity_id": pending_voice_call["call_id"],
-                            "call_id": pending_voice_call["call_id"],
-                            "response_id": response_id,
-                            "playback_id": output.get("playback_id"),
-                            "output_epoch": output.get("output_epoch"),
-                            "turn_id": output.get("turn_id"),
-                        }
-                        await session.emit_event(
-                            "voice_recall_started",
-                            {**recall_activity, "state": "started"},
-                            input_turn_id=recall_input_id,
-                            stimulus_revision=recall_identity["stimulus_revision"],
-                        )
-                        try:
-                            recall_output = await VoiceRecallService(_pool).execute(
-                                session_id=session.session_id,
-                                input_turn_id=uuid.UUID(recall_input_id),
-                                name=pending_voice_call["name"],
-                                arguments=pending_voice_call["arguments"],
+                        tool_outputs: list[tuple[str, str]] = []
+                        for bound_call in pending_voice_calls.values():
+                            session.validate_voice_tool_call(bound_call)
+                            if bound_call.name == "voice_recall":
+                                voice_turn = session._voice_turns.get(
+                                    bound_call.input_turn_id
+                                )
+                                if voice_turn is None:
+                                    raise RuntimeError(
+                                        "recall activity has no authorized voice input"
+                                    )
+                                recall_identity = {
+                                    "session_id": str(session.session_id),
+                                    "input_turn_id": bound_call.input_turn_id,
+                                    "input_order": bound_call.input_order,
+                                    "stimulus_revision": bound_call.stimulus_revision,
+                                }
+                                recall_activity = {
+                                    "identity": recall_identity,
+                                    "activity_id": bound_call.actual_call_id,
+                                    "call_id": bound_call.actual_call_id,
+                                    "response_id": response_id,
+                                    "playback_id": output.get("playback_id"),
+                                    "output_epoch": output.get("output_epoch"),
+                                    "turn_id": output.get("turn_id"),
+                                }
+                                await session.emit_event(
+                                    "voice_recall_started",
+                                    {**recall_activity, "state": "started"},
+                                    input_turn_id=bound_call.input_turn_id,
+                                    stimulus_revision=bound_call.stimulus_revision,
+                                )
+                                try:
+                                    session.validate_voice_tool_call(bound_call)
+                                    tool_output = await VoiceRecallService(_pool).execute(
+                                        session_id=session.session_id,
+                                        input_turn_id=uuid.UUID(
+                                            bound_call.input_turn_id
+                                        ),
+                                        name=bound_call.name,
+                                        arguments=bound_call.raw_arguments,
+                                    )
+                                except Exception:
+                                    await session.emit_event(
+                                        "voice_recall_ended",
+                                        {
+                                            **recall_activity,
+                                            "state": "ended",
+                                            "status": "failed",
+                                        },
+                                        input_turn_id=bound_call.input_turn_id,
+                                        stimulus_revision=bound_call.stimulus_revision,
+                                    )
+                                    raise
+                                recall_status = json.loads(tool_output).get(
+                                    "status", "unknown"
+                                )
+                                await session.emit_event(
+                                    "voice_recall_executed",
+                                    {
+                                        "status": recall_status,
+                                        "call_id": bound_call.actual_call_id,
+                                        "response_id": response_id,
+                                    },
+                                    input_turn_id=bound_call.input_turn_id,
+                                )
+                                await session.emit_event(
+                                    "voice_recall_ended",
+                                    {
+                                        **recall_activity,
+                                        "state": "ended",
+                                        "status": recall_status,
+                                    },
+                                    input_turn_id=bound_call.input_turn_id,
+                                    stimulus_revision=bound_call.stimulus_revision,
+                                )
+                            else:
+                                tool_output = await execute_bound_tool(
+                                    session, bound_call, handlers={}
+                                )
+                            tool_outputs.append(
+                                (bound_call.actual_call_id, tool_output)
                             )
-                        except Exception:
-                            await session.emit_event(
-                                "voice_recall_ended",
-                                {**recall_activity, "state": "ended", "status": "failed"},
-                                input_turn_id=recall_input_id,
-                                stimulus_revision=recall_identity["stimulus_revision"],
+
+                        input_turn_ids = {
+                            call.input_turn_id for call in pending_voice_calls.values()
+                        }
+                        if len(input_turn_ids) != 1:
+                            raise RuntimeError(
+                                "one provider response cannot span multiple authorized inputs"
                             )
-                            raise
-                        recall_status = json.loads(recall_output).get("status", "unknown")
-                        await session.emit_event(
-                            "voice_recall_executed",
-                            {
-                                "status": recall_status,
-                                "call_id": pending_voice_call["call_id"],
-                                "response_id": response_id,
-                            },
-                            input_turn_id=pending_voice_call["input_turn_id"],
-                        )
-                        await session.emit_event(
-                            "voice_recall_ended",
-                            {**recall_activity, "state": "ended", "status": recall_status},
-                            input_turn_id=recall_input_id,
-                            stimulus_revision=recall_identity["stimulus_revision"],
-                        )
-                        followup = await session.start_voice_recall_followup(
-                            input_turn_id=pending_voice_call["input_turn_id"],
-                            call_id=pending_voice_call["call_id"],
-                            tool_output=recall_output,
+                        followup = await session.start_voice_tool_followup(
+                            input_turn_id=next(iter(input_turn_ids)),
+                            outputs=tool_outputs,
                         )
                         if session._response_dispatch is None:
                             await session.release_response(followup["response_id"])

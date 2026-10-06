@@ -7,6 +7,7 @@ import time
 from typing import Any
 from uuid import UUID, uuid4
 
+from services.m5_tool_bridge import BoundToolCall
 from services.qwen_realtime_protocol import ProtocolEvent
 from services.voice_input_authorization import (
     CaptureRange,
@@ -18,6 +19,7 @@ from services.voice_input_authorization import (
 from services.voice_instructions import eligible_gate_emotion, render_per_turn
 from services.voice_output_arbiter import OutputClaim, VoiceOutputArbiter
 from services.voice_recall import VOICE_RECALL_TOOL
+from services.m5_tool_contracts import realtime_tool_definitions
 
 
 class VoiceRealtimeSessionError(RuntimeError):
@@ -62,6 +64,8 @@ class VoiceRealtimeSession:
         self._playback_state: dict[str, dict[str, Any]] = {}
         self.queue_limit = queue_limit
         self.cloud_session_id: str | None = None
+        self.tool_surface = "m4"
+        self.stable_instructions = ""
         self._ready = False
         self._closed = False
         self._closed_event = asyncio.Event()
@@ -79,8 +83,10 @@ class VoiceRealtimeSession:
         self._response_input_ids: dict[str, str] = {}
         self._voice_tool_call_counts: dict[str, int] = {}
         self._used_voice_call_ids: set[str] = set()
+        self._bound_voice_calls: dict[str, BoundToolCall] = {}
         self._voice_call_inputs: dict[str, str] = {}
         self._completed_voice_call_ids: set[str] = set()
+        self._invalidated_response_ids: set[str] = set()
         self._voice_turns: dict[str, dict[str, Any]] = {}
         self._turn_completion_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[Any]] = set()
@@ -103,7 +109,18 @@ class VoiceRealtimeSession:
 
     def response_is_invalidated(self, response_id: str) -> bool:
         state = self._playback_state.get(response_id)
-        return bool(state and state.get("invalidated"))
+        return response_id in self._invalidated_response_ids or bool(
+            state and state.get("invalidated")
+        )
+
+    def local_response_id(self, supplier_response_id: str) -> str | None:
+        """Resolve the Qwen response identity to its local output claim."""
+        if not isinstance(supplier_response_id, str) or not supplier_response_id.strip():
+            return None
+        mapped = self._supplier_response_map.get(supplier_response_id)
+        if mapped is not None:
+            return mapped
+        return supplier_response_id if supplier_response_id in self._response_queues else None
 
     async def invalidate_foreground_output(self) -> str | None:
         """Fence the active output locally before asking Qwen to cancel it."""
@@ -114,25 +131,41 @@ class VoiceRealtimeSession:
         if state is None:
             raise VoiceRealtimeSessionError("foreground output has no playback state")
         state["invalidated"] = True
+        self._invalidated_response_ids.add(response_id)
         claim = self._response_claims.pop(response_id, None)
         if claim is not None:
             await self._output_arbiter.release(response_id, self.media_session_id)
         await self.client.cancel_response()
         return response_id
 
-    async def start(self, instructions: str) -> str:
+    async def start(self, instructions: str, *, tool_surface: str = "m4") -> str:
         if self._closed:
             raise VoiceRealtimeSessionError("realtime session is closed")
         if self._ready:
             raise VoiceRealtimeSessionError("realtime session already started")
+        if tool_surface not in {"m4", "m5"}:
+            raise VoiceRealtimeSessionError("unsupported realtime tool surface")
+        if tool_surface == "m5":
+            from services.voice_instructions import load_m5_instructions
+
+            if instructions != load_m5_instructions().stable:
+                raise VoiceRealtimeSessionError(
+                    "M5 session must use the explicitly selected M5 stable instructions"
+                )
+            m5_recall = {"type": "function", **VOICE_RECALL_TOOL["function"]}
+            tools = [m5_recall, *realtime_tool_definitions()]
+        else:
+            tools = [VOICE_RECALL_TOOL]
         cloud_session_id = await self.client.connect(
-            instructions, tools=[VOICE_RECALL_TOOL]
+            instructions, tools=tools
         )
         if not isinstance(cloud_session_id, str) or not cloud_session_id.strip():
             raise VoiceRealtimeSessionError(
                 "session.updated did not provide a usable cloud session id"
             )
         self.cloud_session_id = cloud_session_id
+        self.tool_surface = tool_surface
+        self.stable_instructions = instructions
         self._ready = True
         return cloud_session_id
 
@@ -178,10 +211,16 @@ class VoiceRealtimeSession:
         if hydration is None:
             raise VoiceRealtimeSessionError("input hydration result is unavailable")
         label, eligible = eligible_gate_emotion(gate, identity)
-        from services.voice_instructions import load_m4_instructions
+        from services.voice_instructions import load_m4_instructions, load_m5_instructions
+
+        instruction_bundle = (
+            load_m5_instructions()
+            if self.tool_surface == "m5"
+            else load_m4_instructions()
+        )
 
         rendered = render_per_turn(
-            load_m4_instructions(),
+            instruction_bundle,
             now=hydration.temporal_context,
             persona=hydration.persona_context,
             continuity=hydration.continuity_context,
@@ -376,6 +415,81 @@ class VoiceRealtimeSession:
             if success:
                 turn["completed"] = True
 
+    def authorize_voice_tool_call(
+        self,
+        *,
+        response_id: str,
+        call_id: str,
+        name: str,
+        arguments: str,
+        supplier_response_id: str | None = None,
+        request_id: str | None = None,
+    ) -> BoundToolCall:
+        if not isinstance(call_id, str) or not call_id.strip():
+            raise VoiceRealtimeSessionError("voice tool call requires a real call id")
+        if not isinstance(name, str) or not name.strip():
+            raise VoiceRealtimeSessionError("voice tool name is missing")
+        if not isinstance(arguments, str):
+            raise VoiceRealtimeSessionError("voice tool arguments are missing")
+        if not isinstance(response_id, str) or not response_id.strip():
+            raise VoiceRealtimeSessionError("voice tool call requires a response id")
+        supplier_response_id = supplier_response_id or response_id
+        previous = self._bound_voice_calls.get(call_id)
+        if previous is not None:
+            if (
+                previous.name == name
+                and previous.raw_arguments == arguments
+                and previous.response_id == response_id
+                and previous.supplier_response_id == supplier_response_id
+                and previous.tool_surface == self.tool_surface
+            ):
+                return previous
+            raise VoiceRealtimeSessionError("tool call id conflicts with its original binding")
+
+        input_turn_id = self._response_input_ids.get(response_id)
+        if self.response_is_invalidated(response_id):
+            raise VoiceRealtimeSessionError("invalidated response cannot authorize a voice tool call")
+        if (
+            not self.ready
+            or input_turn_id is None
+            or input_turn_id not in self._authorized_input_ids
+        ):
+            raise VoiceRealtimeSessionError("voice tool call is not bound to an authorized input")
+        gate = self._input_gate_results.get(input_turn_id)
+        turn = self._voice_turns.get(input_turn_id)
+        if gate is None or turn is None or not gate.released or not gate.context_ready:
+            raise VoiceRealtimeSessionError("voice tool call has no completed input authorization")
+        identity = gate.identity
+        if (
+            identity.get("session_id") != str(self.session_id)
+            or identity.get("input_turn_id") != input_turn_id
+            or identity.get("input_order") != turn.get("input_order")
+            or identity.get("stimulus_revision") != turn.get("stimulus_revision")
+        ):
+            raise VoiceRealtimeSessionError("voice tool input revision or identity is stale")
+        if name == "voice_recall":
+            count = self._voice_tool_call_counts.get(input_turn_id, 0)
+            if count >= 2:
+                raise VoiceRealtimeSessionError("voice recall exceeded the two-call input limit")
+            self._voice_tool_call_counts[input_turn_id] = count + 1
+        bound = BoundToolCall(
+            actual_call_id=call_id,
+            name=name,
+            raw_arguments=arguments,
+            origin_session_id=self.session_id,
+            input_turn_id=input_turn_id,
+            input_order=int(turn["input_order"]),
+            stimulus_revision=int(turn["stimulus_revision"]),
+            response_id=response_id,
+            supplier_response_id=supplier_response_id,
+            request_id=request_id,
+            tool_surface=self.tool_surface,
+        )
+        self._used_voice_call_ids.add(call_id)
+        self._voice_call_inputs[call_id] = input_turn_id
+        self._bound_voice_calls[call_id] = bound
+        return bound
+
     def authorize_voice_recall_call(
         self,
         *,
@@ -384,25 +498,41 @@ class VoiceRealtimeSession:
         name: str,
         arguments: str,
     ) -> str:
-        input_turn_id = self._response_input_ids.get(response_id)
-        if (
-            input_turn_id is None
-            or input_turn_id not in self._authorized_input_ids
-            or name != "voice_recall"
-            or not isinstance(call_id, str)
-            or not call_id.strip()
-            or call_id in self._used_voice_call_ids
-        ):
+        """M4 compatibility wrapper for the generalized voice tool boundary."""
+        if name != "voice_recall":
             raise VoiceRealtimeSessionError("voice recall call is not bound to an authorized input")
-        count = self._voice_tool_call_counts.get(input_turn_id, 0)
-        if count >= 2:
-            raise VoiceRealtimeSessionError("voice recall exceeded the two-call input limit")
-        if not isinstance(arguments, str):
-            raise VoiceRealtimeSessionError("voice recall arguments are missing")
-        self._voice_tool_call_counts[input_turn_id] = count + 1
-        self._used_voice_call_ids.add(call_id)
-        self._voice_call_inputs[call_id] = input_turn_id
-        return input_turn_id
+        return self.authorize_voice_tool_call(
+            response_id=response_id,
+            call_id=call_id,
+            name=name,
+            arguments=arguments,
+        ).input_turn_id
+
+    def validate_voice_tool_call(self, call: BoundToolCall) -> None:
+        if (
+            not self.ready
+            or call.origin_session_id != self.session_id
+            or call.input_turn_id not in self._authorized_input_ids
+            or self._bound_voice_calls.get(call.actual_call_id) != call
+            or call.actual_call_id in self._completed_voice_call_ids
+            or self.response_is_invalidated(call.response_id)
+        ):
+            raise VoiceRealtimeSessionError("voice tool call is no longer authorized")
+        gate = self._input_gate_results.get(call.input_turn_id)
+        turn = self._voice_turns.get(call.input_turn_id)
+        if (
+            gate is None
+            or turn is None
+            or not gate.released
+            or not gate.context_ready
+            or gate.identity.get("session_id") != str(call.origin_session_id)
+            or gate.identity.get("input_turn_id") != call.input_turn_id
+            or gate.identity.get("input_order") != call.input_order
+            or gate.identity.get("stimulus_revision") != call.stimulus_revision
+            or turn.get("input_order") != call.input_order
+            or turn.get("stimulus_revision") != call.stimulus_revision
+        ):
+            raise VoiceRealtimeSessionError("voice tool call input identity is stale")
 
     async def start_voice_recall_followup(
         self,
@@ -411,17 +541,39 @@ class VoiceRealtimeSession:
         call_id: str,
         tool_output: str,
     ) -> dict[str, Any]:
-        if (
-            not self.ready
-            or input_turn_id not in self._authorized_input_ids
-            or self._voice_call_inputs.get(call_id) != input_turn_id
-            or call_id in self._completed_voice_call_ids
-        ):
+        return await self.start_voice_tool_followup(
+            input_turn_id=input_turn_id,
+            outputs=[(call_id, tool_output)],
+        )
+
+    async def start_voice_tool_followup(
+        self,
+        *,
+        input_turn_id: str,
+        outputs: list[tuple[str, str]],
+    ) -> dict[str, Any]:
+        if not self.ready or input_turn_id not in self._authorized_input_ids or not outputs:
             raise VoiceRealtimeSessionError("voice tool follow-up has no authorized input")
+        call_ids = [call_id for call_id, _ in outputs]
+        if len(set(call_ids)) != len(call_ids):
+            raise VoiceRealtimeSessionError("voice tool follow-up contains duplicate call ids")
+        for call_id, tool_output in outputs:
+            bound = self._bound_voice_calls.get(call_id)
+            if (
+                bound is None
+                or bound.input_turn_id != input_turn_id
+                or self._voice_call_inputs.get(call_id) != input_turn_id
+                or call_id in self._completed_voice_call_ids
+                or not isinstance(tool_output, str)
+            ):
+                raise VoiceRealtimeSessionError("voice tool follow-up has no authorized call")
+            self.validate_voice_tool_call(bound)
         async with self._instruction_turn_lock:
             await self._responses_idle.wait()
             instructions, facts = self.response_instructions(input_turn_id)
-            await self.client.send_function_call_output(call_id, tool_output)
+            for call_id, tool_output in outputs:
+                self.validate_voice_tool_call(self._bound_voice_calls[call_id])
+                await self.client.send_function_call_output(call_id, tool_output)
             await self.client.update_session_instructions(instructions)
             response_id = str(uuid4())
             claim = await self._output_arbiter.claim(response_id, self.media_session_id)
@@ -436,7 +588,7 @@ class VoiceRealtimeSession:
                     self._responses_idle.set()
                 await self._output_arbiter.release(response_id, self.media_session_id)
                 raise
-            self._completed_voice_call_ids.add(call_id)
+            self._completed_voice_call_ids.update(call_ids)
             self._response_claims[response_id] = claim
             self._playback_ids[response_id] = playback_id
             self._playback_state[response_id] = {

@@ -157,6 +157,7 @@ def parse_event(value: dict[str, Any]) -> ProtocolEvent:
         return ProtocolEvent(
             type=event_type,
             raw=value,
+            event_id=value.get("event_id"),
             response_id=value.get("response_id"),
             item_id=value.get("item_id"),
             call_id=value.get("call_id"),
@@ -167,6 +168,7 @@ def parse_event(value: dict[str, Any]) -> ProtocolEvent:
         return ProtocolEvent(
             type=event_type,
             raw=value,
+            event_id=value.get("event_id"),
             response_id=value.get("response_id"),
             item_id=value.get("item_id"),
             call_id=value.get("call_id"),

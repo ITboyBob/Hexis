@@ -1,0 +1,605 @@
+{
+  "contract_version": "m5-tool-v1",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "submit",
+        "description": "仅在用户明确委派需要后台执行的新工作时调用。本工具创建持续任务会话、立即启动第一轮工作，并在任务已受理后返回，不等待工作和汇报全部完成。task_description 必须完整保留用户的动作、对象、路径、输出格式和约束；原始用户要求与授权身份由宿主另行绑定。查询、修改要求或补充已存在任务时使用 pend_message，不得重复 submit 来检查进度或绕过 working 状态。不明确是否属于新任务时先正常对话澄清。受理回执只说明任务已创建和受理，不能据此声称已有结果或任务已完成。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_description": {
+              "type": "string",
+              "minLength": 1,
+              "description": "交给后台执行且用作任务列表标题的完整任务描述；保留用户指定的动作、对象、路径、格式和约束，不压缩成关键词。"
+            }
+          },
+          "required": [
+            "task_description"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "pend_message",
+        "description": "仅在用户明确希望向已有任务交流时调用；意图不明确时先正常对话追问。message 应在调用前总结用户实际意图并保留全部重要约束；工具自身打开任务选择弹窗，由用户选择当前来源会话所属的任务，模型不填写或猜测 task_id。用户确认目标后，本工具将消息持久追加到该任务的 pending 队列并立即返回；取消选择不入队。即使任务正在 working 也可以追加；消息何时派发由宿主按 FIFO 规则控制，工具不等待任务处理完成。不得修改、删除或重试已有 pending 消息，也不得为同一已受理动作重复入队。pending 回执表示已保存入队，不表示任务已经处理或该消息此刻仍在等待。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "description": "准备追加给用户选定任务的完整交流消息，必须来自用户明确意图并保留其约束。"
+            }
+          },
+          "required": [
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "report_task_progress",
+        "description": "仅供工作 AgentLoop 已结束后的独立汇报模型请求调用，不向前台对话模型开放。本工具把 summary 交付到宿主绑定的原来源会话后端接收通道，不重新执行原工作，也不把任务正文或产物转移到其他会话。summary 应使用“任务名称＋任务本轮回复：＋具体内容”的口径，准确概括本轮真实结果及其限制，不宣称持续任务已经终结，不编造任务成功。成功只表示后端摘要交付完成，不表示前端已渲染、音频已生成或用户已听到。任务、会话、工作执行和 report_id 由宿主绑定，模型不得提供或修改这些身份。失败只进入该汇报回合的有界恢复；相同 report_id 已交付时返回原成功回执，不重复发布。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "summary": {
+              "type": "string",
+              "minLength": 1,
+              "description": "包含实际任务名称与本轮具体结果的中文摘要，沿用“XX任务本轮回复：……”口径；必须基于该工作回合的真实输出。"
+            }
+          },
+          "required": [
+            "summary"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "remember",
+        "description": "用户明确要求长期记住内容，或明确纠正需要持久保存的认知时调用；已有语义信念的支持或反驳证据优先使用 add_evidence，不把普通对话中的潜在偏好推断成保存意图。不要将临时测试、一次性校准或无长期价值的细节写入记忆。content 应准确保存用户要求记住的内容，不添加未经支持的解释或事实。本工具走异步轻量执行通道，不创建后台任务、不启动 AgentLoop、不出现在任务列表中。等价近期写入按既有记忆去重规则复用已有记录，不应为同一已受理动作重复调用。type、importance、confidence、concepts 和 sources 沿用既有记忆参数语义；来源可验证时保留真实来源，当前会话归属由宿主提供。accepted 只表示写入已受理，不能宣称已经保存；最终 done 回执才说明实际执行结果，复用既有记录也可以是成功。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string",
+              "minLength": 1,
+              "description": "需要持久保存的真实记忆内容，保留用户明确表达的事实或要求。"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "episodic",
+                "semantic",
+                "procedural",
+                "strategic"
+              ],
+              "default": "episodic",
+              "description": "沿用既有记忆类型：事件、事实信念、方法流程或长期策略；省略时由既有写入路径采用 episodic。"
+            },
+            "importance": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.5,
+              "description": "沿用既有重要性参数；没有明确依据时省略并使用现有默认值。"
+            },
+            "confidence": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.5,
+              "description": "仅用于 semantic 事实信念的置信度，沿用既有处理规则；不是写入成功率或授权依据。"
+            },
+            "concepts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "description": "实际相关的概念名称，不添加无关标签。"
+              },
+              "description": "关联概念列表；省略时不额外指定概念。"
+            },
+            "sources": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "description": "可追溯的真实证据来源。至少给出非空 ref 或 label；该跨字段条件由宿主校验。不能编造来源、路径、URL、作者或可信度。",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "来源类型，沿用既有来源分类；当前用户话语的权威归属由宿主补充。"
+                  },
+                  "ref": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "实际取得的来源路径、URL或稳定标识；未知时省略，不能臆造。"
+                  },
+                  "label": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "对真实来源的简短说明；没有 ref 时必须提供，不能把推测当成来源。"
+                  },
+                  "author": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "已知的真实来源作者；不知道时省略。"
+                  },
+                  "trust": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "description": "已有依据的来源可信度；未知时省略并交由既有证据策略处理，不是授权标志。"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "description": "真实来源对象列表，沿用既有来源语义；未提供或为空时由既有写入路径结合宿主上下文处理当前会话来源。"
+            }
+          },
+          "required": [
+            "content"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "add_evidence",
+        "description": "用户明确补充或纠正已存在的语义记忆时调用，将支持或反驳证据附到该信念，并由既有校准策略修订置信度，不重复创建同一信念。memory_id 必须来自真实上下文或既有 Recall 返回的语义记忆 UUID；目标不明确或缺少真实 ID 时先检索或澄清，不能臆造 ID。stance 必须明确表示支持还是反驳；source 必须包含真实 ref 或 label，不能编造证据来源。note 可保存证据具体说明，既有路径可能生成与信念关联的证据记忆；本工具不直接覆盖原信念内容，也不接受模型指定新的最终置信度。本工具是异步轻量写入，不创建任务、不启动 AgentLoop，重复来源沿用既有合并规则。accepted 只表示已受理；实际置信度变化或未变化必须以最终 done 回执为准。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "memory_id": {
+              "type": "string",
+              "minLength": 1,
+              "description": "实际存在的目标语义记忆 UUID，从真实上下文或 Recall 结果取得；宿主验证存在性、类型与可访问性。",
+              "format": "uuid"
+            },
+            "stance": {
+              "type": "string",
+              "enum": [
+                "supports",
+                "contradicts"
+              ],
+              "description": "该证据支持或反驳目标信念；必须使用精确枚举值。"
+            },
+            "source": {
+              "type": "object",
+              "description": "可追溯的真实证据来源。至少给出非空 ref 或 label；该跨字段条件由宿主校验。不能编造来源、路径、URL、作者或可信度。",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "来源类型，沿用既有来源分类；当前用户话语的权威归属由宿主补充。"
+                },
+                "ref": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "实际取得的来源路径、URL或稳定标识；未知时省略，不能臆造。"
+                },
+                "label": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "对真实来源的简短说明；没有 ref 时必须提供，不能把推测当成来源。"
+                },
+                "author": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "已知的真实来源作者；不知道时省略。"
+                },
+                "trust": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1,
+                  "description": "已有依据的来源可信度；未知时省略并交由既有证据策略处理，不是授权标志。"
+                }
+              },
+              "additionalProperties": false
+            },
+            "note": {
+              "type": "string",
+              "minLength": 1,
+              "description": "证据的具体内容或解释；省略时不额外生成说明，不能添加未被证据支持的结论。"
+            }
+          },
+          "required": [
+            "memory_id",
+            "stance",
+            "source"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "receipt_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "M5ToolReceipt",
+    "type": "object",
+    "properties": {
+      "contract_version": {
+        "type": "string",
+        "const": "m5-tool-v1"
+      },
+      "tool_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "供应商实际返回的工具名；未知名字只能用于拒绝回执，不能据此注册或执行新工具。"
+      },
+      "call_id": {
+        "type": "string",
+        "minLength": 1
+      },
+      "operation_id": {
+        "anyOf": [
+          {
+            "type": "string",
+            "format": "uuid"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "ok": {
+        "type": "boolean"
+      },
+      "state": {
+        "type": "string",
+        "enum": [
+          "accepted",
+          "pending",
+          "selection_cancelled",
+          "delivered",
+          "done",
+          "failed",
+          "unknown"
+        ]
+      },
+      "data": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "message_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "task_state": {
+            "type": "string",
+            "enum": [
+              "working",
+              "idle"
+            ]
+          },
+          "origin_session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "memory_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "write_effect": {
+            "type": "string",
+            "enum": [
+              "created",
+              "updated",
+              "reused",
+              "unchanged"
+            ]
+          },
+          "prior_confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "posterior_confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "task_title": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "error": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "INVALID_JSON",
+              "INVALID_ARGUMENTS",
+              "TOOL_NOT_ALLOWED",
+              "MISSING_TOOL_CALL",
+              "UNAUTHORIZED_INPUT",
+              "TARGET_NOT_FOUND",
+              "TARGET_TYPE_MISMATCH",
+              "TARGET_OWNERSHIP_MISMATCH",
+              "ORIGIN_SESSION_UNAVAILABLE",
+              "PERMISSION_DENIED",
+              "MODEL_REQUEST_FAILED",
+              "MODEL_REQUEST_TIMEOUT",
+              "DELIVERY_TEMPORARY_FAILURE",
+              "MEMORY_WRITE_FAILED",
+              "EXECUTION_UNKNOWN",
+              "RETRY_EXHAUSTED",
+              "REPEATED_REJECTION",
+              "TOOL_ATTEMPT_LIMIT",
+              "SELECTION_EXPIRED",
+              "IDEMPOTENCY_CONFLICT"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "required": [
+      "contract_version",
+      "tool_name",
+      "call_id",
+      "operation_id",
+      "ok",
+      "state",
+      "data",
+      "error"
+    ],
+    "additionalProperties": false,
+    "allOf": [
+      {
+        "if": {
+          "properties": {
+            "ok": {
+              "const": true
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "error": {
+              "type": "null"
+            },
+            "state": {
+              "enum": [
+                "accepted",
+                "pending",
+                "selection_cancelled",
+                "delivered",
+                "done"
+              ]
+            },
+            "tool_name": {
+              "enum": [
+                "submit",
+                "pend_message",
+                "report_task_progress",
+                "remember",
+                "add_evidence"
+              ]
+            }
+          }
+        },
+        "else": {
+          "properties": {
+            "error": {
+              "type": "object"
+            },
+            "state": {
+              "enum": [
+                "failed",
+                "unknown"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "tool_name": {
+              "const": "submit"
+            },
+            "ok": {
+              "const": true
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "state": {
+              "const": "accepted"
+            },
+            "data": {
+              "required": [
+                "task_id",
+                "task_title",
+                "task_state"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "tool_name": {
+              "const": "pend_message"
+            },
+            "ok": {
+              "const": true
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "state": {
+              "enum": [
+                "pending",
+                "selection_cancelled"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "tool_name": {
+              "const": "pend_message"
+            },
+            "state": {
+              "const": "pending"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "data": {
+              "required": [
+                "task_id",
+                "task_title",
+                "message_id"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "tool_name": {
+              "const": "report_task_progress"
+            },
+            "ok": {
+              "const": true
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "state": {
+              "const": "delivered"
+            },
+            "operation_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "data": {
+              "required": [
+                "task_id",
+                "origin_session_id"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "tool_name": {
+              "enum": [
+                "remember",
+                "add_evidence"
+              ]
+            },
+            "ok": {
+              "const": true
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "state": {
+              "enum": [
+                "accepted",
+                "done"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "tool_name": {
+              "enum": [
+                "remember",
+                "add_evidence"
+              ]
+            },
+            "state": {
+              "const": "done"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "data": {
+              "required": [
+                "memory_id"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "tool_name": {
+              "const": "add_evidence"
+            },
+            "state": {
+              "const": "done"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "data": {
+              "required": [
+                "prior_confidence",
+                "posterior_confidence"
+              ]
+            }
+          }
+        }
+      }
+    ]
+  }
+}
