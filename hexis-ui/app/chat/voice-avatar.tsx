@@ -11,12 +11,14 @@ export function VoiceAvatar({
   emotionLabel,
   generation,
   bottomOffsetPx = 8,
+  horizontalOffsetPx = 96,
 }: {
   composition: Composition;
   bubble?: "thinking" | "recalling";
   emotionLabel?: Emotion;
   generation: number;
   bottomOffsetPx?: number;
+  horizontalOffsetPx?: number;
 }) {
   const [reducedMotion, setReducedMotion] = useState(false);
   useEffect(() => {
@@ -32,7 +34,10 @@ export function VoiceAvatar({
     <div
       aria-label="Talk 对话形象"
       className="absolute left-1/2 z-20 flex -translate-x-1/2 flex-col items-center"
-      style={{ bottom: `calc(100% + ${bottomOffsetPx}px)` }}
+      style={{
+        bottom: `calc(100% + ${bottomOffsetPx}px)`,
+        left: `calc(50% + ${horizontalOffsetPx}px)`,
+      }}
       data-testid="voice-avatar"
     >
       <VoiceEmotionBubble label={emotionLabel} />
