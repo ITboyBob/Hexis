@@ -54,6 +54,23 @@ class M5TaskWorker:
     async def wait_idle(self) -> None:
         await self._idle_event.wait()
 
+    async def finish_m5_round(
+        self,
+        task_id: UUID | str,
+        work_execution_id: UUID | str,
+        *,
+        report_outcome: str,
+    ) -> dict[str, Any]:
+        """Close only the current work after a terminal report and wake its successor."""
+        result = await self._service.finish_m5_round(
+            task_id,
+            work_execution_id,
+            report_outcome=report_outcome,
+        )
+        if result.get("finished") and result.get("next_work_execution_id"):
+            self.wake()
+        return result
+
     async def close(self) -> None:
         self._stop_event.set()
         self._wake_event.set()

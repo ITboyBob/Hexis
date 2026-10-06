@@ -18,6 +18,7 @@ _AUTHORIZATION_FIELDS = {
     "request_id",
     "actual_call_id",
 }
+_PENDING_AUTHORIZATION_FIELDS = _AUTHORIZATION_FIELDS | {"task_id"}
 def decode_task_work_input(
     value: str, context: Any = None
 ) -> tuple[str, list[str], list[dict], list[dict]]:
@@ -84,6 +85,20 @@ def _submit_digest(description: str) -> str:
     business_arguments = {
         "tool_name": "submit",
         "arguments": {"task_description": description},
+    }
+    canonical = json.dumps(
+        business_arguments,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _pending_digest(task_id: UUID, message: str) -> str:
+    business_arguments = {
+        "tool_name": "pend_message",
+        "arguments": {"task_id": str(task_id), "message": message},
     }
     canonical = json.dumps(
         business_arguments,
@@ -287,6 +302,110 @@ class M5TaskService:
                     "task_state": "working",
                     "revision": int(task["revision"]) + 1,
                 }
+
+    async def append_m5_message(
+        self,
+        origin_session_id: UUID | str,
+        task_id: UUID | str,
+        command_id: UUID | str,
+        message: str,
+        authorization: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one user-confirmed message and preserve FIFO/idempotency."""
+        origin_uuid = _uuid(origin_session_id, "origin_session_id")
+        task_uuid = _uuid(task_id, "task_id")
+        command_uuid = _uuid(command_id, "command_id")
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("pending message must not be blank")
+        if not isinstance(authorization, dict):
+            raise ValueError("host authorization identity must be an object")
+        unknown = set(authorization) - _PENDING_AUTHORIZATION_FIELDS
+        if unknown:
+            raise ValueError(
+                f"host authorization contains unsupported fields: {sorted(unknown)}"
+            )
+        if authorization.get("origin_session_id") != str(origin_uuid):
+            raise ValueError("authorization origin does not match the source chat")
+        if authorization.get("task_id") != str(task_uuid):
+            raise ValueError("selected task does not match the host authorization")
+        if not isinstance(authorization.get("actual_call_id"), str) or not authorization["actual_call_id"].strip():
+            raise ValueError("a real supplier call_id must be bound by the host")
+        if not isinstance(authorization.get("input_turn_id"), str):
+            raise ValueError("a formally authorized input_turn_id is required")
+        _uuid(authorization["input_turn_id"], "input_turn_id")
+        if not isinstance(authorization.get("response_id"), str) or not authorization["response_id"].strip():
+            raise ValueError("a local response_id is required")
+        if not isinstance(authorization.get("supplier_response_id"), str) or not authorization["supplier_response_id"].strip():
+            raise ValueError("a supplier response_id is required")
+        input_order = authorization.get("input_order")
+        stimulus_revision = authorization.get("stimulus_revision")
+        if (
+            isinstance(input_order, bool)
+            or not isinstance(input_order, int)
+            or input_order < 0
+            or isinstance(stimulus_revision, bool)
+            or not isinstance(stimulus_revision, int)
+            or stimulus_revision < 0
+        ):
+            raise ValueError("authorized input order and revision must be non-negative integers")
+
+        host_authorization = dict(authorization)
+        host_authorization.update(
+            command_id=str(command_uuid),
+            argument_digest=_pending_digest(task_uuid, message),
+        )
+        async with self._pool.acquire() as conn:
+            raw = await conn.fetchval(
+                "SELECT public.append_m5_message($1,$2,$3,$4,$5::jsonb)",
+                origin_uuid,
+                task_uuid,
+                command_uuid,
+                message,
+                json.dumps(host_authorization, ensure_ascii=False),
+            )
+        return _coerce_json(raw)
+
+    async def claim_next_m5_message(self, task_id: UUID | str) -> dict[str, Any] | None:
+        task_uuid = _uuid(task_id, "task_id")
+        async with self._pool.acquire() as conn:
+            raw = await conn.fetchval(
+                "SELECT public.claim_next_m5_message($1)", task_uuid
+            )
+        return _coerce_json(raw) if raw is not None else None
+
+    async def list_pending_messages(self, task_id: UUID | str) -> list[dict[str, Any]]:
+        task_uuid = _uuid(task_id, "task_id")
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, task_id, receive_order, message, received_at
+                FROM public.m5_pending_messages
+                WHERE task_id=$1 AND claimed_work_execution_id IS NULL
+                ORDER BY receive_order
+                """,
+                task_uuid,
+            )
+        return [dict(row) for row in rows]
+
+    async def finish_m5_round(
+        self,
+        task_id: UUID | str,
+        work_execution_id: UUID | str,
+        *,
+        report_outcome: str,
+    ) -> dict[str, Any]:
+        if report_outcome not in {"delivered", "exhausted", "refused"}:
+            raise ValueError("report_outcome must be terminal")
+        task_uuid = _uuid(task_id, "task_id")
+        work_id = _uuid(work_execution_id, "work_execution_id")
+        async with self._pool.acquire() as conn:
+            raw = await conn.fetchval(
+                "SELECT public.finish_m5_round($1,$2,$3)",
+                task_uuid,
+                work_id,
+                report_outcome,
+            )
+        return _coerce_json(raw)
 
     async def claim_work_round(self, work_execution_id: UUID | str) -> dict[str, Any] | None:
         work_id = _uuid(work_execution_id, "work_execution_id")

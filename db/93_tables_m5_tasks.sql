@@ -70,12 +70,70 @@ CREATE TABLE IF NOT EXISTS public.m5_work_rounds (
     UNIQUE (id, task_id)
 );
 
+-- S5 adds the append-only pending queue and its deferred bidirectional work links.
+CREATE TABLE IF NOT EXISTS public.m5_pending_messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id UUID NOT NULL
+        REFERENCES public.m5_tasks(id) ON DELETE RESTRICT,
+    command_id UUID NOT NULL UNIQUE
+        REFERENCES public.m5_actions(command_id) ON DELETE RESTRICT,
+    receive_order BIGINT NOT NULL CHECK (receive_order > 0),
+    message TEXT NOT NULL CHECK (NULLIF(btrim(message), '') IS NOT NULL),
+    received_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    claimed_work_execution_id UUID UNIQUE,
+    UNIQUE (task_id, receive_order),
+    UNIQUE (id, task_id)
+);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'm5_work_rounds_message_id_key'
+          AND conrelid = 'public.m5_work_rounds'::regclass
+    ) THEN
+        ALTER TABLE public.m5_work_rounds
+            ADD CONSTRAINT m5_work_rounds_message_id_key UNIQUE (message_id);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'm5_work_rounds_message_task_fkey'
+          AND conrelid = 'public.m5_work_rounds'::regclass
+    ) THEN
+        ALTER TABLE public.m5_work_rounds
+            ADD CONSTRAINT m5_work_rounds_message_task_fkey
+            FOREIGN KEY (message_id, task_id)
+            REFERENCES public.m5_pending_messages(id, task_id)
+            ON DELETE RESTRICT
+            DEFERRABLE INITIALLY DEFERRED;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'm5_pending_claimed_work_task_fkey'
+          AND conrelid = 'public.m5_pending_messages'::regclass
+    ) THEN
+        ALTER TABLE public.m5_pending_messages
+            ADD CONSTRAINT m5_pending_claimed_work_task_fkey
+            FOREIGN KEY (claimed_work_execution_id, task_id)
+            REFERENCES public.m5_work_rounds(id, task_id)
+            ON DELETE RESTRICT
+            DEFERRABLE INITIALLY DEFERRED;
+    END IF;
+END;
+$$;
+
 CREATE INDEX IF NOT EXISTS idx_m5_work_task_started
     ON public.m5_work_rounds (task_id, started_at);
 
 CREATE INDEX IF NOT EXISTS idx_m5_work_claimed
     ON public.m5_work_rounds (status)
     WHERE status = 'claimed';
+
+CREATE INDEX IF NOT EXISTS idx_m5_pending_unclaimed
+    ON public.m5_pending_messages (task_id, receive_order)
+    WHERE claimed_work_execution_id IS NULL;
 
 DO $$
 BEGIN

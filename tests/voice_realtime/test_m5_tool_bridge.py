@@ -102,6 +102,7 @@ async def test_multiple_calls_bind_actual_ids_to_one_authorized_voice_input():
 
     assert list(pending) == ["call-submit-1", "call-remember-1"]
     assert first.actual_call_id == "call-submit-1"
+    assert first.command_id is not None
     assert first.raw_arguments == '{"task_description":"  create a plan  "}'
     assert first.origin_session_id == session.session_id
     assert first.input_turn_id == input_turn_id
