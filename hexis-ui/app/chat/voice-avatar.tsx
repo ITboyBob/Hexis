@@ -1,16 +1,22 @@
 import { useEffect, useState } from "react";
 import type { Composition } from "@/lib/avatar-preview/engine";
+import type { Emotion } from "@/lib/avatar-preview/contracts";
 import { Avatar } from "../avatar-preview/avatar";
+import { VoiceEmotionBubble } from "./voice-emotion-bubble";
 import { VoiceBubble } from "./voice-bubble";
 
 export function VoiceAvatar({
   composition,
   bubble,
+  emotionLabel,
   generation,
+  bottomOffsetPx = 8,
 }: {
   composition: Composition;
   bubble?: "thinking" | "recalling";
+  emotionLabel?: Emotion;
   generation: number;
+  bottomOffsetPx?: number;
 }) {
   const [reducedMotion, setReducedMotion] = useState(false);
   useEffect(() => {
@@ -25,9 +31,11 @@ export function VoiceAvatar({
   return (
     <div
       aria-label="Talk 对话形象"
-      className="absolute bottom-[calc(100%+0.5rem)] left-1/2 z-20 flex -translate-x-1/2 flex-col items-center"
+      className="absolute left-1/2 z-20 flex -translate-x-1/2 flex-col items-center"
+      style={{ bottom: `calc(100% + ${bottomOffsetPx}px)` }}
       data-testid="voice-avatar"
     >
+      <VoiceEmotionBubble label={emotionLabel} />
       {bubble ? <div className="absolute bottom-full left-1/2 z-10 mb-1 -translate-x-1/2"><VoiceBubble stage={bubble} /></div> : null}
       <Avatar value={{ ...composition, reduced_motion: reducedMotion || composition.reduced_motion }} size={160} generation={generation} />
     </div>

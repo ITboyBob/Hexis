@@ -107,6 +107,7 @@ describe("voice avatar production event projection", () => {
 
     expect(projectVoiceAvatar(state)).toMatchObject({
       bubble: "recalling",
+      emotionLabel: "happy",
       composition: { eye: "happy", pose: "thinking" },
     });
 
@@ -140,6 +141,7 @@ describe("voice avatar production event projection", () => {
 
     const nextIdentity = { ...identity, input_turn_id: "input-2", input_order: 2 };
     state = applyVoiceBehaviorEvent(state, committed(5, nextIdentity));
+    expect(projectVoiceAvatar(state).emotionLabel).toBeUndefined();
     state = applyVoiceBehaviorEvent(state, event(6, "voice_recall_started", {
       identity,
       activity_id: "old-recall",

@@ -198,11 +198,19 @@ export function applyLocalPlaybackFeedback(
   return { ...state, localPlayback: { identity: { ...identity }, feedback: { ...feedback } } };
 }
 
-export function projectVoiceAvatar(state: VoiceAvatarState): { composition: Composition; bubble?: "thinking" | "recalling" } {
+export function projectVoiceAvatar(state: VoiceAvatarState): {
+  composition: Composition;
+  bubble?: "thinking" | "recalling";
+  emotionLabel?: Emotion;
+} {
   const focus = compose(state.preview, undefined, 8).value;
   const identity = state.preview.current;
   const hasCurrentRecall = identity && Object.values(state.recallActivities).some((item) => sameIdentity(item.identity, identity));
   const hasCurrentModelCall = identity && Object.values(state.modelActivities).some((item) => sameIdentity(item.identity, identity));
+  const emotionLabel = identity && state.preview.last_valid
+    && sameIdentity(state.preview.last_valid.identity, identity)
+    ? state.preview.last_valid.label
+    : undefined;
   const localPlayback = state.localPlayback;
   const playing = !!localPlayback && localPlayback.feedback.phase === "playing"
     && localPlayback.identity.media_session_id === state.media_session_id;
@@ -214,6 +222,7 @@ export function projectVoiceAvatar(state: VoiceAvatarState): { composition: Comp
   };
   return {
     composition,
+    ...(emotionLabel ? { emotionLabel } : {}),
     ...(hasCurrentRecall ? { bubble: "recalling" as const }
       : hasCurrentModelCall ? { bubble: "thinking" as const } : {}),
   };

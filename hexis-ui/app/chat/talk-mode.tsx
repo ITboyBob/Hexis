@@ -1,7 +1,7 @@
 "use client";
 
 import { Radio, Square, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AudioCaptureController } from "@/lib/voice-realtime/capture";
 import { VoiceRealtimeClient } from "@/lib/voice-realtime/client";
 import type { RealtimeServerMessage } from "@/lib/voice-realtime/contracts";
@@ -62,6 +62,7 @@ export function TalkMode({
   const [error, setError] = useState<string | null>(null);
   const [retryAvailable, setRetryAvailable] = useState(false);
   const [avatarState, setAvatarState] = useState(() => initialVoiceAvatarState(sessionId ?? ""));
+  const [statusCardHeight, setStatusCardHeight] = useState(0);
   const clientRef = useRef<VoiceRealtimeClient | null>(null);
   const captureRef = useRef<AudioCaptureController | null>(null);
   const outputsRef = useRef(new Map<string, TalkOutput>());
@@ -69,6 +70,7 @@ export function TalkMode({
   const activeRef = useRef(false);
   const mountedRef = useRef(true);
   const sessionIdRef = useRef(sessionId);
+  const statusCardRef = useRef<HTMLDivElement>(null);
   const avatar = projectVoiceAvatar(avatarState);
 
   const refreshSpeaking = useCallback(() => {
@@ -143,6 +145,20 @@ export function TalkMode({
       setAvatarState(initialVoiceAvatarState(sessionId));
     }
   }, [avatarState.session_id, sessionId]);
+
+  useLayoutEffect(() => {
+    const node = statusCardRef.current;
+    if (!node) {
+      setStatusCardHeight(0);
+      return;
+    }
+    const measure = () => setStatusCardHeight(node.getBoundingClientRect().height);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [phase, error, retryAvailable, speaking]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -346,7 +362,13 @@ export function TalkMode({
   return (
     <div className={`relative flex-none ${phase !== "idle" ? "z-40" : ""}`}>
       {phase !== "idle" && phase !== "closing" ? (
-        <VoiceAvatar composition={avatar.composition} bubble={avatar.bubble} generation={0} />
+        <VoiceAvatar
+          composition={avatar.composition}
+          bubble={avatar.bubble}
+          emotionLabel={avatar.emotionLabel}
+          generation={0}
+          bottomOffsetPx={statusCardHeight + 16}
+        />
       ) : null}
       {phase === "idle" ? (
         <button
@@ -381,7 +403,7 @@ export function TalkMode({
         </button>
       )}
       {phase !== "idle" ? (
-        <div className="absolute bottom-12 left-0 z-30 w-72 rounded-lg border border-[var(--outline)] bg-white p-3 shadow-xl">
+        <div ref={statusCardRef} className="absolute bottom-12 left-0 z-30 w-72 rounded-lg border border-[var(--outline)] bg-white p-3 shadow-xl" data-testid="voice-status-card">
           <p className="text-xs font-semibold">{phaseLabel[phase]}</p>
           <p className="mt-2 text-[11px] text-[var(--ink-soft)]">
             {phase === "listening"

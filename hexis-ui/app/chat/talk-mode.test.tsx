@@ -255,6 +255,7 @@ describe("TalkMode", () => {
     send(4, "voice_model_call_started", { identity, activity_id: "response-1", state: "started" });
     send(5, "voice_recall_started", { identity, activity_id: "call-1", state: "started" });
     expect(screen.getByTestId("voice-stage-bubble")).toHaveTextContent("recalling");
+    expect(screen.getByTestId("voice-emotion-bubble")).toHaveTextContent("happy");
     expect(screen.getByTestId("talk-avatar-engine")).toHaveAttribute("aria-label", "眼形 happy，活动 thinking");
 
     send(6, "voice_recall_ended", { identity, activity_id: "call-1", state: "ended" });
@@ -262,6 +263,7 @@ describe("TalkMode", () => {
     const nextIdentity = { ...identity, input_turn_id: "input-2", input_order: 2 };
     send(7, "voice_input_committed", { identity: nextIdentity });
     expect(screen.queryByTestId("voice-stage-bubble")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("voice-emotion-bubble")).not.toBeInTheDocument();
     send(8, "voice_recall_started", { identity, activity_id: "old-recall", state: "started" });
     send(9, "voice_model_call_started", { identity: nextIdentity, activity_id: "response-2", state: "started" });
     send(10, "waiting_for_user", { identity: nextIdentity, state: "started" });
