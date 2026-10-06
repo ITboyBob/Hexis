@@ -474,6 +474,7 @@ class VoiceRealtimeSession:
             self._voice_tool_call_counts[input_turn_id] = count + 1
         bound = BoundToolCall(
             actual_call_id=call_id,
+            command_id=uuid4(),
             name=name,
             raw_arguments=arguments,
             origin_session_id=self.session_id,

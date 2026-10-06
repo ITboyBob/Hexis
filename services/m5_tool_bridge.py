@@ -18,6 +18,7 @@ from services.m5_tool_contracts import (
 @dataclass(frozen=True)
 class BoundToolCall:
     actual_call_id: str
+    command_id: UUID
     name: str
     raw_arguments: str
     origin_session_id: UUID
@@ -120,7 +121,17 @@ async def execute_bound_tool(
             message=f"No backend handler is available for {call.name} in this runtime.",
         )
 
-    result = await handler(call, arguments)
+    try:
+        result = await handler(call, arguments)
+    except Exception:
+        return _failed_receipt(
+            call,
+            code="EXECUTION_UNKNOWN",
+            message=(
+                "The host could not confirm this operation. Do not repeat the same "
+                "call automatically; inspect the authoritative task state first."
+            ),
+        )
     receipt = build_receipt(
         tool_name=call.name,
         call_id=call.actual_call_id,

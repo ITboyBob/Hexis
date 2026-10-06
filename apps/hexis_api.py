@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 _pool: asyncpg.Pool | None = None
 _voice_realtime_registry: Any | None = None
 _voice_playback_watchdog: Any | None = None
+_m5_task_worker: Any | None = None
 
 
 def _dsn() -> str:
@@ -75,7 +76,7 @@ def _dsn() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pool
+    global _pool, _m5_task_worker
     dsn = _dsn()
     # Bring the schema up to date on startup (advisory-locked, idempotent, no data loss).
     try:
@@ -94,6 +95,32 @@ async def lifespan(app: FastAPI):
 
     set_usage_pool(_pool)
     try:
+        async with _pool.acquire() as conn:
+            m5_ready = await conn.fetchval(
+                """
+                SELECT to_regclass('public.m5_actions') IS NOT NULL
+                   AND to_regclass('public.m5_tasks') IS NOT NULL
+                   AND to_regclass('public.m5_work_rounds') IS NOT NULL
+                """
+            )
+        if m5_ready:
+            from services.m5_task_service import M5TaskService
+            from services.m5_task_worker import M5TaskWorker
+
+            interrupted = await M5TaskService(_pool).mark_interrupted_work_unknown()
+            if interrupted:
+                logger.warning(
+                    "Marked %d interrupted M5 work round(s) unknown; they will not be rerun",
+                    interrupted,
+                )
+            _m5_task_worker = M5TaskWorker(_pool)
+            _m5_task_worker.start()
+        else:
+            logger.warning("M5 task worker is disabled because the M5 schema is unavailable")
+    except Exception:
+        _m5_task_worker = None
+        logger.exception("M5 task worker could not start")
+    try:
         from core.agent_api import record_build_change
 
         async with _pool.acquire() as conn:
@@ -105,6 +132,12 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await auth_flow_coordinator.close()
+        if _m5_task_worker is not None:
+            try:
+                await _m5_task_worker.close()
+            except Exception:
+                logger.exception("M5 task worker shutdown failed")
+            _m5_task_worker = None
         try:
             from core.tools.mcp_runtime import MCPRuntime
 
@@ -2618,6 +2651,11 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
     registry = _voice_realtime_session_registry()
     if registry.get(req.session_id) is not None:
         raise HTTPException(status_code=409, detail="This chat already has an active realtime session.")
+    if req.tool_surface == "m5" and _m5_task_worker is None:
+        raise HTTPException(
+            status_code=503,
+            detail="M5 realtime tools are unavailable because the task worker is not ready.",
+        )
 
     async with _pool.acquire() as conn:
         stale_id = await conn.fetchval(
@@ -3109,8 +3147,78 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                         await session.release_response(response_id)
                         from services.m5_tool_bridge import execute_bound_tool
                         from services.voice_recall import VoiceRecallService
+                        from services.m5_task_service import M5TaskService
 
                         tool_outputs: list[tuple[str, str]] = []
+
+                        async def submit_m5_tool(bound_call: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+                            voice_turn = session._voice_turns.get(
+                                bound_call.input_turn_id
+                            )
+                            original_request = (
+                                voice_turn.get("user_text")
+                                if isinstance(voice_turn, dict)
+                                else None
+                            )
+                            if (
+                                not isinstance(original_request, str)
+                                or not original_request.strip()
+                            ):
+                                return {
+                                    "ok": False,
+                                    "state": "failed",
+                                    "operation_id": str(bound_call.command_id),
+                                    "data": {},
+                                    "error": {
+                                        "code": "UNAUTHORIZED_INPUT",
+                                        "message": "The authorized voice input is unavailable.",
+                                        "retryable": False,
+                                    },
+                                }
+                            authorization = {
+                                "origin_session_id": str(session.session_id),
+                                "input_turn_id": bound_call.input_turn_id,
+                                "input_order": bound_call.input_order,
+                                "stimulus_revision": bound_call.stimulus_revision,
+                                "response_id": bound_call.response_id,
+                                "supplier_response_id": bound_call.supplier_response_id,
+                                "request_id": bound_call.request_id,
+                                "actual_call_id": bound_call.actual_call_id,
+                            }
+                            result = await M5TaskService(_pool).submit_m5_task(
+                                session.session_id,
+                                bound_call.command_id,
+                                arguments["task_description"],
+                                original_request,
+                                authorization,
+                            )
+                            if not result.get("accepted"):
+                                return {
+                                    "ok": False,
+                                    "state": "failed",
+                                    "operation_id": str(bound_call.command_id),
+                                    "data": {},
+                                    "error": result.get("error") or {
+                                        "code": "EXECUTION_UNKNOWN",
+                                        "message": "The task host returned no accepted result.",
+                                        "retryable": False,
+                                    },
+                                }
+                            worker = _m5_task_worker
+                            if worker is not None:
+                                worker.wake()
+                            return {
+                                "ok": True,
+                                "state": "accepted",
+                                "operation_id": str(bound_call.command_id),
+                                "data": {
+                                    "task_id": result["task_id"],
+                                    "task_title": result["task_title"],
+                                    "task_state": result["task_state"],
+                                },
+                                "error": None,
+                            }
+
                         for bound_call in pending_voice_calls.values():
                             session.validate_voice_tool_call(bound_call)
                             if bound_call.name == "voice_recall":
@@ -3188,7 +3296,9 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                                 )
                             else:
                                 tool_output = await execute_bound_tool(
-                                    session, bound_call, handlers={}
+                                    session,
+                                    bound_call,
+                                    handlers={"submit": submit_m5_tool},
                                 )
                             tool_outputs.append(
                                 (bound_call.actual_call_id, tool_output)
@@ -4284,6 +4394,11 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 attachment.model_dump(exclude_none=True)
                 for attachment in (req.attachments or [])[:16]
             ],
+            m5_task_wake=(
+                _m5_task_worker.wake
+                if _m5_task_worker is not None and _m5_task_worker.running
+                else None
+            ),
         ):
             if event.event == AgentEvent.PHASE_CHANGE:
                 phase = event.data.get("phase", "")

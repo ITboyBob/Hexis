@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import inspect
 from typing import Any, AsyncIterator, Awaitable, Callable
 from uuid import UUID
 
@@ -838,6 +839,7 @@ async def stream_chat_events(
     on_approval: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None,
     visual_attachments: list[dict[str, Any]] | None = None,
     attachments: list[dict[str, Any]] | None = None,
+    m5_task_wake: Callable[[], Any] | None = None,
 ) -> AsyncIterator[AgentEventData]:
     """Canonical streaming chat orchestration.
 
@@ -856,6 +858,85 @@ async def stream_chat_events(
         pool = await asyncpg.create_pool(dsn, min_size=_min, max_size=_max)
 
     try:
+        if session_id is not None:
+            from services.m5_task_service import M5TaskService
+
+            task_service = M5TaskService(pool)
+            task = await task_service.resolve_task_session(session_id)
+            if task is not None:
+                if m5_task_wake is None:
+                    yield AgentEventData(
+                        event=AgentEvent.ERROR,
+                        data={
+                            "error": (
+                                "The task worker is not ready. This message was not "
+                                "accepted; retry after the service recovers."
+                            ),
+                            "m5_task_id": str(task["task_id"]),
+                            "task_state": task["product_state"],
+                        },
+                    )
+                    return
+                if task["product_state"] != "idle":
+                    yield AgentEventData(
+                        event=AgentEvent.ERROR,
+                        data={
+                            "error": (
+                                "This task is already working. This message was not "
+                                "queued; use the foreground task message action to add it."
+                            ),
+                            "m5_task_id": str(task["task_id"]),
+                            "task_state": task["product_state"],
+                        },
+                    )
+                    return
+                accepted = await task_service.create_idle_work_round(
+                    session_id,
+                    user_message,
+                    prompt_addenda=prompt_addenda,
+                    visual_attachments=visual_attachments,
+                    attachments=attachments,
+                )
+                if not accepted.get("accepted"):
+                    yield AgentEventData(
+                        event=AgentEvent.ERROR,
+                        data={
+                            "error": (
+                                "This task is already working. This message was not "
+                                "queued; use the foreground task message action to add it."
+                            ),
+                            "m5_task_id": accepted.get("task_id"),
+                            "task_state": accepted.get("task_state", "working"),
+                        },
+                    )
+                    return
+                wake_result = m5_task_wake()
+                if inspect.isawaitable(wake_result):
+                    await wake_result
+                yield AgentEventData(
+                    event=AgentEvent.LOOP_START,
+                    data={"phase": "m5_task", "runtime": "m5_task"},
+                )
+                yield AgentEventData(
+                    event=AgentEvent.TEXT_DELTA,
+                    data={
+                        "text": (
+                            "本轮要求已交给这个任务继续处理，结果会保存在当前任务会话中。"
+                        ),
+                        "runtime": "m5_task",
+                    },
+                )
+                yield AgentEventData(
+                    event=AgentEvent.LOOP_END,
+                    data={
+                        "stopped_reason": "completed",
+                        "runtime": "m5_task",
+                        "task_id": accepted["task_id"],
+                        "task_state": accepted["task_state"],
+                    },
+                )
+                return
+
         is_operator = _trusted_operator_turn(
             surface=surface,
             is_group=is_group,

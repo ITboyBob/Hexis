@@ -93,6 +93,23 @@ class BackgroundExecutor:
         )
 
     @staticmethod
+    def m5_work_result_payload(result: AgentLoopResult) -> dict[str, Any]:
+        """Persist the actual work result without copying prompt/config internals."""
+        return {
+            "text": str(result.text or ""),
+            "visible_text": str(result.visible_text or ""),
+            "tool_calls_made": [
+                {"name": item.get("name"), "call_id": item.get("call_id")}
+                for item in (result.tool_calls_made or [])
+                if isinstance(item, dict)
+            ],
+            "tool_results": result.tool_results or [],
+            "iterations": int(result.iterations),
+            "timed_out": bool(result.timed_out),
+            "stopped_reason": str(result.stopped_reason),
+        }
+
+    @staticmethod
     def _succeeded(result: AgentLoopResult, criteria: str) -> bool:
         if result.timed_out or result.stopped_reason != "completed":
             return False

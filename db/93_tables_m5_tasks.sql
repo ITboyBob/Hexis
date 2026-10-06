@@ -1,0 +1,95 @@
+-- Durable M5 action, task, and first-work identities.
+SET search_path = public, ag_catalog, "$user";
+
+CREATE TABLE IF NOT EXISTS public.m5_actions (
+    command_id UUID PRIMARY KEY,
+    origin_session_id UUID NOT NULL
+        REFERENCES public.chat_sessions(id) ON DELETE RESTRICT,
+    tool_name TEXT NOT NULL
+        CHECK (tool_name IN ('submit', 'pend_message', 'remember', 'add_evidence')),
+    argument_digest TEXT NOT NULL
+        CHECK (argument_digest ~ '^[0-9a-f]{64}$'),
+    "authorization" JSONB NOT NULL
+        CHECK (jsonb_typeof("authorization") = 'object'),
+    actual_call_id TEXT NOT NULL
+        CHECK (NULLIF(btrim(actual_call_id), '') IS NOT NULL),
+    state TEXT NOT NULL DEFAULT 'accepted'
+        CHECK (state IN (
+            'accepted', 'pending', 'selection_cancelled', 'done',
+            'failed', 'unknown'
+        )),
+    result JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX IF NOT EXISTS idx_m5_actions_accepted
+    ON public.m5_actions (state, created_at)
+    WHERE state = 'accepted';
+
+CREATE TABLE IF NOT EXISTS public.m5_tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    origin_session_id UUID NOT NULL
+        REFERENCES public.chat_sessions(id) ON DELETE RESTRICT,
+    task_session_id UUID NOT NULL UNIQUE
+        REFERENCES public.chat_sessions(id) ON DELETE RESTRICT,
+    submit_command_id UUID NOT NULL UNIQUE
+        REFERENCES public.m5_actions(command_id) ON DELETE RESTRICT,
+    task_description TEXT NOT NULL
+        CHECK (NULLIF(btrim(task_description), '') IS NOT NULL),
+    original_user_request TEXT NOT NULL
+        CHECK (NULLIF(btrim(original_user_request), '') IS NOT NULL),
+    product_state TEXT NOT NULL DEFAULT 'working'
+        CHECK (product_state IN ('working', 'idle')),
+    current_work_execution_id UUID,
+    revision BIGINT NOT NULL DEFAULT 1 CHECK (revision > 0),
+    next_receive_order BIGINT NOT NULL DEFAULT 0 CHECK (next_receive_order >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX IF NOT EXISTS idx_m5_tasks_origin_created
+    ON public.m5_tasks (origin_session_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_m5_tasks_state_work
+    ON public.m5_tasks (product_state, current_work_execution_id);
+
+CREATE TABLE IF NOT EXISTS public.m5_work_rounds (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id UUID NOT NULL
+        REFERENCES public.m5_tasks(id) ON DELETE RESTRICT,
+    message_id UUID,
+    status TEXT NOT NULL DEFAULT 'claimed'
+        CHECK (status IN ('claimed', 'running', 'completed', 'failed', 'unknown')),
+    turn_id UUID REFERENCES public.agent_turns(id) ON DELETE RESTRICT,
+    input TEXT NOT NULL CHECK (NULLIF(btrim(input), '') IS NOT NULL),
+    result JSONB,
+    error TEXT,
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    UNIQUE (id, task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_m5_work_task_started
+    ON public.m5_work_rounds (task_id, started_at);
+
+CREATE INDEX IF NOT EXISTS idx_m5_work_claimed
+    ON public.m5_work_rounds (status)
+    WHERE status = 'claimed';
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'm5_tasks_current_work_execution_id_fkey'
+          AND conrelid = 'public.m5_tasks'::regclass
+    ) THEN
+        ALTER TABLE public.m5_tasks
+            ADD CONSTRAINT m5_tasks_current_work_execution_id_fkey
+            FOREIGN KEY (current_work_execution_id)
+            REFERENCES public.m5_work_rounds(id)
+            ON DELETE RESTRICT
+            DEFERRABLE INITIALLY DEFERRED;
+    END IF;
+END;
+$$;
