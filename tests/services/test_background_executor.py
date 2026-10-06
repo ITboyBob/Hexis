@@ -29,27 +29,27 @@ def _patch_explicit_assembly(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("services.agent.run_agent", fail_old_runner)
     monkeypatch.setattr("services.agent.run_subconscious_appraisal", fail_appraisal)
     monkeypatch.setattr(
-        "services.background_executor.load_llm_config",
+        "services.background_preparation.load_llm_config",
         AsyncMock(return_value={"provider": "fake-provider", "model": "fake-model"}),
     )
     monkeypatch.setattr(
-        "services.background_executor.get_agent_profile_context",
+        "services.background_preparation.get_agent_profile_context",
         AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
-        "services.background_executor.CognitiveMemory.hydrate",
+        "services.background_preparation.CognitiveMemory.hydrate",
         AsyncMock(return_value=_hydrated_context()),
     )
     monkeypatch.setattr(
-        "services.background_executor.render_chat_memory_context_db",
+        "services.background_preparation.render_chat_memory_context_db",
         AsyncMock(return_value="memory context"),
     )
     monkeypatch.setattr(
-        "services.background_executor.render_chat_continuity_context_db",
+        "services.background_preparation.render_chat_continuity_context_db",
         AsyncMock(return_value="continuity context"),
     )
     monkeypatch.setattr(
-        "services.background_executor.build_system_prompt",
+        "services.background_preparation.build_system_prompt",
         AsyncMock(return_value="background system prompt"),
     )
 
@@ -164,20 +164,20 @@ async def test_run_explicitly_assembles_real_agent_loop(db_pool, monkeypatch):
     monkeypatch.setattr("services.agent.run_agent", fail_old_runner)
     monkeypatch.setattr("services.agent.run_subconscious_appraisal", fail_appraisal)
     monkeypatch.setattr(
-        "services.background_executor.load_llm_config",
+        "services.background_preparation.load_llm_config",
         AsyncMock(return_value={"provider": "fake-provider", "model": "fake-model"}),
     )
     monkeypatch.setattr(
-        "services.background_executor.get_agent_profile_context",
+        "services.background_preparation.get_agent_profile_context",
         AsyncMock(return_value={"persona": {"name": "Hexis"}}),
     )
     hydrate = AsyncMock(return_value=_hydrated_context())
     monkeypatch.setattr(
-        "services.background_executor.CognitiveMemory.hydrate",
+        "services.background_preparation.CognitiveMemory.hydrate",
         hydrate,
     )
     monkeypatch.setattr(
-        "services.background_executor.render_chat_memory_context_db",
+        "services.background_preparation.render_chat_memory_context_db",
         AsyncMock(return_value="memory context"),
     )
     continuity_calls: list[dict[str, Any]] = []
@@ -199,7 +199,7 @@ async def test_run_explicitly_assembles_real_agent_loop(db_pool, monkeypatch):
         return "continuity context"
 
     monkeypatch.setattr(
-        "services.background_executor.render_chat_continuity_context_db",
+        "services.background_preparation.render_chat_continuity_context_db",
         fake_continuity,
     )
     prompt_calls: list[dict[str, Any]] = []
@@ -209,8 +209,26 @@ async def test_run_explicitly_assembles_real_agent_loop(db_pool, monkeypatch):
         return "background system prompt"
 
     monkeypatch.setattr(
-        "services.background_executor.build_system_prompt",
+        "services.background_preparation.build_system_prompt",
         fake_prompt,
+    )
+    selected = {}
+    original_select_skills = __import__(
+        "services.background_preparation", fromlist=["select_skills"]
+    ).select_skills
+
+    async def capture_selection(*args: Any, **kwargs: Any):
+        selected["value"] = await original_select_skills(*args, **kwargs)
+        return selected["value"]
+
+    monkeypatch.setattr(
+        "services.background_preparation.select_skills", capture_selection
+    )
+    db_history = [{"role": "assistant", "content": "authoritative db history"}]
+    hydrate_history = AsyncMock(return_value=db_history)
+    monkeypatch.setattr(
+        "services.background_executor.CognitiveMemory.hydrate_chat_session",
+        hydrate_history,
     )
 
     captured: dict[str, Any] = {}
@@ -223,6 +241,8 @@ async def test_run_explicitly_assembles_real_agent_loop(db_pool, monkeypatch):
     ) -> AgentLoopResult:
         captured["config"] = self.config
         captured["user_message"] = user_message
+        captured["history"] = history
+        captured["user_content"] = user_content
         return _loop_result(
             text="done",
             visible_text="done",
@@ -248,6 +268,7 @@ async def test_run_explicitly_assembles_real_agent_loop(db_pool, monkeypatch):
     assert outcome["succeeded"] is True
     assert outcome["criteria_met"] is True
     assert outcome["task_updated"] is True
+    hydrate_history.assert_awaited_once_with(session_id)
     assert hydrate.await_args.kwargs["session_id"] == str(session_id)
     assert hydrate.await_args.kwargs["include_partial"] is True
     assert hydrate.await_args.kwargs["include_identity"] is True
@@ -265,8 +286,8 @@ async def test_run_explicitly_assembles_real_agent_loop(db_pool, monkeypatch):
 
     prompt_kwargs = prompt_calls[0]["kwargs"]
     assert prompt_kwargs["surface"] == "background"
-    assert prompt_kwargs["active_skills"] == []
-    assert prompt_kwargs["available_skills"] == []
+    assert prompt_kwargs["active_skills"] == selected["value"].skills
+    assert prompt_kwargs["available_skills"] == selected["value"].available
     assert prompt_kwargs["allowed_tool_names"] is None
 
     config = captured["config"]
@@ -277,6 +298,7 @@ async def test_run_explicitly_assembles_real_agent_loop(db_pool, monkeypatch):
     assert config.allowed_tool_names is None
     assert config.surface == "background"
     assert config.session_id == str(session_id)
+    assert captured["history"] == db_history
     assert "recall" in config.registry.list_names()
     assert "remember" in config.registry.list_names()
     assert captured["user_message"] == (
@@ -327,19 +349,19 @@ async def test_strict_continuity_failure_fails_task_and_propagates(
     monkeypatch.setattr("services.agent.run_subconscious_appraisal", fail_appraisal)
     monkeypatch.setattr(AgentLoop, "run", fail_agent_run)
     monkeypatch.setattr(
-        "services.background_executor.load_llm_config",
+        "services.background_preparation.load_llm_config",
         AsyncMock(return_value={"provider": "fake-provider", "model": "fake-model"}),
     )
     monkeypatch.setattr(
-        "services.background_executor.get_agent_profile_context",
+        "services.background_preparation.get_agent_profile_context",
         AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
-        "services.background_executor.CognitiveMemory.hydrate",
+        "services.background_preparation.CognitiveMemory.hydrate",
         AsyncMock(return_value=_hydrated_context()),
     )
     monkeypatch.setattr(
-        "services.background_executor.render_chat_memory_context_db",
+        "services.background_preparation.render_chat_memory_context_db",
         AsyncMock(return_value="memory context"),
     )
 
@@ -348,7 +370,7 @@ async def test_strict_continuity_failure_fails_task_and_propagates(
         raise RuntimeError("continuity unavailable")
 
     monkeypatch.setattr(
-        "services.background_executor.render_chat_continuity_context_db",
+        "services.background_preparation.render_chat_continuity_context_db",
         failing_continuity,
     )
 

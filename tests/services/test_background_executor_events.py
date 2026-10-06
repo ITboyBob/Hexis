@@ -68,27 +68,27 @@ def _patch_explicit_assembly(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("services.agent.run_agent", fail_old_runner)
     monkeypatch.setattr("services.agent.run_subconscious_appraisal", fail_appraisal)
     monkeypatch.setattr(
-        "services.background_executor.load_llm_config",
+        "services.background_preparation.load_llm_config",
         AsyncMock(return_value={"provider": "fake-provider", "model": "fake-model"}),
     )
     monkeypatch.setattr(
-        "services.background_executor.get_agent_profile_context",
+        "services.background_preparation.get_agent_profile_context",
         AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
-        "services.background_executor.CognitiveMemory.hydrate",
+        "services.background_preparation.CognitiveMemory.hydrate",
         AsyncMock(return_value=_hydrated_context()),
     )
     monkeypatch.setattr(
-        "services.background_executor.render_chat_memory_context_db",
+        "services.background_preparation.render_chat_memory_context_db",
         AsyncMock(return_value="memory context"),
     )
     monkeypatch.setattr(
-        "services.background_executor.render_chat_continuity_context_db",
+        "services.background_preparation.render_chat_continuity_context_db",
         AsyncMock(return_value="continuity context"),
     )
     monkeypatch.setattr(
-        "services.background_executor.build_system_prompt",
+        "services.background_preparation.build_system_prompt",
         AsyncMock(return_value="background system prompt"),
     )
 

@@ -1061,7 +1061,11 @@ BEGIN
         p_session_id,
         COALESCE(NULLIF(btrim(p_surface), ''), 'chat'),
         COALESCE(NULLIF(btrim(p_tool_context), ''), 'chat'),
-        CASE WHEN p_decision_kind = 'skill_activation' THEN p_decision_kind ELSE 'selection' END,
+        CASE
+            WHEN p_decision_kind IN ('skill_activation', 'background_default')
+                THEN p_decision_kind
+            ELSE 'selection'
+        END,
         COALESCE(NULLIF(btrim(p_input_text_hash), ''), repeat('0', 64)),
         COALESCE(p_selected_skills, ARRAY[]::TEXT[]),
         COALESCE(p_considered, '[]'::jsonb),

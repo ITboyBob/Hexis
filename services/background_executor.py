@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from core.agent_api import get_agent_profile_context
 from core.agent_loop import (
     AgentEvent,
     AgentEventData,
@@ -16,11 +15,12 @@ from core.agent_loop import (
     AgentLoopConfig,
     AgentLoopResult,
 )
-from core.cognitive_memory_api import CognitiveMemory, render_chat_memory_context_db
+from core.cognitive_memory_api import CognitiveMemory
 from core.llm_config import load_llm_config
 from core.tools import ToolContext, ToolRegistry, create_default_registry
-from services.agent import build_system_prompt, render_chat_continuity_context_db
 from services.behavior_events import BehaviorEvent, record_behavior_event
+from services.background_preparation import prepare_background_turn
+from services.tool_surface_audit import hash_input_text
 
 
 _SUCCESS_CRITERIA = {"text", "tool", "text_and_tool"}
@@ -64,8 +64,33 @@ class BackgroundExecutor:
         return create_default_registry(self._pool)
 
     async def execute_work(self, prepared: Any, on_event: Any = None) -> AgentLoopResult:
-        """Execute one already prepared background turn."""
-        raise NotImplementedError
+        """Execute one already prepared background turn with host policy intact."""
+        options = prepared.loop_options
+        config = AgentLoopConfig(
+            tool_context=ToolContext.CHAT,
+            system_prompt=prepared.system_prompt,
+            llm_config=prepared.llm_config,
+            registry=prepared.registry,
+            pool=self._pool,
+            energy_budget=None,
+            timeout_seconds=options["timeout_seconds"],
+            temperature=options["temperature"],
+            max_tokens=options["max_tokens"],
+            session_id=prepared.session_id,
+            is_operator=options["is_operator"],
+            on_approval=options["on_approval"],
+            on_event=on_event,
+            allowed_tool_names=None,
+            active_skill_names=[skill.name for skill in prepared.selection.skills],
+            surface="background",
+            tool_surface_input_hash=hash_input_text(prepared.user_message),
+            available_skill_count=len(prepared.selection.available),
+        )
+        return await AgentLoop(config).run(
+            prepared.user_message,
+            history=prepared.history,
+            user_content=prepared.user_content,
+        )
 
     @staticmethod
     def _succeeded(result: AgentLoopResult, criteria: str) -> bool:
@@ -426,64 +451,18 @@ class BackgroundExecutor:
                 payload={"status": "running"},
             )
 
-            llm_config = await self._load_config()
-            registry = await self._create_registry()
-            profile = await get_agent_profile_context(pool=self._pool)
             memory = CognitiveMemory(self._pool)
-            context = await memory.hydrate(
-                request.instruction,
-                memory_limit=10,
-                include_partial=True,
-                include_identity=True,
-                include_worldview=True,
-                include_emotional_state=True,
-                include_goals=True,
-                include_drives=True,
-                session_id=str(request.session_id),
-            )
-            async with self._pool.acquire() as conn:
-                memory_context = await render_chat_memory_context_db(
-                    conn, context, max_memories=10
-                )
-                continuity = await render_chat_continuity_context_db(
-                    conn,
-                    str(request.session_id),
-                    strict=True,
-                )
-
-            prompt = await build_system_prompt(
-                "chat",
-                registry,
-                profile,
-                active_skills=[],
-                available_skills=[],
-                allowed_tool_names=None,
-                surface="background",
-            )
-            user_message = "\n\n".join(
-                part
-                for part in (continuity, memory_context, request.instruction)
-                if part
-            )
-
-            config = AgentLoopConfig(
-                tool_context=ToolContext.CHAT,
-                system_prompt=prompt,
-                llm_config=llm_config,
-                registry=registry,
-                pool=self._pool,
-                energy_budget=None,
-                timeout_seconds=300.0,
-                max_tokens=4096,
-                session_id=str(request.session_id),
-                allowed_tool_names=None,
-                surface="background",
-            )
             async def on_agent_event(event: AgentEventData) -> None:
                 await self._on_agent_event(event, state)
 
-            config.on_event = on_agent_event
-            result = await AgentLoop(config).run(user_message)
+            history = await memory.hydrate_chat_session(request.session_id)
+            prepared = await prepare_background_turn(
+                self._pool,
+                request.session_id,
+                request.instruction,
+                history,
+            )
+            result = await self.execute_work(prepared, on_event=on_agent_event)
             turn_id = self._turn_id(result)
             if state.error is not None:
                 raise state.error

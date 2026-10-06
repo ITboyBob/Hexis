@@ -543,6 +543,8 @@ async def record_selection(
     surface: str,
     tool_context: ToolContext,
     query: str,
+    actual_tool_names: set[str] | None = None,
+    decision_kind: str = "selection",
 ) -> None:
     """Record what the selector decided. Advisory — never breaks a turn.
 
@@ -571,17 +573,41 @@ async def record_selection(
         # The selection row records why skills won. The immutable surface audit
         # records whether their tools actually survived registry + config
         # resolution. Keep these separate so existing telemetry remains stable.
-        from services.tool_surface_audit import record_tool_surface_decision
+        if actual_tool_names is None and decision_kind == "selection":
+            from services.tool_surface_audit import record_tool_surface_decision
 
-        await record_tool_surface_decision(
-            pool,
-            registry=registry,
-            selection=selection,
-            session_id=session_id,
-            surface=surface,
-            tool_context=tool_context,
-            query=query,
-        )
+            await record_tool_surface_decision(
+                pool,
+                registry=registry,
+                selection=selection,
+                session_id=session_id,
+                surface=surface,
+                tool_context=tool_context,
+                query=query,
+            )
+        else:
+            from services.tool_surface_audit import (
+                hash_input_text,
+                record_tool_surface_snapshot,
+            )
+
+            await record_tool_surface_snapshot(
+                pool,
+                registry=registry,
+                allowed_tool_names=(
+                    set(actual_tool_names)
+                    if actual_tool_names is not None
+                    else set(selection.allowed_tool_names)
+                ),
+                active_skill_names=[str(skill.name) for skill in selection.skills],
+                considered=selection.considered,
+                available_skill_count=len(selection.available),
+                session_id=session_id,
+                surface=surface,
+                tool_context=tool_context,
+                input_text_hash=hash_input_text(query),
+                decision_kind=decision_kind,
+            )
 
 
 async def record_gate_refusal(

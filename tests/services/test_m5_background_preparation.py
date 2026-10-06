@@ -40,7 +40,12 @@ async def test_prepare_orders_hydration_continuity_selection_and_record(monkeypa
     events: list[str] = []
     session_id = uuid4()
     context = {"identity": "kept", "worldview": "kept", "drives": "kept"}
-    registry = object()
+    registry = SimpleNamespace(
+        get_specs=AsyncMock(return_value=[
+            {"type": "function", "function": {"name": "recall"}},
+        ]),
+        list_names=lambda: ["recall"],
+    )
     selection = SimpleNamespace(
         skills=[SimpleNamespace(name="core-memory")],
         allowed_tool_names={"recall"},
@@ -63,7 +68,7 @@ async def test_prepare_orders_hydration_continuity_selection_and_record(monkeypa
 
     async def hydrate(*args, **kwargs):
         events.append("hydrate")
-        assert args[0] == "summarize this"
+        assert args[1] == "summarize this"
         assert kwargs["session_id"] == str(session_id)
         assert all(kwargs[name] is True for name in (
             "include_identity", "include_worldview", "include_emotional_state",
@@ -94,7 +99,7 @@ async def test_prepare_orders_hydration_continuity_selection_and_record(monkeypa
 
     async def record(*args, **kwargs):
         events.append("record")
-        assert args[0] is None
+        assert args[0] is not None
         assert kwargs["surface"] == "background"
 
     monkeypatch.setattr(module, "select_skills", select)
@@ -102,7 +107,7 @@ async def test_prepare_orders_hydration_continuity_selection_and_record(monkeypa
 
     async def build_prompt(*args, **kwargs):
         events.append("prompt")
-        assert kwargs["active_skills"] == ["core-memory"]
+        assert kwargs["active_skills"] == selection.skills
         assert kwargs["available_skills"] == selection.available
         assert kwargs["allowed_tool_names"] is None
         return "system prompt"
@@ -113,6 +118,7 @@ async def test_prepare_orders_hydration_continuity_selection_and_record(monkeypa
         session_id,
         "summarize this",
         [{"role": "user", "content": "authoritative history"}],
+        loop_options={"is_operator": True, "on_approval": object()},
         prompt_addenda=["background addendum"],
         visual_attachments=[{"name": "chart", "mime_type": "image/png", "data_url": "data:image/png;base64,abc"}],
     )
@@ -138,8 +144,13 @@ async def test_execute_work_passes_authoritative_turn_and_host_options(monkeypat
     from services.background_executor import BackgroundExecutor
     from core.agent_loop import AgentLoop
 
-    registry = object()
-    selection = object()
+    registry = SimpleNamespace(
+        get_specs=AsyncMock(return_value=[
+            {"type": "function", "function": {"name": "recall"}},
+        ]),
+        list_names=lambda: ["recall"],
+    )
+    selection = SimpleNamespace(skills=[], available=[])
     callback = AsyncMock()
     host_operator = object()
     prepared = PreparedBackgroundTurn(
@@ -151,7 +162,13 @@ async def test_execute_work_passes_authoritative_turn_and_host_options(monkeypat
         registry=registry,
         selection=selection,
         session_id=str(uuid4()),
-        loop_options={"is_operator": True, "on_approval": host_operator},
+        loop_options={
+            "is_operator": True,
+            "on_approval": host_operator,
+            "timeout_seconds": 360.0,
+            "temperature": 0.4,
+            "max_tokens": 2048,
+        },
     )
     captured: dict[str, Any] = {}
 
@@ -170,3 +187,28 @@ async def test_execute_work_passes_authoritative_turn_and_host_options(monkeypat
     assert captured["config"].is_operator is True
     assert captured["config"].on_approval is host_operator
     assert captured["config"].on_event is callback
+
+
+@pytest.mark.asyncio
+async def test_background_loop_options_do_not_treat_missing_approval_as_opt_out(monkeypatch):
+    from services import background_preparation as module
+
+    pool = _Pool()
+    approval_callback = object()
+    callback_factory = AsyncMock(return_value=(approval_callback, 12))
+    question_timeout = AsyncMock(return_value=34)
+    monkeypatch.setattr(module, "create_operator_approval_callback", callback_factory)
+    monkeypatch.setattr(module, "question_timeout_seconds", question_timeout)
+
+    options = await module._loop_options(
+        pool,
+        "session-id",
+        {"timeout_seconds": 120, "max_tokens": 3000, "temperature": 0.2},
+        {"on_approval": None},
+    )
+
+    callback_factory.assert_awaited_once()
+    assert options["on_approval"] is approval_callback
+    assert options["timeout_seconds"] == 166
+    assert options["max_tokens"] == 3000
+    assert options["temperature"] == 0.2

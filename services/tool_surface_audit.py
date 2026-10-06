@@ -116,7 +116,9 @@ async def record_tool_surface_snapshot(
                 _uuid_or_none(session_id),
                 str(surface or "chat"),
                 tool_context.value,
-                "skill_activation" if decision_kind == "skill_activation" else "selection",
+                decision_kind
+                if decision_kind in {"selection", "skill_activation", "background_default"}
+                else "selection",
                 input_text_hash,
                 sorted({str(name) for name in active_skill_names}),
                 json.dumps((considered or [])[:25]),

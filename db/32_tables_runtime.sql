@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS tool_surface_decision_events (
     surface TEXT NOT NULL DEFAULT 'chat',
     tool_context TEXT NOT NULL,
     decision_kind TEXT NOT NULL DEFAULT 'selection'
-        CHECK (decision_kind IN ('selection', 'skill_activation')),
+        CHECK (decision_kind IN ('selection', 'skill_activation', 'background_default')),
     input_text_hash TEXT NOT NULL,
     selected_skills TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
     considered JSONB NOT NULL DEFAULT '[]'::jsonb,
