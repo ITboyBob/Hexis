@@ -60,10 +60,15 @@ async def test_interrupted_work_is_marked_unknown_and_never_reclaimed(db_pool):
         task_state = await conn.fetchval(
             "SELECT product_state FROM m5_tasks WHERE id=$1", accepted["task_id"]
         )
+        report_origin = await conn.fetchval(
+            "SELECT origin_session_id FROM m5_reports WHERE work_execution_id=$1",
+            accepted["work_execution_id"],
+        )
     assert work["status"] == "unknown"
     assert "stopped" in work["error"]
     assert work["finished_at"] is not None
     assert task_state == "working"
+    assert report_origin == origin_session_id
 
 
 @pytest.mark.asyncio(loop_scope="session")

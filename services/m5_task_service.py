@@ -427,10 +427,22 @@ class M5TaskService:
                         finished_at=clock_timestamp()
                     FROM public.m5_tasks t
                     WHERE t.id=w.task_id AND w.status='running'
-                    RETURNING t.task_session_id, w.id AS work_id
+                    RETURNING t.id AS task_id,t.origin_session_id,
+                              t.task_session_id,w.id AS work_id
                     """
                 )
                 for row in rows:
+                    await conn.execute(
+                        """
+                        INSERT INTO public.m5_reports(
+                            task_id,origin_session_id,work_execution_id
+                        ) VALUES($1,$2,$3)
+                        ON CONFLICT (work_execution_id) DO NOTHING
+                        """,
+                        row["task_id"],
+                        row["origin_session_id"],
+                        row["work_id"],
+                    )
                     await _remove_window_work_context(
                         conn, row["task_session_id"], row["work_id"]
                     )

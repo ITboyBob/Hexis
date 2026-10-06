@@ -21,6 +21,8 @@ class M5TaskWorker:
         pool: Any,
         *,
         executor: Any | None = None,
+        report_runner: Any | None = None,
+        report_config_provider: Any | None = None,
         poll_interval: float = 0.5,
     ) -> None:
         if pool is None:
@@ -30,6 +32,14 @@ class M5TaskWorker:
         self._pool = pool
         self._service = M5TaskService(pool)
         self._executor = executor or BackgroundExecutor(pool)
+        if report_runner is not None and report_config_provider is None:
+            raise ValueError("M5 report runner requires an explicit selected config provider")
+        self._report_runner = report_runner
+        self._report_config_provider = report_config_provider
+        if report_runner is not None:
+            set_callback = getattr(report_runner, "set_next_work_callback", None)
+            if callable(set_callback):
+                set_callback(self.wake)
         self._poll_interval = poll_interval
         self._wake_event = asyncio.Event()
         self._stop_event = asyncio.Event()
@@ -170,6 +180,8 @@ class M5TaskWorker:
             )
             if not saved:
                 logger.error("M5 work round lost its authoritative claim: %s", work_id)
+            elif self._report_runner is not None:
+                await self._run_report_for_work(work_id)
         except asyncio.CancelledError:
             await asyncio.shield(
                 self._service.finish_work_round(
@@ -197,6 +209,8 @@ class M5TaskWorker:
                 )
                 if not saved:
                     logger.error("M5 failed work round lost its claim: %s", work_id)
+                elif self._report_runner is not None:
+                    await self._run_report_for_work(work_id)
             except Exception:
                 logger.exception("Could not persist M5 work failure: %s", work_id)
             logger.exception(
@@ -205,3 +219,20 @@ class M5TaskWorker:
                 work_id,
                 origin_session_id,
             )
+
+    async def _run_report_for_work(self, work_id: UUID) -> None:
+        try:
+            async with self._pool.acquire() as conn:
+                report_id = await conn.fetchval(
+                    "SELECT report_id FROM public.m5_reports WHERE work_execution_id=$1",
+                    work_id,
+                )
+            if report_id is None:
+                raise RuntimeError("completed M5 work has no durable report identity")
+            config = await self._report_config_provider()
+            await self._report_runner.run_once(report_id, config)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The work row is already terminal. Report failures must never replay it.
+            logger.exception("M5 report attempt failed for completed work=%s", work_id)

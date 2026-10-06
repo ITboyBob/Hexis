@@ -101,11 +101,16 @@ async def lifespan(app: FastAPI):
                 SELECT to_regclass('public.m5_actions') IS NOT NULL
                    AND to_regclass('public.m5_tasks') IS NOT NULL
                    AND to_regclass('public.m5_work_rounds') IS NOT NULL
+                   AND to_regclass('public.m5_reports') IS NOT NULL
                 """
             )
         if m5_ready:
             from services.m5_task_service import M5TaskService
             from services.m5_task_worker import M5TaskWorker
+            from services.m5_report_runner import (
+                M5ReportRunner,
+                load_selected_report_config,
+            )
 
             interrupted = await M5TaskService(_pool).mark_interrupted_work_unknown()
             if interrupted:
@@ -113,7 +118,11 @@ async def lifespan(app: FastAPI):
                     "Marked %d interrupted M5 work round(s) unknown; they will not be rerun",
                     interrupted,
                 )
-            _m5_task_worker = M5TaskWorker(_pool)
+            _m5_task_worker = M5TaskWorker(
+                _pool,
+                report_runner=M5ReportRunner(_pool),
+                report_config_provider=lambda: load_selected_report_config(_pool),
+            )
             _m5_task_worker.start()
         else:
             logger.warning("M5 task worker is disabled because the M5 schema is unavailable")

@@ -48,6 +48,9 @@ CREATE TABLE IF NOT EXISTS public.m5_tasks (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_m5_tasks_id_origin
+    ON public.m5_tasks (id, origin_session_id);
+
 CREATE INDEX IF NOT EXISTS idx_m5_tasks_origin_created
     ON public.m5_tasks (origin_session_id, created_at DESC);
 
@@ -134,6 +137,35 @@ CREATE INDEX IF NOT EXISTS idx_m5_work_claimed
 CREATE INDEX IF NOT EXISTS idx_m5_pending_unclaimed
     ON public.m5_pending_messages (task_id, receive_order)
     WHERE claimed_work_execution_id IS NULL;
+
+-- S6 gives every certain, completed work round one immutable report identity.
+CREATE TABLE IF NOT EXISTS public.m5_reports (
+    report_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id UUID NOT NULL,
+    origin_session_id UUID NOT NULL,
+    work_execution_id UUID NOT NULL UNIQUE,
+    failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count BETWEEN 0 AND 3),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 16),
+    rejected_signatures JSONB NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(rejected_signatures) = 'array'),
+    outcome TEXT NOT NULL DEFAULT 'pending'
+        CHECK (outcome IN ('pending', 'delivered', 'exhausted', 'refused')),
+    summary TEXT,
+    receiver_receipt JSONB,
+    last_call_id TEXT,
+    last_error TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT m5_reports_task_origin_fkey
+        FOREIGN KEY (task_id, origin_session_id)
+        REFERENCES public.m5_tasks(id, origin_session_id) ON DELETE RESTRICT,
+    CONSTRAINT m5_reports_work_task_fkey
+        FOREIGN KEY (work_execution_id, task_id)
+        REFERENCES public.m5_work_rounds(id, task_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_m5_reports_pending
+    ON public.m5_reports (updated_at)
+    WHERE outcome = 'pending';
 
 DO $$
 BEGIN

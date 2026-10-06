@@ -144,7 +144,7 @@ async def _m5_s5_schema_snapshot(conn):
         SELECT p.proname,pg_get_functiondef(p.oid)
         FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
         WHERE n.nspname='public' AND p.proname IN (
-            'submit_m5_task','claim_m5_work_round','finish_m5_work_round',
+            'submit_m5_task','claim_m5_work_round',
             'claim_next_m5_message','append_m5_message','finish_m5_round'
         ) ORDER BY p.proname
         """
@@ -235,5 +235,65 @@ async def test_m5_pending_forward_matches_baseline_and_preserves_work(db_pool, t
             assert work["input"] == "Preserve this S4 work round"
             assert work["status"] == "claimed"
             assert work["message_id"] is None
+        finally:
+            await transaction.rollback()
+
+
+async def _m5_s6_schema_snapshot(conn):
+    tables = await conn.fetch(
+        """
+        SELECT table_name,column_name,data_type,is_nullable,column_default
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='m5_reports'
+        ORDER BY ordinal_position
+        """
+    )
+    constraints = await conn.fetch(
+        """
+        SELECT c.conname,c.contype,c.condeferrable,c.condeferred,pg_get_constraintdef(c.oid)
+        FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid
+        JOIN pg_namespace n ON n.oid=t.relnamespace
+        WHERE n.nspname='public' AND t.relname='m5_reports'
+        ORDER BY c.conname
+        """
+    )
+    indexes = await conn.fetch(
+        "SELECT indexname,indexdef FROM pg_indexes WHERE schemaname='public' "
+        "AND tablename IN ('m5_reports','m5_tasks') ORDER BY indexname"
+    )
+    functions = await conn.fetch(
+        """
+        SELECT p.proname,pg_get_functiondef(p.oid)
+        FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+        WHERE n.nspname='public' AND p.proname IN ('finish_m5_work_round','deliver_m5_report')
+        ORDER BY p.proname
+        """
+    )
+    return tuple(tuple(tuple(row.values()) for row in group) for group in (tables, constraints, indexes, functions))
+
+
+async def test_m5_reports_forward_matches_baseline(db_pool, tmp_path):
+    from core.migrations import apply_pending_migrations, migration_status
+
+    async with db_pool.acquire() as conn:
+        expected = await _m5_s6_schema_snapshot(conn)
+        transaction = conn.transaction()
+        await transaction.start()
+        try:
+            await conn.execute("DROP FUNCTION IF EXISTS public.deliver_m5_report(uuid,uuid,text,text)")
+            await conn.execute("DROP TABLE IF EXISTS public.m5_reports CASCADE")
+            await conn.execute("DROP INDEX IF EXISTS public.idx_m5_reports_pending")
+            await conn.execute("DROP INDEX IF EXISTS public.idx_m5_tasks_id_origin")
+            await conn.execute(
+                "DELETE FROM public.schema_migrations WHERE version=$1",
+                "0264_m5_reports",
+            )
+            migration = _MIGRATIONS / "0264_m5_reports.sql"
+            (tmp_path / migration.name).write_bytes(migration.read_bytes())
+            assert await apply_pending_migrations(conn, migrations_dir=tmp_path) == [
+                "0264_m5_reports"
+            ]
+            assert (await migration_status(conn, migrations_dir=tmp_path))["pending"] == []
+            assert await _m5_s6_schema_snapshot(conn) == expected
         finally:
             await transaction.rollback()
