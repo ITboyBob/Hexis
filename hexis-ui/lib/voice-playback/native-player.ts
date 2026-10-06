@@ -47,7 +47,7 @@ class NativePcmPlayer {
   private context?: AudioContext;
   private analyser?: AnalyserNode;
   private samples?: Uint8Array<ArrayBuffer>;
-  private sources: AudioBufferSourceNode[] = [];
+  private sources = new Set<AudioBufferSourceNode>();
   private raf = 0;
   private audibleTimer?: ReturnType<typeof setTimeout>;
   private dead = false;
@@ -90,51 +90,62 @@ class NativePcmPlayer {
       let lastSource: AudioBufferSourceNode | undefined;
       for await (const chunk of source.chunks) {
         if (this.dead || this.closed || this.current !== identity) return;
-        await this.waitForScheduleWindow(nextTime);
-        if (this.dead || this.closed || this.current !== identity) return;
         if (source.channels !== 1) throw new Error("PCM播放仅支持mono");
         const bytes = new Uint8Array(chunk.data);
         if (bytes.byteLength === 0 || bytes.byteLength % 2 !== 0) {
           throw new Error("PCM chunk必须是16-bit mono帧");
         }
         const frames = bytes.byteLength / 2;
-        const buffer = this.context.createBuffer(1, frames, source.sample_rate);
-        const channel = buffer.getChannelData(0);
         const view = new DataView(chunk.data);
-        for (let index = 0; index < frames; index += 1) {
-          channel[index] = view.getInt16(index * 2, true) / 32768;
+        // 大块也拆成至多100ms的节点，网络分块大小不能扩大WebAudio调度窗口。
+        const sliceFrames = Math.max(1, Math.floor(source.sample_rate / 10));
+        for (let offset = 0; offset < frames; offset += sliceFrames) {
+          await this.waitForScheduleWindow(nextTime);
+          if (this.dead || this.closed || this.current !== identity) return;
+          const count = Math.min(sliceFrames, frames - offset);
+          const buffer = this.context.createBuffer(1, count, source.sample_rate);
+          const channel = buffer.getChannelData(0);
+          for (let index = 0; index < count; index += 1) {
+            channel[index] = view.getInt16((offset + index) * 2, true) / 32768;
+          }
+          const node = this.context.createBufferSource();
+          node.buffer = buffer;
+          node.connect(this.analyser);
+          node.start(nextTime);
+          const chunkStart = nextTime;
+          nextTime += count / source.sample_rate;
+          this.scheduledUntil = nextTime;
+          node.onended = () => {
+            this.sources.delete(node);
+            node.disconnect();
+            if (this.sourceComplete && lastSource === node) this.feedback("drained");
+          };
+          if (first) {
+            this.startAt = chunkStart;
+            this.opened = true;
+            this.onStarted();
+            this.audibleTimer = setTimeout(() => {
+              this.audibleTimer = undefined;
+              this.feedback("playing");
+            }, 20);
+            first = false;
+          }
+          lastSource = node;
+          this.sources.add(node);
         }
-        const node = this.context.createBufferSource();
-        node.buffer = buffer;
-        node.connect(this.analyser);
-        node.start(nextTime);
-        const chunkStart = nextTime;
-        nextTime += frames / source.sample_rate;
-        this.scheduledUntil = nextTime;
-        node.onended = () => {
-          if (this.sourceComplete && lastSource === node) this.feedback("drained");
-        };
-        if (first) {
-          this.startAt = chunkStart;
-          this.opened = true;
-          this.onStarted();
-          this.audibleTimer = setTimeout(() => {
-            this.audibleTimer = undefined;
-            this.feedback("playing");
-          }, 20);
-          first = false;
-        }
-        lastSource = node;
-        this.sources.push(node);
       }
       if (!lastSource) throw new Error("PCM source不包含音频帧");
       this.sourceComplete = true;
       if (this.context.currentTime >= this.scheduledUntil) this.feedback("drained");
-    } catch {
+    } catch (error) {
+      if (this.dead || this.closed) return;
+      this.clearScheduledSources();
+      if (this.audibleTimer !== undefined) clearTimeout(this.audibleTimer);
       if (this.opened && !this.dead && !this.closed && this.current === identity) {
         this.feedback("error");
       }
-      throw new Error("PCM流未能播放；请检查音频格式后重试");
+      const cause = error instanceof Error ? error : new Error(String(error));
+      throw new Error(`语音播放失败：${cause.message}；请重试 Talk。`, { cause });
     }
   }
 
@@ -157,15 +168,15 @@ class NativePcmPlayer {
     this.playing = false;
     if (this.audibleTimer !== undefined) clearTimeout(this.audibleTimer);
     cancelAnimationFrame(this.raf);
-    for (const source of this.sources) source.stop();
-    if (previous) this.emitFeedback(previous, "cancel", 0, reason, playedMs);
+    this.clearScheduledSources();
+    if (previous && this.opened) this.emitFeedback(previous, "cancel", 0, reason, playedMs);
   }
 
   async destroy(): Promise<void> {
     if (this.dead) return;
     this.stop();
     this.dead = true;
-    this.sources = [];
+    this.sources.clear();
     try {
       await this.context?.close();
     } catch {
@@ -180,6 +191,15 @@ class NativePcmPlayer {
     cancelAnimationFrame(this.raf);
     this.emitFeedback(this.current, phase, 0);
     if (this.playing) this.frame();
+  }
+
+  private clearScheduledSources(): void {
+    for (const source of this.sources) {
+      source.onended = null;
+      source.stop();
+      source.disconnect();
+    }
+    this.sources.clear();
   }
 
   private emitFeedback(

@@ -5,13 +5,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { AudioCaptureController } from "@/lib/voice-realtime/capture";
 import { VoiceRealtimeClient } from "@/lib/voice-realtime/client";
 import type { RealtimeServerMessage } from "@/lib/voice-realtime/contracts";
-import { NativeOutputQueue } from "@/lib/voice-realtime/output-queue";
+import { NativeOutputQueue, REALTIME_OUTPUT_SAMPLE_RATE } from "@/lib/voice-realtime/output-queue";
 import { decodeBase64ToPcm } from "@/lib/voice-playback/native-output-source";
 import { NativeOutputPlayer } from "@/lib/voice-playback/native-player";
 import type { NativePcmSource } from "@/lib/voice-playback/native-output-source";
 import type { NativePlaybackEventRequest } from "@/lib/voice-playback/native-player";
 
 type TalkPhase = "idle" | "connecting" | "listening" | "failed";
+type TalkOutput = { queue: NativeOutputQueue; player: NativeOutputPlayer; failed: boolean };
 
 async function postPlaybackReceipt(
   endpoint: string,
@@ -53,18 +54,41 @@ export function TalkMode({
   const [retryAvailable, setRetryAvailable] = useState(false);
   const clientRef = useRef<VoiceRealtimeClient | null>(null);
   const captureRef = useRef<AudioCaptureController | null>(null);
-  const outputsRef = useRef(new Map<string, { queue: NativeOutputQueue; player: NativeOutputPlayer }>());
+  const outputsRef = useRef(new Map<string, TalkOutput>());
   const invalidatedResponsesRef = useRef(new Set<string>());
   const activeRef = useRef(false);
   const mountedRef = useRef(true);
   const sessionIdRef = useRef(sessionId);
+
+  const invalidateResponse = useCallback((responseId: string) => {
+    if (invalidatedResponsesRef.current.size >= 256) {
+      const oldest = invalidatedResponsesRef.current.values().next().value;
+      if (oldest) invalidatedResponsesRef.current.delete(oldest);
+    }
+    invalidatedResponsesRef.current.add(responseId);
+  }, []);
+
+  const failOutput = useCallback((responseId: string, output: TalkOutput, cause: unknown) => {
+    if (output.failed) return;
+    output.failed = true;
+    const failure = cause instanceof Error ? cause : new Error("Voice output failed. Retry Talk to continue.");
+    invalidateResponse(responseId);
+    outputsRef.current.delete(responseId);
+    output.queue.fail(failure);
+    output.player.stop("error");
+    void output.player.destroy().catch(() => undefined);
+    if (mountedRef.current) {
+      setError(failure.message);
+      setRetryAvailable(true);
+    }
+  }, [invalidateResponse]);
 
   const stopOutputs = useCallback(async () => {
     const outputs = [...outputsRef.current.values()];
     outputsRef.current.clear();
     for (const output of outputs) {
       output.player.stop();
-      output.queue.close();
+      await output.queue[Symbol.asyncIterator]().return?.();
       await output.player.destroy().catch(() => undefined);
     }
   }, []);
@@ -73,16 +97,12 @@ export function TalkMode({
     const outputs = [...outputsRef.current.entries()];
     outputsRef.current.clear();
     for (const [responseId, output] of outputs) {
-      if (invalidatedResponsesRef.current.size >= 256) {
-        const oldest = invalidatedResponsesRef.current.values().next().value;
-        if (oldest) invalidatedResponsesRef.current.delete(oldest);
-      }
-      invalidatedResponsesRef.current.add(responseId);
+      invalidateResponse(responseId);
       output.player.stop("barge_in");
-      output.queue.close();
+      void output.queue[Symbol.asyncIterator]().return?.();
       void output.player.destroy().catch(() => undefined);
     }
-  }, []);
+  }, [invalidateResponse]);
 
   const stopTalk = useCallback(async (message?: string) => {
     activeRef.current = false;
@@ -156,11 +176,11 @@ export function TalkMode({
           if (!activeRef.current) return;
           if (message.type === "audio_chunk") {
             if (invalidatedResponsesRef.current.has(message.response_id)) return;
-            setError(null);
-            setRetryAvailable(false);
             let output = outputsRef.current.get(message.response_id);
             if (!output) {
-              const queue = new NativeOutputQueue(16);
+              setError(null);
+              setRetryAvailable(false);
+              const queue = new NativeOutputQueue();
               const player = new NativeOutputPlayer({
                 identity: {
                   playback_id: message.playback_id,
@@ -172,28 +192,27 @@ export function TalkMode({
                 session_id: message.session_id,
                 emit: (event: NativePlaybackEventRequest) => {
                   const endpoint = clientRef.current?.activePlaybackEndpoint ?? "";
-                  void postPlaybackReceipt(endpoint, event).then(() => {
-                    if (event.action === "end" || event.action === "interrupt") {
-                      outputsRef.current.delete(message.response_id);
+                  if (event.action === "end" || event.action === "interrupt") {
+                    invalidateResponse(message.response_id);
+                    outputsRef.current.delete(message.response_id);
+                    void queue[Symbol.asyncIterator]().return?.();
+                    void player.destroy().catch(() => undefined);
+                  }
+                  void postPlaybackReceipt(endpoint, event).catch((receiptError: unknown) => {
+                    if (mountedRef.current && !output?.failed) {
+                      setError(receiptError instanceof Error ? receiptError.message : "Playback receipt could not be saved.");
+                      setRetryAvailable(true);
                     }
-                  }).catch((receiptError: unknown) => {
-                if (mountedRef.current) {
-                  setError(receiptError instanceof Error ? receiptError.message : "Playback receipt could not be saved.");
-                  setRetryAvailable(true);
-                }
                   });
                 },
               });
               player.attach({ epoch: message.output_epoch, source: "real" });
-              output = { queue, player };
+              output = { queue, player, failed: false };
               outputsRef.current.set(message.response_id, output);
-              const source: NativePcmSource = { sample_rate: 24_000, channels: 1, chunks: queue };
+              const source: NativePcmSource = { sample_rate: REALTIME_OUTPUT_SAMPLE_RATE, channels: 1, chunks: queue };
               void player.start(source, Math.round(performance.now())).catch((playbackError: unknown) => {
-                if (mountedRef.current) {
-                  setError(playbackError instanceof Error ? playbackError.message : "Voice output failed.");
-                  setRetryAvailable(true);
-                }
-                queue.fail(playbackError instanceof Error ? playbackError : new Error("Voice output failed."));
+                if (!activeRef.current || clientRef.current?.activeMediaSessionId !== message.media_session_id) return;
+                failOutput(message.response_id, output!, playbackError);
               });
             }
             try {
@@ -203,9 +222,7 @@ export function TalkMode({
                 chunk_seq: message.chunk_seq,
               });
             } catch (outputError) {
-              output.queue.fail(outputError instanceof Error ? outputError : new Error("Voice output queue failed."));
-              setError(outputError instanceof Error ? outputError.message : "Voice output queue failed.");
-              setRetryAvailable(true);
+              failOutput(message.response_id, output, outputError);
             }
             return;
           }
@@ -215,7 +232,7 @@ export function TalkMode({
             if (!output) return;
             if (message.kind === "done") output.queue.close();
             if (message.kind === "failed") {
-              output.queue.fail(new Error(message.reason || "Voice generation failed."));
+              failOutput(message.response_id, output, new Error(message.reason || "Voice generation failed."));
             }
             return;
           }
@@ -258,7 +275,7 @@ export function TalkMode({
       setError(startError instanceof Error ? startError.message : "Talk could not start.");
       setRetryAvailable(true);
     }
-  }, [onSessionId, stopOutputs, stopOutputsForBargeIn, stopTalk]);
+  }, [onSessionId, stopOutputsForBargeIn, stopTalk, failOutput, invalidateResponse]);
 
   const phaseLabel: Record<TalkPhase, string> = {
     idle: "Talk off",

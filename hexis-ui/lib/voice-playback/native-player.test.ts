@@ -256,7 +256,7 @@ describe("NativeOutputPlayer", () => {
   it("在流结束前起播，且仅在实际最后帧结束后报告drained", async () => {
     const context = fakePcmContext();
     const events: NativePlaybackEventRequest[] = [];
-    const queue = new NativeOutputQueue(2);
+    const queue = new NativeOutputQueue();
     const player = new NativeOutputPlayer({
       identity,
       session_id: "11111111-1111-1111-1111-111111111111",
@@ -336,8 +336,81 @@ describe("NativeOutputPlayer", () => {
         { sample_rate: 24_000, channels: 1, chunks: (async function* () {})() },
         0,
       ),
-    ).rejects.toThrow(/PCM流未能播放/);
+    ).rejects.toThrow(/不包含音频帧/);
     expect(events.map((event) => event.action)).toEqual([]);
+    await player.destroy();
+  });
+
+  it("快速到达的长回答完整播放，调度窗口与存活节点保持有界", async () => {
+    vi.useFakeTimers();
+    const context = fakePcmContext();
+    const began = Date.now();
+    Object.defineProperty(context, "currentTime", { get: () => (Date.now() - began) / 1000 });
+    let alive = 0;
+    let maxAlive = 0;
+    let maxLookahead = 0;
+    const createSource = context.createBufferSource.getMockImplementation()!;
+    context.createBufferSource.mockImplementation(() => {
+      const node = createSource();
+      node.start.mockImplementation((at: number) => {
+        alive++;
+        maxAlive = Math.max(maxAlive, alive);
+        const buffer = node.buffer as { length: number; sampleRate: number };
+        const duration = buffer.length / buffer.sampleRate;
+        maxLookahead = Math.max(maxLookahead, at + duration - context.currentTime);
+        setTimeout(() => { alive--; node.onended?.(); }, Math.ceil((at + duration - context.currentTime) * 1000));
+      });
+      return node;
+    });
+    const queue = new NativeOutputQueue();
+    const events: NativePlaybackEventRequest[] = [];
+    const player = new NativeOutputPlayer({ identity, session_id: "session-1", emit: (event) => events.push(event), createContext: () => context as unknown as AudioContext });
+    try {
+      player.attach({ epoch: 2, source: "real" });
+      const starting = player.start({ sample_rate: 24_000, channels: 1, chunks: queue }, 0);
+      // 120 秒合法 PCM 在一个网络突发中到达；一秒大块还需被拆分调度。
+      for (let chunk_seq = 0; chunk_seq < 120; chunk_seq++) {
+        queue.push({ data: new ArrayBuffer(48_000), segment_id: "segment-1", chunk_seq });
+      }
+      queue.close();
+      const result = starting.then(() => null, (error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(events[0]?.action).toBe("open");
+      expect(events.some((event) => event.action === "end")).toBe(false);
+      await vi.advanceTimersByTimeAsync(121_000);
+      expect(await result).toBeNull();
+      expect(events.at(-1)).toMatchObject({ action: "end", scope: "complete", played_ms: 120_000 });
+      expect(context.buffers.reduce((sum, buffer) => sum + buffer.length, 0)).toBe(120 * 24_000);
+      expect(maxLookahead).toBeLessThanOrEqual(1.101);
+      expect(maxAlive).toBeLessThanOrEqual(12);
+      expect(alive).toBe(0);
+      expect(queue.bufferedMs).toBe(0);
+    } finally {
+      await player.destroy();
+      vi.useRealTimers();
+    }
+  });
+
+  it("流失败保留原始原因，立即停播并只报告一次error终态", async () => {
+    const context = fakePcmContext();
+    const events: NativePlaybackEventRequest[] = [];
+    const queue = new NativeOutputQueue();
+    const player = new NativeOutputPlayer({ identity, session_id: "session-1", emit: (event) => events.push(event), createContext: () => context as unknown as AudioContext });
+    player.attach({ epoch: 2, source: "real" });
+    const starting = player.start({ sample_rate: 24_000, channels: 1, chunks: queue }, 0);
+    const result = starting.catch((error: unknown) => error);
+    queue.push({ data: new ArrayBuffer(4800), segment_id: "segment-1", chunk_seq: 1 });
+    await vi.waitFor(() => expect(events[0]?.action).toBe("open"));
+    const cause = new Error("音频播放缓冲已达到上限");
+    queue.fail(cause);
+    const error = await result as Error;
+    expect(error.cause).toBe(cause);
+    expect(error.message).toContain(cause.message);
+    expect(error.message).not.toContain("检查音频格式");
+    expect(context.sources.every((node) => node.stop.mock.calls.length === 1)).toBe(true);
+    expect(events.filter((event) => event.action === "interrupt")).toEqual([
+      expect.objectContaining({ reason: "error" }),
+    ]);
     await player.destroy();
   });
 });
@@ -363,6 +436,7 @@ function fakePcmContext() {
     connect: ReturnType<typeof vi.fn>;
     start: ReturnType<typeof vi.fn>;
     stop: ReturnType<typeof vi.fn>;
+    disconnect: ReturnType<typeof vi.fn>;
     onended?: (() => void) | null;
   }> = [];
   return {
@@ -389,7 +463,9 @@ function fakePcmContext() {
         connect: vi.fn(),
         start: vi.fn(),
         stop: vi.fn(),
-        onended: null,
+        onended: null as (() => void) | null,
+        buffer: undefined as unknown,
+        disconnect: vi.fn(),
       };
       sources.push(source);
       return source;
