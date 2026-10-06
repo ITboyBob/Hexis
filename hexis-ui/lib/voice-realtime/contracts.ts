@@ -46,6 +46,30 @@ export type RealtimeClientMessage =
       reason: string;
     };
 
+export type VoiceBehaviorEvent = {
+  event_id: string;
+  schema_version: 1;
+  event_type: string;
+  stream_id: string;
+  seq: number;
+  session_id: string;
+  source: "server";
+  producer_id: string;
+  producer_seq: number;
+  channel: string;
+  payload: Record<string, unknown>;
+  request_id?: string | null;
+  stimulus_revision?: number | null;
+  input_turn_id?: string | null;
+  response_id?: string | null;
+  media_session_id?: string | null;
+  output_epoch?: number | null;
+  turn_id?: string | null;
+  task_id?: string | null;
+  call_id?: string | null;
+  ts?: string | null;
+};
+
 export type RealtimeServerMessage =
   | {
       schema_version: 1;
@@ -91,7 +115,7 @@ export type RealtimeServerMessage =
       session_id: string;
       media_session_id: string;
       producer_seq: number;
-      event: Record<string, unknown>;
+      event: VoiceBehaviorEvent;
     }
   | {
       schema_version: 1;

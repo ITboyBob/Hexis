@@ -3,6 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TalkMode } from "./talk-mode";
 
+vi.mock("../avatar-preview/avatar", () => ({
+  Avatar: ({ value }: { value: { eye: string; pose: string } }) => (
+    <div data-testid="talk-avatar-engine" aria-label={`眼形 ${value.eye}，活动 ${value.pose}`}>{value.pose}</div>
+  ),
+}));
+
 const captureMocks = vi.hoisted(() => ({
   start: vi.fn().mockResolvedValue(undefined),
   close: vi.fn().mockResolvedValue(undefined),
@@ -79,7 +85,7 @@ describe("TalkMode", () => {
   afterEach(() => {
     vi.useRealTimers();
     captureMocks.start.mockClear();
-    captureMocks.close.mockClear();
+    captureMocks.close.mockReset().mockResolvedValue(undefined);
     captureMocks.onBargeIn = undefined;
     vi.unstubAllGlobals();
     FakeWebSocket.instances = [];
@@ -139,6 +145,127 @@ describe("TalkMode", () => {
     );
     expect(track.stop).toHaveBeenCalled();
     expect(FakeWebSocket.instances[0].readyState).toBe(3);
+  });
+
+  it("shows the avatar while microphone permission is still pending without claiming listening", async () => {
+    let rejectPermission: ((error: Error) => void) | undefined;
+    const getUserMedia = vi.fn(() => new Promise((_resolve, reject) => { rejectPermission = reject; }));
+    Object.defineProperty(navigator, "mediaDevices", {
+      value: { getUserMedia },
+      configurable: true,
+    });
+    vi.stubGlobal("fetch", vi.fn());
+    render(<TalkMode sessionId="session-1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Start Talk mode" }));
+
+    expect(await screen.findByTestId("voice-avatar")).toBeInTheDocument();
+    expect(screen.getByTestId("talk-avatar-engine")).toHaveTextContent("idle");
+    expect(screen.queryByText("Listening")).not.toBeInTheDocument();
+    await act(async () => rejectPermission?.(new Error("Permission denied")));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Permission denied");
+  });
+
+  it("hides the avatar immediately when closing while media cleanup continues", async () => {
+    Object.defineProperty(navigator, "mediaDevices", {
+      value: { getUserMedia: vi.fn().mockResolvedValue(new FakeStream()) },
+      configurable: true,
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({
+        session_id: "session-1",
+        media_session_id: "media-1",
+        websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1",
+      }),
+      { status: 200 },
+    )));
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    let finishClose: (() => void) | undefined;
+    captureMocks.close.mockImplementation(() => new Promise<void>((resolve) => { finishClose = resolve; }));
+    render(<TalkMode sessionId="session-1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Start Talk mode" }));
+    await screen.findByText("Listening");
+    expect(screen.getByTestId("voice-avatar")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop Talk mode" }));
+
+    expect(screen.queryByTestId("voice-avatar")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stopping Talk mode" })).toBeDisabled();
+    await act(async () => finishClose?.());
+    await screen.findByRole("button", { name: "Start Talk mode" });
+  });
+
+  it("projects only current production activities and gives recalling precedence", async () => {
+    Object.defineProperty(navigator, "mediaDevices", {
+      value: { getUserMedia: vi.fn().mockResolvedValue(new FakeStream()) },
+      configurable: true,
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({
+        session_id: "session-1",
+        media_session_id: "media-1",
+        websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1",
+      }),
+      { status: 200 },
+    )));
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    render(<TalkMode sessionId="session-1" />);
+    fireEvent.click(screen.getByRole("button", { name: "Start Talk mode" }));
+    await screen.findByText("Listening");
+
+    const identity = { session_id: "session-1", input_turn_id: "input-1", input_order: 1, stimulus_revision: 0 };
+    const send = (seq: number, event_type: string, payload: Record<string, unknown>) => {
+      act(() => FakeWebSocket.instances[0].onmessage?.({
+        data: JSON.stringify({
+          schema_version: 1,
+          type: "event",
+          session_id: "session-1",
+          media_session_id: "media-1",
+          producer_seq: seq,
+          event: {
+            event_id: `event-${seq}`,
+            schema_version: 1,
+            event_type,
+            stream_id: "voice-realtime-session",
+            seq,
+            session_id: "session-1",
+            source: "server",
+            producer_id: "hexis.voice-realtime",
+            producer_seq: seq,
+            payload,
+            media_session_id: "media-1",
+          },
+        }),
+      }));
+    };
+
+    send(1, "voice_input_committed", { identity });
+    send(2, "voice_visual_window", {
+      identity,
+      wordset_version: "v1",
+      fact: { status: "open", owner: "service", decision_seq: 0 },
+    });
+    send(3, "voice_visual_window", {
+      identity,
+      wordset_version: "v1",
+      fact: { status: "accepted", owner: "service", decision_seq: 1 },
+      label: "happy",
+    });
+    send(4, "voice_model_call_started", { identity, activity_id: "response-1", state: "started" });
+    send(5, "voice_recall_started", { identity, activity_id: "call-1", state: "started" });
+    expect(screen.getByTestId("voice-stage-bubble")).toHaveTextContent("recalling");
+    expect(screen.getByTestId("talk-avatar-engine")).toHaveAttribute("aria-label", "眼形 happy，活动 thinking");
+
+    send(6, "voice_recall_ended", { identity, activity_id: "call-1", state: "ended" });
+    expect(screen.getByTestId("voice-stage-bubble")).toHaveTextContent("thinking");
+    const nextIdentity = { ...identity, input_turn_id: "input-2", input_order: 2 };
+    send(7, "voice_input_committed", { identity: nextIdentity });
+    expect(screen.queryByTestId("voice-stage-bubble")).not.toBeInTheDocument();
+    send(8, "voice_recall_started", { identity, activity_id: "old-recall", state: "started" });
+    send(9, "voice_model_call_started", { identity: nextIdentity, activity_id: "response-2", state: "started" });
+    send(10, "waiting_for_user", { identity: nextIdentity, state: "started" });
+    expect(screen.getByTestId("voice-stage-bubble")).toHaveTextContent("thinking");
   });
 
   it("does not create a realtime session when microphone permission is denied", async () => {

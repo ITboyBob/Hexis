@@ -2672,6 +2672,25 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
 
     async def on_input_authorized(receipt: Any) -> None:
         logger.debug("M4 voice gate started for an authorized input")
+        from services.avatar_emotion import WORDSET_VERSION
+
+        async def publish_visual_window(
+            identity: dict[str, Any], fact: dict[str, Any], label: str | None = None
+        ) -> None:
+            payload = {
+                "identity": identity,
+                "wordset_version": WORDSET_VERSION,
+                "fact": fact,
+                **({"label": label} if label is not None else {}),
+            }
+            await session.emit_event(
+                "voice_visual_window",
+                payload,
+                input_turn_id=str(identity["input_turn_id"]),
+                stimulus_revision=int(identity["stimulus_revision"]),
+            )
+
+        emotion_coordinator.set_visual_window_sink(publish_visual_window)
         gate = await emotion_coordinator.run(
             receipt.identity.model_dump(mode="json"), receipt.transcript
         )
@@ -2741,7 +2760,8 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
     )
     session._response_dispatch = None
     session._input_error_dispatch = None
-    from services.behavior_events import BehaviorEvent, record_behavior_event
+    from services.behavior_events import record_behavior_event
+    from services.voice_avatar_events import build_voice_behavior_event, voice_behavior_envelope
 
     async def write_voice_event(
         event_type: str,
@@ -2752,27 +2772,22 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
     ) -> None:
         if _pool is None:
             raise RuntimeError("database is unavailable for voice behavior events")
-        await record_behavior_event(
-            _pool,
-            BehaviorEvent(
-                event_id=uuid.uuid5(
-                    uuid.UUID(int=0),
-                    f"hexis:voice:{req.session_id}:{media_session_id}:{producer_seq}:{event_type}",
-                ),
-                schema_version=1,
-                event_type=event_type,
-                stream_id="voice-realtime-session",
-                session_id=req.session_id,
-                source="server",
-                producer_id="hexis.voice-realtime",
-                producer_seq=producer_seq,
-                channel="voice",
-                payload=payload,
-                media_session_id=media_session_id,
-                input_turn_id=input_turn_id,
-                stimulus_revision=stimulus_revision,
-            ),
+        event = build_voice_behavior_event(
+            session_id=req.session_id,
+            media_session_id=media_session_id,
+            producer_seq=producer_seq,
+            event_type=event_type,
+            payload=payload,
+            input_turn_id=input_turn_id,
+            stimulus_revision=stimulus_revision,
+            response_id=payload.get("response_id"),
+            output_epoch=payload.get("output_epoch"),
+            call_id=payload.get("call_id"),
         )
+        receipt = await record_behavior_event(_pool, event)
+        dispatch = session._behavior_event_dispatch
+        if dispatch is not None:
+            await dispatch(voice_behavior_envelope(event, database_seq=receipt.get("seq")))
 
     session._event_sink = write_voice_event
     registry.register(req.session_id, session)
@@ -2902,10 +2917,52 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
             }
         )
 
+    async def dispatch_behavior_event(event: dict[str, Any]) -> None:
+        await send_server_message(
+            {
+                "schema_version": 1,
+                "type": "event",
+                "session_id": str(session.session_id),
+                "media_session_id": session.media_session_id,
+                "producer_seq": 0,
+                "event": event,
+            }
+        )
+
     session._input_error_dispatch = send_input_error
+    session._behavior_event_dispatch = dispatch_behavior_event
 
     async def stream_response(output: dict[str, Any]) -> None:
         response_id = output["response_id"]
+        model_call_open = False
+
+        async def emit_model_activity(state: str, reason: str | None = None) -> None:
+            input_turn_id = str(output.get("input_turn_id", ""))
+            voice_turn = session._voice_turns.get(input_turn_id)
+            if voice_turn is None:
+                raise RuntimeError("model activity has no authorized voice input")
+            identity = {
+                "session_id": str(session.session_id),
+                "input_turn_id": input_turn_id,
+                "input_order": voice_turn["input_order"],
+                "stimulus_revision": voice_turn["stimulus_revision"],
+            }
+            await session.emit_event(
+                "voice_model_call_started" if state == "started" else "voice_model_call_ended",
+                {
+                    "identity": identity,
+                    "activity_id": response_id,
+                    "response_id": response_id,
+                    "playback_id": output.get("playback_id"),
+                    "output_epoch": output.get("output_epoch"),
+                    "turn_id": output.get("turn_id"),
+                    "state": state,
+                    **({"reason": reason} if reason else {}),
+                },
+                input_turn_id=input_turn_id,
+                stimulus_revision=identity["stimulus_revision"],
+            )
+
         pending_voice_call: dict[str, str] | None = None
         adapter = QwenRealtimeOutputAdapter(
             response_id=response_id,
@@ -2924,6 +2981,9 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                     continue
                 if event.type == "response.created":
                     adapter.bind(event)
+                    if not model_call_open:
+                        await emit_model_activity("started")
+                        model_call_open = True
                     continue
                 if event.type == "response.function_call_arguments.done":
                     input_turn_id = session.authorize_voice_recall_call(
@@ -2998,6 +3058,9 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                 if event.type in {"response.done", "response.failed", "response_failed"}:
                     adapter.finish(event)
                     failed = event.type != "response.done" or event.status not in {None, "completed"}
+                    if model_call_open:
+                        await emit_model_activity("ended", "failed" if failed else "completed")
+                        model_call_open = False
                     if session.response_is_invalidated(response_id):
                         input_turn_id = output.get("input_turn_id", "")
                         await session.mark_generation_done(input_turn_id, response_id)
@@ -3041,12 +3104,46 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                         await session.release_response(response_id)
                         from services.voice_recall import VoiceRecallService
 
-                        recall_output = await VoiceRecallService(_pool).execute(
-                            session_id=session.session_id,
-                            input_turn_id=uuid.UUID(pending_voice_call["input_turn_id"]),
-                            name=pending_voice_call["name"],
-                            arguments=pending_voice_call["arguments"],
+                        recall_input_id = pending_voice_call["input_turn_id"]
+                        voice_turn = session._voice_turns.get(recall_input_id)
+                        if voice_turn is None:
+                            raise RuntimeError("recall activity has no authorized voice input")
+                        recall_identity = {
+                            "session_id": str(session.session_id),
+                            "input_turn_id": recall_input_id,
+                            "input_order": voice_turn["input_order"],
+                            "stimulus_revision": voice_turn["stimulus_revision"],
+                        }
+                        recall_activity = {
+                            "identity": recall_identity,
+                            "activity_id": pending_voice_call["call_id"],
+                            "call_id": pending_voice_call["call_id"],
+                            "response_id": response_id,
+                            "playback_id": output.get("playback_id"),
+                            "output_epoch": output.get("output_epoch"),
+                            "turn_id": output.get("turn_id"),
+                        }
+                        await session.emit_event(
+                            "voice_recall_started",
+                            {**recall_activity, "state": "started"},
+                            input_turn_id=recall_input_id,
+                            stimulus_revision=recall_identity["stimulus_revision"],
                         )
+                        try:
+                            recall_output = await VoiceRecallService(_pool).execute(
+                                session_id=session.session_id,
+                                input_turn_id=uuid.UUID(recall_input_id),
+                                name=pending_voice_call["name"],
+                                arguments=pending_voice_call["arguments"],
+                            )
+                        except Exception:
+                            await session.emit_event(
+                                "voice_recall_ended",
+                                {**recall_activity, "state": "ended", "status": "failed"},
+                                input_turn_id=recall_input_id,
+                                stimulus_revision=recall_identity["stimulus_revision"],
+                            )
+                            raise
                         recall_status = json.loads(recall_output).get("status", "unknown")
                         await session.emit_event(
                             "voice_recall_executed",
@@ -3056,6 +3153,12 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                                 "response_id": response_id,
                             },
                             input_turn_id=pending_voice_call["input_turn_id"],
+                        )
+                        await session.emit_event(
+                            "voice_recall_ended",
+                            {**recall_activity, "state": "ended", "status": recall_status},
+                            input_turn_id=recall_input_id,
+                            stimulus_revision=recall_identity["stimulus_revision"],
                         )
                         followup = await session.start_voice_recall_followup(
                             input_turn_id=pending_voice_call["input_turn_id"],
@@ -3114,6 +3217,8 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                     return
         except Exception as exc:
             logger.exception("Realtime output stream failed for response %s", response_id)
+            if model_call_open:
+                await emit_model_activity("ended", "failed")
             await session.release_response(response_id)
             try:
                 await send_server_message(

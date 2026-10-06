@@ -39,6 +39,7 @@ class VoiceEmotionCoordinator:
         hydrator: Callable[[Identity, str], Awaitable[Any]],
         emotion_timeout_ms: float,
         window_host: EmotionWindowHost | None = None,
+        on_visual_window: Callable[[dict[str, Any], dict[str, Any], str | None], Awaitable[Any]] | None = None,
     ) -> None:
         if not math.isfinite(emotion_timeout_ms) or emotion_timeout_ms <= 0:
             raise ValueError("emotion_timeout_ms must be a positive finite number")
@@ -47,7 +48,14 @@ class VoiceEmotionCoordinator:
         self._hydrator = hydrator
         self._emotion_timeout_ms = emotion_timeout_ms
         self.window_host = window_host or EmotionWindowHost()
+        self._on_visual_window = on_visual_window
         self.last_evaluation_task: asyncio.Task[Any] | None = None
+
+    def set_visual_window_sink(
+        self,
+        sink: Callable[[dict[str, Any], dict[str, Any], str | None], Awaitable[Any]] | None,
+    ) -> None:
+        self._on_visual_window = sink
 
     async def run(self, identity: Identity, message: str) -> VoiceEmotionGateResult:
         if not isinstance(message, str) or not message.strip():
@@ -58,7 +66,14 @@ class VoiceEmotionCoordinator:
 
         loop = asyncio.get_running_loop()
         started = loop.time()
-        self.window_host.open(identity, self._emotion_timeout_ms)
+        opened = self.window_host.open(identity, self._emotion_timeout_ms)
+        reported_windows: set[tuple[Any, ...]] = set()
+        await self._publish_visual_window(identity, opened, reported=reported_windows)
+        close_watcher = (
+            asyncio.create_task(self._watch_visual_window_close(identity, reported_windows))
+            if self._on_visual_window is not None
+            else None
+        )
 
         evaluation_timing: dict[str, float | None] = {
             "start": loop.time(),
@@ -84,6 +99,12 @@ class VoiceEmotionCoordinator:
                 try:
                     value = evaluation_task.result()
                     accepted = self.window_host.accept_result(identity)
+                    await self._publish_visual_window(
+                        identity,
+                        accepted["fact"],
+                        self._label(value) if accepted["accepted"] else None,
+                        reported=reported_windows,
+                    )
                     evaluation = {
                         "status": "valid",
                         "value": value,
@@ -97,7 +118,8 @@ class VoiceEmotionCoordinator:
                     }
                     release_reason = "evaluation_error"
             else:
-                self.window_host.close_for_timeout(identity, TimeoutKind.MODEL_TIMEOUT)
+                closed = self.window_host.close_for_timeout(identity, TimeoutKind.MODEL_TIMEOUT)
+                await self._publish_visual_window(identity, closed, reported=reported_windows)
                 evaluation = {
                     "status": "timeout",
                     "reason": TimeoutKind.MODEL_TIMEOUT.value,
@@ -120,7 +142,16 @@ class VoiceEmotionCoordinator:
             context_ready = hydration is not None
         except asyncio.CancelledError:
             self._recover_cancelled_children(identity, evaluation_task, hydration_task)
+            closed = self.window_host.current(identity)
+            if closed is not None and closed.get("status") == "closed":
+                await self._publish_visual_window(identity, closed, reported=reported_windows)
             raise
+        finally:
+            fact = self.window_host.current(identity)
+            if (fact is None or fact.get("status") != "open") and close_watcher is not None:
+                if not close_watcher.done():
+                    close_watcher.cancel()
+                    await asyncio.gather(close_watcher, return_exceptions=True)
 
         def _elapsed(timing: dict[str, float | None]) -> float:
             end = timing["end"]
@@ -203,3 +234,48 @@ class VoiceEmotionCoordinator:
             self.window_host.record_late_error(identity, exc)
             return
         self.window_host.record_late_result(identity, value, status="valid")
+
+    async def _watch_visual_window_close(
+        self, identity: Identity, reported: set[tuple[Any, ...]]
+    ) -> None:
+        """Publish the host's authoritative timeout close, including after run returns."""
+        while True:
+            await asyncio.sleep(0.01)
+            fact = self.window_host.current(identity)
+            if fact is None or fact.get("status") != "open":
+                if fact is not None and fact.get("status") == "closed":
+                    await self._publish_visual_window(identity, fact, reported=reported)
+                return
+
+    async def _publish_visual_window(
+        self,
+        identity: Identity,
+        fact: dict[str, Any] | None,
+        label: str | None = None,
+        *,
+        reported: set[tuple[Any, ...]] | None = None,
+    ) -> None:
+        if fact is None or self._on_visual_window is None:
+            return
+        event_key = (
+            tuple(identity.get(key) for key in ("session_id", "input_turn_id", "input_order", "stimulus_revision")),
+            fact.get("status"),
+            fact.get("decision_seq"),
+            fact.get("reason"),
+        )
+        if reported is not None:
+            if event_key in reported:
+                return
+            reported.add(event_key)
+        result = self._on_visual_window(dict(identity), dict(fact), label)
+        if asyncio.iscoroutine(result):
+            await result
+
+    @staticmethod
+    def _label(value: Any) -> str | None:
+        from services.avatar_emotion import EMOTIONS
+
+        if not isinstance(value, dict):
+            return None
+        label = value.get("label")
+        return label if isinstance(label, str) and label in EMOTIONS else None

@@ -10,8 +10,16 @@ import { decodeBase64ToPcm } from "@/lib/voice-playback/native-output-source";
 import { NativeOutputPlayer } from "@/lib/voice-playback/native-player";
 import type { NativePcmSource } from "@/lib/voice-playback/native-output-source";
 import type { NativePlaybackEventRequest } from "@/lib/voice-playback/native-player";
+import {
+  applyLocalPlaybackFeedback,
+  applyVoiceBehaviorEvent,
+  initialVoiceAvatarState,
+  projectVoiceAvatar,
+  setVoiceAvatarMediaSession,
+} from "@/lib/voice-realtime/avatar-projection";
+import { VoiceAvatar } from "./voice-avatar";
 
-type TalkPhase = "idle" | "connecting" | "listening" | "failed";
+type TalkPhase = "idle" | "connecting" | "listening" | "failed" | "closing";
 type TalkOutput = { queue: NativeOutputQueue; player: NativeOutputPlayer; failed: boolean; speaking: boolean };
 
 async function postPlaybackReceipt(
@@ -53,6 +61,7 @@ export function TalkMode({
   const [speaking, setSpeaking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [retryAvailable, setRetryAvailable] = useState(false);
+  const [avatarState, setAvatarState] = useState(() => initialVoiceAvatarState(sessionId ?? ""));
   const clientRef = useRef<VoiceRealtimeClient | null>(null);
   const captureRef = useRef<AudioCaptureController | null>(null);
   const outputsRef = useRef(new Map<string, TalkOutput>());
@@ -60,6 +69,7 @@ export function TalkMode({
   const activeRef = useRef(false);
   const mountedRef = useRef(true);
   const sessionIdRef = useRef(sessionId);
+  const avatar = projectVoiceAvatar(avatarState);
 
   const refreshSpeaking = useCallback(() => {
     if (mountedRef.current) {
@@ -116,6 +126,7 @@ export function TalkMode({
 
   const stopTalk = useCallback(async (message?: string) => {
     activeRef.current = false;
+    if (mountedRef.current) setPhase("closing");
     const capture = captureRef.current;
     captureRef.current = null;
     await capture?.close();
@@ -126,6 +137,12 @@ export function TalkMode({
     setError(message ?? null);
     setRetryAvailable(Boolean(message));
   }, [stopOutputs]);
+
+  useEffect(() => {
+    if (sessionId && avatarState.session_id !== sessionId) {
+      setAvatarState(initialVoiceAvatarState(sessionId));
+    }
+  }, [avatarState.session_id, sessionId]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -184,6 +201,28 @@ export function TalkMode({
       clientRef.current = new VoiceRealtimeClient({
         onMessage: (message: RealtimeServerMessage) => {
           if (!activeRef.current) return;
+          if (message.type === "ready") {
+            setAvatarState((current) => {
+              const sessionState = current.session_id === message.session_id
+                ? current
+                : initialVoiceAvatarState(message.session_id);
+              return setVoiceAvatarMediaSession(sessionState, message.media_session_id);
+            });
+            return;
+          }
+          if (message.type === "event") {
+            if (message.media_session_id !== clientRef.current?.activeMediaSessionId) return;
+            setAvatarState((current) => {
+              const sessionState = current.session_id === message.session_id
+                ? current
+                : initialVoiceAvatarState(message.session_id, message.media_session_id);
+              const mediaState = sessionState.media_session_id === message.media_session_id
+                ? sessionState
+                : setVoiceAvatarMediaSession(sessionState, message.media_session_id);
+              return applyVoiceBehaviorEvent(mediaState, message.event);
+            });
+            return;
+          }
           if (message.type === "audio_chunk") {
             if (invalidatedResponsesRef.current.has(message.response_id)) return;
             let output = outputsRef.current.get(message.response_id);
@@ -200,6 +239,10 @@ export function TalkMode({
                   turn_id: message.turn_id,
                 },
                 session_id: message.session_id,
+                onVisualFeedback: (value) => {
+                  if (!activeRef.current || clientRef.current?.activeMediaSessionId !== message.media_session_id) return;
+                  setAvatarState((current) => applyLocalPlaybackFeedback(current, value));
+                },
                 emit: (event: NativePlaybackEventRequest) => {
                   const endpoint = clientRef.current?.activePlaybackEndpoint ?? "";
                   if (event.action === "audible" && output) {
@@ -297,10 +340,14 @@ export function TalkMode({
     connecting: "Connecting Talk",
     listening: speaking ? "Speaking" : "Listening",
     failed: "Talk needs attention",
+    closing: "Stopping Talk",
   };
 
   return (
-    <div className="relative flex-none">
+    <div className={`relative flex-none ${phase !== "idle" ? "z-40" : ""}`}>
+      {phase !== "idle" && phase !== "closing" ? (
+        <VoiceAvatar composition={avatar.composition} bubble={avatar.bubble} generation={0} />
+      ) : null}
       {phase === "idle" ? (
         <button
           type="button"
@@ -311,6 +358,15 @@ export function TalkMode({
           className="flex h-10 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-[var(--ink-soft)] hover:bg-[var(--outline)] hover:text-[var(--foreground)] disabled:opacity-40"
         >
           <Radio size={16} /> Talk
+        </button>
+      ) : phase === "closing" ? (
+        <button
+          type="button"
+          disabled
+          aria-label="Stopping Talk mode"
+          className="flex h-10 items-center gap-1.5 rounded-md bg-[var(--outline)] px-2 text-xs font-medium text-[var(--ink-soft)]"
+        >
+          Stopping
         </button>
       ) : (
         <button
@@ -330,7 +386,9 @@ export function TalkMode({
           <p className="mt-2 text-[11px] text-[var(--ink-soft)]">
             {phase === "listening"
               ? speaking ? "Hexis is speaking. You can interrupt by speaking." : "The microphone stays open while Hexis listens."
-              : "Talk is starting. Grant microphone permission if your browser asks."}
+              : phase === "closing"
+                ? "The microphone and audio output are closing."
+                : "Talk is starting. Grant microphone permission if your browser asks."}
           </p>
         </div>
       ) : null}

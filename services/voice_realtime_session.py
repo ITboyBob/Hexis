@@ -88,6 +88,7 @@ class VoiceRealtimeSession:
         self._input_lock = asyncio.Lock()
         self._input_order = 0
         self._event_sink: Any | None = None
+        self._behavior_event_dispatch: Any | None = None
         self._response_dispatch: Any | None = None
         # Producer sequence 0 is reserved for voice_session_ready.
         self._event_seq = 1
@@ -657,6 +658,7 @@ class VoiceRealtimeSession:
                 {
                     "capture_instance_id": str(source.capture_instance_id),
                     "deduplicated": receipt.deduplicated,
+                    "identity": receipt.identity.model_dump(mode="json"),
                 },
                 input_turn_id=str(receipt.identity.input_turn_id),
                 stimulus_revision=receipt.identity.stimulus_revision,

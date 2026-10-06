@@ -39,6 +39,7 @@ type NativeOutputPlayerOptions = {
   identity: NativePlaybackIdentity;
   session_id: string;
   emit: (event: NativePlaybackEventRequest) => void;
+  onVisualFeedback?: (value: { identity: NativePlaybackIdentity; feedback: Playback }) => void;
   audio?: HTMLAudioElement;
   createContext?: () => AudioContext;
 };
@@ -370,6 +371,10 @@ export class NativeOutputPlayer {
   }
 
   private emitPlaybackFeedback(feedback: Playback): void {
+    this.options.onVisualFeedback?.({
+      identity: { ...this.options.identity },
+      feedback: { ...feedback },
+    });
     if (feedback.phase === "playing" && !this.audibleEmitted) {
       this.audibleEmitted = true;
       this.emit({

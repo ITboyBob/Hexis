@@ -73,10 +73,12 @@ describe("NativeOutputPlayer", () => {
   it("桥接LocalPlayer真实反馈并在终态后拒绝迟到反馈", async () => {
     const audio = new FakeAudio();
     const events: NativePlaybackEventRequest[] = [];
+    const visual: Array<{ identity: NativePlaybackIdentity; phase: string }> = [];
     const player = new NativeOutputPlayer({
       identity,
       session_id: "11111111-1111-1111-1111-111111111111",
       emit: (event) => events.push(event),
+      onVisualFeedback: (value) => visual.push({ identity: value.identity, phase: value.feedback.phase }),
       audio: audio as unknown as HTMLAudioElement,
       createContext: () => fakeContext() as unknown as AudioContext,
     });
@@ -119,6 +121,11 @@ describe("NativeOutputPlayer", () => {
       scope: "complete",
       played_ms: 3000,
     });
+    expect(visual).toEqual([
+      { identity, phase: "playing" },
+      { identity, phase: "playing" },
+      { identity, phase: "drained" },
+    ]);
     expect(player.accepts({ epoch: 2, source: "real" })).toBe(false);
     await player.destroy();
   });
