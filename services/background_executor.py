@@ -63,6 +63,10 @@ class BackgroundExecutor:
     async def _create_registry(self) -> ToolRegistry:
         return create_default_registry(self._pool)
 
+    async def execute_work(self, prepared: Any, on_event: Any = None) -> AgentLoopResult:
+        """Execute one already prepared background turn."""
+        raise NotImplementedError
+
     @staticmethod
     def _succeeded(result: AgentLoopResult, criteria: str) -> bool:
         if result.timed_out or result.stopped_reason != "completed":
