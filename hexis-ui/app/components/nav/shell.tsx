@@ -9,7 +9,8 @@ export function Shell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const hideNav = pathname.startsWith("/init")
     || pathname === "/avatar-preview"
-    || pathname.startsWith("/avatar-preview/");
+    || pathname.startsWith("/avatar-preview/")
+    || pathname === "/voice-vad-test";
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
   useEffect(() => {

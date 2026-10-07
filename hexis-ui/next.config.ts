@@ -3,6 +3,9 @@ import path from "node:path";
 
 const nextConfig: NextConfig = {
   output: "standalone",
+  ...(process.env.HEXIS_UI_TEST_TARGET === "worker" && process.env.HEXIS_UI_DIST_DIR
+    ? { distDir: process.env.HEXIS_UI_DIST_DIR }
+    : {}),
   turbopack: {
     root: path.resolve(__dirname),
   },

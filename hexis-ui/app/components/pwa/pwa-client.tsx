@@ -19,7 +19,9 @@ const DISMISSED_KEY = "hexis:pwa-prompt-dismissed";
 
 export function PwaClient() {
   const pathname = usePathname();
-  const isolatedRoute = pathname === "/avatar-preview" || pathname.startsWith("/avatar-preview/");
+  const isolatedRoute = pathname === "/avatar-preview"
+    || pathname.startsWith("/avatar-preview/")
+    || pathname === "/voice-vad-test";
   const [installAvailable, setInstallAvailable] = useState(false);
   const [showPrompt, setShowPrompt] = useState(false);
   const [notificationAvailable, setNotificationAvailable] = useState(false);

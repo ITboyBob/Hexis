@@ -1,3 +1,5 @@
+import errno
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +12,8 @@ from apps.voice_barge_in_environment import (
     build_compose_command,
     build_environment_record,
     build_pytest_environment,
+    build_worker_environment,
+    build_parser,
     derive_project_name,
     validate_source_container_metadata,
     validate_environment_id,
@@ -49,6 +53,105 @@ def setup_db():
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 PROFILE_PATH = REPOSITORY_ROOT / "config/voice-barge-in/run-profile.json"
+
+
+def test_fingerprints_respects_selected_paths_defaults_and_missing_files(monkeypatch, tmp_path):
+    (tmp_path / "present.txt").write_bytes(b"fingerprint-data")
+    expected_digest = hashlib.sha256(b"fingerprint-data").hexdigest()
+    monkeypatch.setattr(environment_module, "FINGERPRINT_PATHS", ("present.txt", "missing.txt"))
+    assert environment_module._fingerprints(tmp_path) == {"present.txt": expected_digest, "missing.txt": "missing"}
+    assert environment_module._fingerprints(tmp_path, ["present.txt"]) == {"present.txt": expected_digest}
+    assert environment_module._fingerprints(tmp_path, []) == {}
+
+
+def test_worker_ui_fingerprints_uses_only_its_selected_source_paths(monkeypatch, tmp_path):
+    monkeypatch.setattr(environment_module, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(environment_module.subprocess, "run", lambda *args, **kwargs: pytest.fail("real subprocess invoked"))
+    monkeypatch.setattr(environment_module.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("real process invoked"))
+    page = "hexis-ui/app/voice-vad-test/page.tsx"
+    page_path = tmp_path / page
+    page_path.parent.mkdir(parents=True)
+    page_path.write_bytes(b"unit-worker-page")
+    fingerprints = environment_module._worker_ui_fingerprints()
+    assert fingerprints[page] == hashlib.sha256(b"unit-worker-page").hexdigest()
+    assert fingerprints["hexis-ui/lib/voice-realtime/vad-assets-manifest.json"] == "missing"
+    assert "config/voice-barge-in/run-profile.json" not in fingerprints
+
+
+def test_worker_container_name_uses_the_complete_run_identity_without_suffix_collisions():
+    environment_id = "vb-20261008-a"
+    first_run = "w1-s2-20261008-a-standalone-worker"
+    second_run = "w1-s2-20261008-b-standalone-worker"
+    assert first_run[-8:] == second_run[-8:]
+    first_name = environment_module._worker_ui_container_name(environment_id, first_run)
+    second_name = environment_module._worker_ui_container_name(environment_id, second_run)
+    assert first_name != second_name
+    assert first_name == environment_module._worker_ui_container_name(environment_id, first_run)
+    for name in (first_name, second_name):
+        assert name.startswith("hexis-vb-20261008-a-worker-")
+        assert environment_module.re.fullmatch(r"[a-z0-9][a-z0-9_.-]+", name)
+        assert environment_module.re.fullmatch(r"[a-f0-9]{12}", name.rsplit("-", 1)[1])
+
+
+@pytest.mark.parametrize("run_id", ["w1-first-dev-worker", "w1-second-dev-worker"])
+def test_worker_dev_start_selects_and_records_its_own_build_directory(monkeypatch, tmp_path, run_id):
+    monkeypatch.setattr(environment_module, "_assert_port_available", lambda *args: None)
+    monkeypatch.setattr(environment_module, "_worker_ui_fingerprints", lambda: {"unit-source": "unit-hash"})
+    monkeypatch.setattr(environment_module, "_run", lambda command, **kwargs: SimpleNamespace(stdout="unit-head"))
+    monkeypatch.setattr(environment_module, "_wait_for_worker_page", lambda *args, **kwargs: 200)
+    monkeypatch.setattr(environment_module.subprocess, "run", lambda *args, **kwargs: pytest.fail("real subprocess invoked"))
+    launches = []
+
+    def launch(command, **kwargs):
+        launches.append((command, kwargs))
+        return SimpleNamespace(pid=12345)
+
+    monkeypatch.setattr(environment_module.subprocess, "Popen", launch)
+    output_record = tmp_path / "voice-barge-in/ui-runs" / f"{run_id}.json"
+    args = SimpleNamespace(
+        env_id="vb-unit", mode="worker", target="dev", port=3481,
+        profile=PROFILE_PATH, cache_root=tmp_path, output_record=output_record,
+    )
+    environment_module._start_worker_ui(args)
+    record = json.loads(output_record.read_text(encoding="utf-8"))
+    expected = f".next/voice-barge-in-{hashlib.sha256(run_id.encode()).hexdigest()[:12]}"
+    assert launches[0][1]["env"]["HEXIS_UI_DIST_DIR"] == expected
+    assert launches[0][1]["start_new_session"] is True
+    assert record["dev_dist_dir"] == expected
+    assert record["process"]["process_group_id"] == 12345
+    assert record["status"] == "ready"
+
+
+@pytest.mark.parametrize("active_listener", [False, True])
+def test_port_probe_reuses_closing_connections_but_rejects_active_listeners(monkeypatch, active_listener):
+    class PortProbe:
+        reuse_address = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def setsockopt(self, level, option, value):
+            assert (level, option, value) == (
+                environment_module.socket.SOL_SOCKET, environment_module.socket.SO_REUSEADDR, 1,
+            )
+            self.reuse_address = True
+
+        def bind(self, address):
+            assert address == ("127.0.0.1", 3478)
+            if active_listener or not self.reuse_address:
+                raise OSError(errno.EADDRINUSE, "Address already in use")
+
+    probe = PortProbe()
+    monkeypatch.setattr(environment_module.socket, "socket", lambda: probe)
+    if active_listener:
+        with pytest.raises(RuntimeError, match="port 3478 is already occupied"):
+            environment_module._assert_port_available(3478)
+    else:
+        environment_module._assert_port_available(3478)
+    assert probe.reuse_address is True
 
 
 def test_environment_id_rejects_path_components_and_project_is_deterministic():
@@ -258,6 +361,40 @@ def test_api_start_record_contains_only_non_secret_clone_and_config_fingerprints
     assert record["source_clone"]["target_data_fingerprint"] == "safe-hash"
     assert "must-not-copy" not in serialized
     assert "postgresql://" not in serialized
+
+
+def test_worker_ui_environment_strips_database_api_and_credential_values():
+    worker_env = build_worker_environment({
+        "PATH": "/usr/bin",
+        "POSTGRES_PASSWORD": "db-secret",
+        "POSTGRES_USER": "private-role",
+        "HEXIS_DATABASE_URL": "postgresql://private",
+        "DATABASE_URL": "postgresql://ambient",
+        "HEXIS_API_URL": "http://ambient-api",
+        "OPENAI_API_KEY": "cloud-secret",
+        "SAFE_UI_SETTING": "visible",
+        "LC_ALL": "zh_CN.UTF-8",
+    }, port=3477)
+    assert worker_env["PATH"] == "/usr/bin"
+    assert worker_env["LC_ALL"] == "zh_CN.UTF-8"
+    assert worker_env["HEXIS_VAD_TEST_HARNESS"] == "1"
+    assert worker_env["PORT"] == "3477"
+    assert not {"POSTGRES_PASSWORD", "POSTGRES_USER", "HEXIS_DATABASE_URL", "DATABASE_URL", "HEXIS_API_URL", "OPENAI_API_KEY", "SAFE_UI_SETTING"} & set(worker_env)
+
+
+def test_worker_ui_cli_requires_explicit_mode_target_and_run_record():
+    parsed = build_parser().parse_args([
+        "start-ui",
+        "--env-id", "vb-s2",
+        "--mode", "worker",
+        "--target", "standalone",
+        "--output-record", "/cache/voice-barge-in/ui-runs/w1-s2-worker.json",
+        "--cache-root", "/cache",
+    ])
+    assert parsed.command == "start-ui"
+    assert parsed.mode == "worker"
+    assert parsed.target == "standalone"
+    assert parsed.output_record.name == "w1-s2-worker.json"
 
 
 @pytest.mark.parametrize("target_migration_count", [268, 269])

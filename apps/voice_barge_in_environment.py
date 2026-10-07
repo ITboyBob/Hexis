@@ -12,8 +12,10 @@ import subprocess
 import sys
 import signal
 import time
+import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+from urllib.error import URLError
 from urllib.request import urlopen
 from urllib.parse import quote
 from pathlib import Path
@@ -156,9 +158,9 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _fingerprints(repository_root: Path) -> dict[str, str]:
+def _fingerprints(repository_root: Path, paths: Sequence[str] | None = None) -> dict[str, str]:
     result = {}
-    for relative in FINGERPRINT_PATHS:
+    for relative in (FINGERPRINT_PATHS if paths is None else paths):
         path = repository_root / relative
         result[relative] = _sha256(path) if path.is_file() else "missing"
     return result
@@ -213,6 +215,28 @@ def build_pytest_environment(
         "POSTGRES_ADMIN_DB": "postgres",
     })
     return env
+
+
+def _validate_port(port: int) -> None:
+    if not 1 <= int(port) <= 65535:
+        raise ValueError(f"port must be between 1 and 65535: {port}")
+
+
+def build_worker_environment(parent_environment: dict[str, str], *, port: int) -> dict[str, str]:
+    _validate_port(port)
+    safe_host_settings = {"PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "TZ", "TERM", "NO_COLOR"}
+    worker_environment = {
+        key: value
+        for key, value in parent_environment.items()
+        if key in safe_host_settings
+    }
+    worker_environment.update({
+        "HEXIS_VAD_TEST_HARNESS": "1",
+        "HEXIS_UI_TEST_TARGET": "worker",
+        "PORT": str(port),
+        "NEXT_TELEMETRY_DISABLED": "1",
+    })
+    return worker_environment
 
 
 def load_owned_environment_record(record_path: Path | str) -> tuple[Path, dict[str, Any]]:
@@ -649,9 +673,9 @@ def _verify_restored_database(
 
 
 def _assert_port_available(port: int) -> None:
-    if not 1 <= port <= 65535:
-        raise ValueError(f"port must be between 1 and 65535: {port}")
+    _validate_port(port)
     with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             listener.bind(("127.0.0.1", port))
         except OSError as exc:
@@ -1059,6 +1083,243 @@ def _stop_api(args: argparse.Namespace) -> None:
     raise RuntimeError(f"M6 API process group {pid} did not stop after SIGTERM; inspect its private log and choose the next action")
 
 
+def _worker_ui_container_name(environment_id: str, run_id: str) -> str:
+    run_digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:12]
+    return f"{derive_project_name(environment_id)}-worker-{run_digest}"
+
+
+def _worker_ui_fingerprints() -> dict[str, str]:
+    paths = (
+        "hexis-ui/package.json",
+        "hexis-ui/package-lock.json",
+        "hexis-ui/next.config.ts",
+        "hexis-ui/app/layout.tsx",
+        "hexis-ui/app/components/nav/shell.tsx",
+        "hexis-ui/app/components/pwa/pwa-client.tsx",
+        "hexis-ui/lib/voice-realtime/speech-detection-config.json",
+        "hexis-ui/lib/voice-realtime/vad-assets-manifest.json",
+        "hexis-ui/lib/voice-realtime/speech-detector.ts",
+        "hexis-ui/lib/voice-realtime/speech-detector.worker.ts",
+        "hexis-ui/app/voice-vad-test/page.tsx",
+        "hexis-ui/app/voice-vad-test/worker-harness.tsx",
+        "hexis-ui/e2e/voice-vad-worker.spec.ts",
+    )
+    return _fingerprints(REPOSITORY_ROOT, paths)
+
+
+def _wait_for_worker_page(url: str, *, process: subprocess.Popen[Any] | None, container_id: str | None, timeout_seconds: float = 60) -> int:
+    deadline = time.monotonic() + timeout_seconds
+    last_status: int | None = None
+    while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(f"Worker UI process exited before the test page was ready (exit {process.returncode}); inspect its private W1 log")
+        if container_id is not None:
+            state = _run(["docker", "inspect", "--format", "{{.State.Status}}", container_id]).stdout.strip()
+            if state in {"exited", "dead", "removing"}:
+                raise RuntimeError(f"Worker UI container exited before the test page was ready ({state})")
+        try:
+            with urlopen(url, timeout=1) as response:
+                last_status = response.status
+                if response.status == 200:
+                    return response.status
+        except Exception as exc:
+            status = getattr(exc, "code", None)
+            if status is not None:
+                last_status = int(status)
+        time.sleep(0.25)
+    raise RuntimeError(f"Worker test page did not become available at {url} within {timeout_seconds:g}s (last HTTP status: {last_status})")
+
+
+def _start_worker_ui(args: argparse.Namespace) -> None:
+    environment_id = validate_environment_id(args.env_id)
+    if args.mode != "worker":
+        raise ValueError("talk UI startup is reserved for Task 5.3 after API/database identity verification")
+    profile = load_profile(args.profile)
+    public_url = urlparse(profile["ui_url"])
+    if public_url.scheme != "http" or public_url.hostname != "127.0.0.1":
+        raise ValueError("worker UI must use an explicitly selected loopback URL")
+    port = args.port if args.port is not None else (public_url.port or 3477)
+    _assert_port_available(port)
+    output_record = args.output_record.resolve()
+    ui_runs_root = (args.cache_root / "voice-barge-in" / "ui-runs").resolve()
+    if not output_record.is_relative_to(ui_runs_root) or output_record == ui_runs_root:
+        raise ValueError("W1/U1 output must be inside the selected cache root's ui-runs directory")
+    if not output_record.name.endswith("-worker.json"):
+        raise ValueError("worker UI output record filename must end in -worker.json")
+    if output_record.exists():
+        raise FileExistsError(f"refusing to overwrite existing UI run record: {output_record}")
+    run_id = output_record.stem
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", run_id):
+        raise ValueError("worker UI run id derived from output filename contains unsupported characters")
+    log_path = output_record.with_suffix(".log")
+    if log_path.exists():
+        raise FileExistsError(f"refusing to overwrite existing UI run log: {log_path}")
+    fingerprints = _worker_ui_fingerprints()
+    worker_env = build_worker_environment(os.environ.copy(), port=port)
+    if args.target == "dev":
+        run_digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:12]
+        worker_env["HEXIS_UI_DIST_DIR"] = f".next/voice-barge-in-{run_digest}"
+    process: subprocess.Popen[Any] | None = None
+    container_id: str | None = None
+    ui_target = "dev" if args.target == "dev" else "standalone"
+    run_record: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "worker_ui_run",
+        "run_id": run_id,
+        "env_id": environment_id,
+        "mode": "worker",
+        "target": ui_target,
+        "ui_port": port,
+        "ui_url": f"http://127.0.0.1:{port}/voice-vad-test",
+        "runtime_flag": "HEXIS_VAD_TEST_HARNESS=1",
+        "source_root": str(REPOSITORY_ROOT),
+        "source_head": _run(["git", "rev-parse", "HEAD"]).stdout.strip(),
+        "source_fingerprints": fingerprints,
+        "model_resource_fingerprint": fingerprints.get("hexis-ui/lib/voice-realtime/vad-assets-manifest.json"),
+        "credential_env_names": [],
+        "network_services": [],
+        "status": "starting",
+        "log_path": str(log_path),
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    if args.target == "dev":
+        run_record["dev_dist_dir"] = worker_env["HEXIS_UI_DIST_DIR"]
+    _atomic_json_write(output_record, run_record, refuse_existing=True)
+    try:
+        if args.target == "dev":
+            log_descriptor = os.open(log_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(log_descriptor, "wb") as log_stream:
+                process = subprocess.Popen(
+                    [str(REPOSITORY_ROOT / "hexis-ui/node_modules/.bin/next"), "dev", "--hostname", "127.0.0.1", "--port", str(port)],
+                    cwd=REPOSITORY_ROOT / "hexis-ui",
+                    env=worker_env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_stream,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            run_record["process"] = {"pid": process.pid, "process_group_id": process.pid}
+        else:
+            image = f"hexis-ui-voice-barge-in-w1:{run_id}"
+            source_head = run_record["source_head"]
+            _run([
+                "docker", "build", "--quiet", "--file", "ops/Dockerfile.ui", "--tag", image,
+                "--label", f"com.hexis.voice-barge-in.w1-run-id={run_id}",
+                "--label", f"com.hexis.voice-barge-in.source-head={source_head}",
+                ".",
+            ])
+            image_id = _run(["docker", "image", "inspect", image, "--format", "{{.Id}}"] ).stdout.strip()
+            container_name = _worker_ui_container_name(environment_id, run_id)
+            labels = [
+                "--label", f"com.hexis.voice-barge-in.env-id={environment_id}",
+                "--label", f"com.hexis.voice-barge-in.run-id={run_id}",
+                "--label", "com.hexis.voice-barge-in.mode=worker",
+            ]
+            command = [
+                "docker", "run", "--detach", "--pull", "never", "--name", container_name,
+                *labels,
+                "--publish", f"127.0.0.1:{port}:3477",
+                "--env", "HEXIS_VAD_TEST_HARNESS=1",
+                "--env", "HEXIS_UI_TEST_TARGET=worker",
+                "--env", "PORT=3477",
+                "--env", "NEXT_TELEMETRY_DISABLED=1",
+                image,
+            ]
+            container_id = _run(command).stdout.strip()
+            run_record["build_fingerprint"] = hashlib.sha256(
+                json.dumps({"source_fingerprints": fingerprints, "image_id": image_id}, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            run_record["container"] = {"id": container_id, "name": container_name, "image": image, "image_id": image_id}
+        run_record["status"] = "starting"
+        _atomic_json_write(output_record, run_record)
+        http_status = _wait_for_worker_page(run_record["ui_url"], process=process, container_id=container_id)
+        run_record["status"] = "ready"
+        run_record["runtime_http_status"] = http_status
+        run_record["ready_at_utc"] = datetime.now(timezone.utc).isoformat()
+        _atomic_json_write(output_record, run_record)
+        print(f"Worker UI ready at {run_record['ui_url']} ({ui_target}); W1: {output_record}")
+    except Exception:
+        if container_id is not None and not log_path.exists():
+            try:
+                diagnostic = _run(["docker", "logs", "--tail", "100", container_id]).stdout
+                descriptor = os.open(log_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as log_stream:
+                    log_stream.write(diagnostic)
+            except Exception:
+                pass
+        run_record["status"] = "start_failed_resource_left_for_explicit_recovery"
+        _atomic_json_write(output_record, run_record)
+        raise
+
+
+def _stop_worker_ui(args: argparse.Namespace) -> None:
+    environment_id = validate_environment_id(args.env_id)
+    run_path = args.run_record.resolve()
+    ui_runs_root = (args.cache_root / "voice-barge-in" / "ui-runs").resolve()
+    if not run_path.is_relative_to(ui_runs_root):
+        raise ValueError("worker UI stop requires an explicit W1 record under the selected cache root")
+    try:
+        record = json.loads(run_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read selected W1 record: {exc}") from exc
+    if record.get("env_id") != environment_id or record.get("mode") != "worker" or record.get("kind") != "worker_ui_run":
+        raise ValueError("selected W1 record does not own a Worker UI for this env-id")
+    if record.get("status") == "stopped":
+        print(f"Worker UI run {record['run_id']} is already stopped")
+        return
+    if record.get("target") == "standalone":
+        container = record.get("container", {})
+        container_id = container.get("id")
+        if not container_id:
+            raise ValueError("selected W1 record has no owned container ID")
+        inspected = json.loads(_run(["docker", "inspect", container_id]).stdout)[0]
+        labels = inspected.get("Config", {}).get("Labels") or {}
+        if (
+            labels.get("com.hexis.voice-barge-in.env-id") != environment_id
+            or labels.get("com.hexis.voice-barge-in.run-id") != record.get("run_id")
+            or labels.get("com.hexis.voice-barge-in.mode") != "worker"
+            or inspected.get("Image") != container.get("image_id")
+        ):
+            raise RuntimeError("container labels do not match the selected W1; refusing to stop it")
+        _run(["docker", "stop", "--time", "10", container_id])
+    else:
+        process = record.get("process", {})
+        pid = int(process.get("pid", 0))
+        group_id = int(process.get("process_group_id", 0))
+        if pid <= 0 or group_id != pid:
+            raise ValueError("selected W1 has no verified owned process group")
+        command = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, check=False).stdout.strip()
+        if not command:
+            record["status"] = "stopped"
+            record["stopped_at_utc"] = datetime.now(timezone.utc).isoformat()
+            _atomic_json_write(run_path, record)
+            print(f"Worker UI process for {record['run_id']} is already stopped")
+            return
+        if "next" not in command or "dev" not in command:
+            raise RuntimeError("recorded UI PID now belongs to a different command; refusing to signal it")
+        env_output = subprocess.run(["ps", "eww", "-p", str(pid), "-o", "command="], capture_output=True, text=True, check=False).stdout
+        if (
+            "HEXIS_VAD_TEST_HARNESS=1" not in env_output
+            or f"PORT={record.get('ui_port')}" not in env_output
+            or os.getpgid(pid) != group_id
+        ):
+            raise RuntimeError("recorded UI process does not match the selected W1 identity; refusing to stop it")
+        os.killpg(group_id, signal.SIGTERM)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(group_id, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError(f"Worker UI process group {group_id} did not stop after SIGTERM; inspect the private W1 log")
+    record["status"] = "stopped"
+    record["stopped_at_utc"] = datetime.now(timezone.utc).isoformat()
+    _atomic_json_write(run_path, record)
+    print(f"Stopped only the Worker UI owned by W1 run {record['run_id']}")
+
+
 def _run_pytest(args: argparse.Namespace) -> None:
     _, record = _read_environment_record(args.cache_root, args.env_id)
     identity = record.get("db_identity", {}).get("pytest")
@@ -1111,12 +1372,22 @@ def build_parser() -> argparse.ArgumentParser:
     start_api.add_argument("--cache-root", type=Path, default=cache_default)
     start_api.set_defaults(handler=_start_api)
 
+    start_ui = subparsers.add_parser("start-ui", help="start the API/database-free W1 Worker test page")
+    start_ui.add_argument("--env-id", required=True)
+    start_ui.add_argument("--profile", type=Path, default=PROFILE_DEFAULT)
+    start_ui.add_argument("--mode", choices=("worker", "talk"), required=True)
+    start_ui.add_argument("--target", choices=("dev", "standalone"), required=True)
+    start_ui.add_argument("--port", type=int)
+    start_ui.add_argument("--output-record", type=Path, required=True)
+    start_ui.add_argument("--cache-root", type=Path, default=cache_default)
+    start_ui.set_defaults(handler=_start_worker_ui)
+
     stop = subparsers.add_parser("stop", help="stop one explicitly selected owned API process")
     stop.add_argument("--env-id", required=True)
-    stop.add_argument("--target", choices=("api",), required=True)
+    stop.add_argument("--target", choices=("api", "worker-ui"), required=True)
     stop.add_argument("--run-record", type=Path, required=True)
     stop.add_argument("--cache-root", type=Path, default=cache_default)
-    stop.set_defaults(handler=_stop_api)
+    stop.set_defaults(handler=lambda parsed: _stop_api(parsed) if parsed.target == "api" else _stop_worker_ui(parsed))
 
     run_tests = subparsers.add_parser("run-pytest", help="run tests only against the owned pytest database")
     run_tests.add_argument("--env-id", required=True)
