@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
+
+from services.behavior_events import (
+    BehaviorEvent,
+    record_behavior_event_on_connection,
+)
 
 
 _AUTHORIZATION_FIELDS = {
@@ -19,6 +25,12 @@ _AUTHORIZATION_FIELDS = {
     "actual_call_id",
 }
 _PENDING_AUTHORIZATION_FIELDS = _AUTHORIZATION_FIELDS | {"task_id"}
+
+
+def task_event_stream_id(origin_session_id: UUID | str) -> str:
+    return f"m5-tasks:{_uuid(origin_session_id, 'origin_session_id')}"
+
+
 def decode_task_work_input(
     value: str, context: Any = None
 ) -> tuple[str, list[str], list[dict], list[dict]]:
@@ -115,6 +127,156 @@ class M5TaskService:
             raise ValueError("a database pool is required for M5 tasks")
         self._pool = pool
 
+    async def _task_view(
+        self, conn: Any, origin_session_id: UUID, task_id: UUID
+    ) -> dict[str, Any]:
+        task = await conn.fetchrow(
+            """
+            SELECT id, origin_session_id, task_description, task_session_id,
+                   product_state, revision
+            FROM public.m5_tasks
+            WHERE id=$1 AND origin_session_id=$2
+            """,
+            task_id,
+            origin_session_id,
+        )
+        if task is None:
+            raise RuntimeError("M5 task disappeared before its projection event was saved")
+        pending = await conn.fetch(
+            """
+            SELECT id, receive_order, message
+            FROM public.m5_pending_messages
+            WHERE task_id=$1 AND claimed_work_execution_id IS NULL
+            ORDER BY receive_order
+            """,
+            task_id,
+        )
+        return {
+            "task_id": str(task["id"]),
+            "task_title": task["task_description"],
+            "task_state": task["product_state"],
+            "task_session_id": str(task["task_session_id"]),
+            "revision": int(task["revision"]),
+            "pending": [
+                {
+                    "message_id": str(message["id"]),
+                    "receive_order": int(message["receive_order"]),
+                    "message": message["message"],
+                }
+                for message in pending
+            ],
+        }
+
+    async def record_task_changed_on_connection(
+        self,
+        conn: Any,
+        origin_session_id: UUID,
+        task_id: UUID,
+        *,
+        authorization: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not conn.is_in_transaction():
+            raise ValueError("the supplied M5 task event connection must have an active transaction")
+        view = await self._task_view(conn, origin_session_id, task_id)
+        identity = authorization or {}
+        await record_behavior_event_on_connection(
+            conn,
+            BehaviorEvent(
+                event_id=uuid4(),
+                schema_version=1,
+                event_type="m5_task_changed",
+                stream_id=task_event_stream_id(origin_session_id),
+                session_id=origin_session_id,
+                request_id=identity.get("request_id"),
+                stimulus_revision=identity.get("stimulus_revision"),
+                input_turn_id=identity.get("input_turn_id"),
+                response_id=identity.get("response_id"),
+                task_id=str(task_id),
+                call_id=identity.get("actual_call_id"),
+                ts=datetime.now(timezone.utc),
+                source="m5-task-service",
+                producer_id=f"m5-task:{task_id}",
+                producer_seq=view["revision"],
+                channel="m5-task",
+                payload={"origin_session_id": str(origin_session_id), **view},
+            ),
+        )
+        await conn.execute(
+            "SELECT pg_notify('m5_task_events',$1)", str(origin_session_id)
+        )
+        return view
+
+    async def list_tasks_for_origin(
+        self, origin_session_id: UUID | str
+    ) -> dict[str, Any] | None:
+        """Read one origin's task view and event cursor from one DB snapshot."""
+        origin_id = _uuid(origin_session_id, "origin_session_id")
+        stream_id = task_event_stream_id(origin_id)
+        async with self._pool.acquire() as conn:
+            async with conn.transaction(isolation="repeatable_read", readonly=True):
+                active = await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM public.chat_sessions WHERE id=$1 AND status='active')",
+                    origin_id,
+                )
+                if not active:
+                    return None
+                tasks = await conn.fetch(
+                    """
+                    SELECT id, origin_session_id, task_description, task_session_id,
+                           product_state, revision
+                    FROM public.m5_tasks
+                    WHERE origin_session_id=$1
+                    ORDER BY created_at DESC, id
+                    """,
+                    origin_id,
+                )
+                task_ids = [task["id"] for task in tasks]
+                pending_rows = (
+                    await conn.fetch(
+                        """
+                        SELECT task_id, id, receive_order, message
+                        FROM public.m5_pending_messages
+                        WHERE task_id=ANY($1::uuid[])
+                          AND claimed_work_execution_id IS NULL
+                        ORDER BY task_id, receive_order
+                        """,
+                        task_ids,
+                    )
+                    if task_ids
+                    else []
+                )
+                pending_by_task: dict[UUID, list[dict[str, Any]]] = {
+                    task_id: [] for task_id in task_ids
+                }
+                for message in pending_rows:
+                    pending_by_task[message["task_id"]].append(
+                        {
+                            "message_id": str(message["id"]),
+                            "receive_order": int(message["receive_order"]),
+                            "message": message["message"],
+                        }
+                    )
+                cursor = await conn.fetchval(
+                    "SELECT COALESCE(MAX(seq),0) FROM public.behavior_events WHERE stream_id=$1 AND session_id=$2",
+                    stream_id,
+                    origin_id,
+                )
+        return {
+            "origin_session_id": str(origin_id),
+            "event_cursor": {"m5-tasks": int(cursor)},
+            "tasks": [
+                {
+                    "task_id": str(task["id"]),
+                    "task_title": task["task_description"],
+                    "task_state": task["product_state"],
+                    "task_session_id": str(task["task_session_id"]),
+                    "revision": int(task["revision"]),
+                    "pending": pending_by_task[task["id"]],
+                }
+                for task in tasks
+            ],
+        }
+
     async def submit_m5_task(
         self,
         origin_session_id: UUID | str,
@@ -170,15 +332,24 @@ class M5TaskService:
             argument_digest=_submit_digest(description),
         )
         async with self._pool.acquire() as conn:
-            raw = await conn.fetchval(
-                "SELECT public.submit_m5_task($1, $2, $3, $4, $5::jsonb)",
-                origin_id,
-                command_uuid,
-                description,
-                original_request,
-                json.dumps(host_authorization, ensure_ascii=False),
-            )
-        return _coerce_json(raw)
+            async with conn.transaction():
+                raw = await conn.fetchval(
+                    "SELECT public.submit_m5_task($1, $2, $3, $4, $5::jsonb)",
+                    origin_id,
+                    command_uuid,
+                    description,
+                    original_request,
+                    json.dumps(host_authorization, ensure_ascii=False),
+                )
+                result = _coerce_json(raw)
+                if result.get("accepted") and not result.get("replayed"):
+                    await self.record_task_changed_on_connection(
+                        conn,
+                        origin_id,
+                        UUID(str(result["task_id"])),
+                        authorization=host_authorization,
+                    )
+        return result
 
     async def list_claimable_work(self, *, limit: int = 10) -> list[UUID]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
@@ -240,7 +411,7 @@ class M5TaskService:
             async with conn.transaction():
                 task = await conn.fetchrow(
                     """
-                    SELECT id, product_state, revision
+                    SELECT id, origin_session_id, product_state, revision
                     FROM public.m5_tasks
                     WHERE task_session_id=$1
                     FOR UPDATE
@@ -294,7 +465,7 @@ class M5TaskService:
                     task["id"],
                     work_id,
                 )
-                return {
+                result = {
                     "accepted": True,
                     "task_id": str(task["id"]),
                     "task_session_id": str(session_uuid),
@@ -302,6 +473,10 @@ class M5TaskService:
                     "task_state": "working",
                     "revision": int(task["revision"]) + 1,
                 }
+                await self.record_task_changed_on_connection(
+                    conn, task["origin_session_id"], task["id"]
+                )
+                return result
 
     async def append_m5_message(
         self,
@@ -310,6 +485,8 @@ class M5TaskService:
         command_id: UUID | str,
         message: str,
         authorization: dict[str, Any],
+        *,
+        connection: Any | None = None,
     ) -> dict[str, Any]:
         """Persist one user-confirmed message and preserve FIFO/idempotency."""
         origin_uuid = _uuid(origin_session_id, "origin_session_id")
@@ -354,24 +531,78 @@ class M5TaskService:
             command_id=str(command_uuid),
             argument_digest=_pending_digest(task_uuid, message),
         )
-        async with self._pool.acquire() as conn:
-            raw = await conn.fetchval(
-                "SELECT public.append_m5_message($1,$2,$3,$4,$5::jsonb)",
+        if connection is not None:
+            if not connection.is_in_transaction():
+                raise ValueError("the supplied M5 connection must have an active transaction")
+            return await self._append_m5_message_on_connection(
+                connection,
                 origin_uuid,
                 task_uuid,
                 command_uuid,
                 message,
-                json.dumps(host_authorization, ensure_ascii=False),
+                host_authorization,
             )
-        return _coerce_json(raw)
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                return await self._append_m5_message_on_connection(
+                    conn,
+                    origin_uuid,
+                    task_uuid,
+                    command_uuid,
+                    message,
+                    host_authorization,
+                )
+
+    async def _append_m5_message_on_connection(
+        self,
+        conn: Any,
+        origin_uuid: UUID,
+        task_uuid: UUID,
+        command_uuid: UUID,
+        message: str,
+        authorization: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw = await conn.fetchval(
+            "SELECT public.append_m5_message($1,$2,$3,$4,$5::jsonb)",
+            origin_uuid,
+            task_uuid,
+            command_uuid,
+            message,
+            json.dumps(authorization, ensure_ascii=False),
+        )
+        result = _coerce_json(raw)
+        if result.get("accepted") and not result.get("replayed"):
+            if not result.get("work_execution_id"):
+                await conn.execute(
+                    "UPDATE public.m5_tasks SET revision=revision+1,updated_at=clock_timestamp() WHERE id=$1 AND origin_session_id=$2",
+                    task_uuid,
+                    origin_uuid,
+                )
+            await self.record_task_changed_on_connection(
+                conn,
+                origin_uuid,
+                task_uuid,
+                authorization=authorization,
+            )
+        return result
 
     async def claim_next_m5_message(self, task_id: UUID | str) -> dict[str, Any] | None:
         task_uuid = _uuid(task_id, "task_id")
         async with self._pool.acquire() as conn:
-            raw = await conn.fetchval(
-                "SELECT public.claim_next_m5_message($1)", task_uuid
-            )
-        return _coerce_json(raw) if raw is not None else None
+            async with conn.transaction():
+                origin_id = await conn.fetchval(
+                    "SELECT origin_session_id FROM public.m5_tasks WHERE id=$1",
+                    task_uuid,
+                )
+                raw = await conn.fetchval(
+                    "SELECT public.claim_next_m5_message($1)", task_uuid
+                )
+                if raw is None:
+                    return None
+                result = _coerce_json(raw)
+                if result and origin_id is not None:
+                    await self.record_task_changed_on_connection(conn, origin_id, task_uuid)
+                return result or None
 
     async def list_pending_messages(self, task_id: UUID | str) -> list[dict[str, Any]]:
         task_uuid = _uuid(task_id, "task_id")
@@ -399,13 +630,21 @@ class M5TaskService:
         task_uuid = _uuid(task_id, "task_id")
         work_id = _uuid(work_execution_id, "work_execution_id")
         async with self._pool.acquire() as conn:
-            raw = await conn.fetchval(
-                "SELECT public.finish_m5_round($1,$2,$3)",
-                task_uuid,
-                work_id,
-                report_outcome,
-            )
-        return _coerce_json(raw)
+            async with conn.transaction():
+                raw = await conn.fetchval(
+                    "SELECT public.finish_m5_round($1,$2,$3)",
+                    task_uuid,
+                    work_id,
+                    report_outcome,
+                )
+                result = _coerce_json(raw)
+                if result.get("finished"):
+                    origin_id = await conn.fetchval(
+                        "SELECT origin_session_id FROM public.m5_tasks WHERE id=$1",
+                        task_uuid,
+                    )
+                    await self.record_task_changed_on_connection(conn, origin_id, task_uuid)
+                return result
 
     async def claim_work_round(self, work_execution_id: UUID | str) -> dict[str, Any] | None:
         work_id = _uuid(work_execution_id, "work_execution_id")

@@ -29,11 +29,13 @@ import { Badge } from "../components/ui/badge";
 import { Spinner } from "../components/ui/spinner";
 import { normalizeMessagePresentation } from "../../lib/message-presentation";
 import type { MessagePresentation } from "../../lib/message-presentation";
+import type { M5Task, M5TaskSnapshot } from "../../lib/m5-tasks";
 import { isImageAttachmentFile, normalizeUploadFile } from "./attachment-helpers";
 import { AttachmentCard, type AttachmentKind } from "./attachment-card";
 import { MessagePresentationView } from "./message-presentation";
 import { VoiceRecorder } from "./voice-recorder";
 import { TalkMode } from "./talk-mode";
+import { TaskList } from "./task-list";
 
 type ChatMessage = {
   id: string;
@@ -557,9 +559,47 @@ const promptAddendaOptions = [
 const SESSION_KEY = "hexis-chat-display-messages";
 const LEGACY_SESSION_KEY = "hexis-chat-messages";
 const SESSION_ID_KEY = "hexis-chat-session-id";
+const M5_TASK_NAVIGATION_KEY = "hexis-m5-task-navigation";
 const ACTIVITY_KEY = "hexis-chat-activity-events";
 const MAX_ACTIVITY_EVENTS = 60;
 const ACTIVITY_TTL_MS = 30 * 60 * 1000;
+
+type M5TaskNavigation = {
+  originSessionId: string;
+  taskId: string;
+  taskSessionId: string;
+  taskState: "working" | "idle";
+};
+
+function loadM5TaskNavigation(): M5TaskNavigation | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = sessionStorage.getItem(M5_TASK_NAVIGATION_KEY);
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Partial<M5TaskNavigation>;
+    if (
+      typeof value.originSessionId !== "string" ||
+      typeof value.taskId !== "string" ||
+      typeof value.taskSessionId !== "string" ||
+      (value.taskState !== "working" && value.taskState !== "idle")
+    ) {
+      return null;
+    }
+    return value as M5TaskNavigation;
+  } catch {
+    return null;
+  }
+}
+
+function saveM5TaskNavigation(value: M5TaskNavigation | null) {
+  if (typeof window === "undefined") return;
+  try {
+    if (value) sessionStorage.setItem(M5_TASK_NAVIGATION_KEY, JSON.stringify(value));
+    else sessionStorage.removeItem(M5_TASK_NAVIGATION_KEY);
+  } catch {
+    // Navigation identity is also held in page state for this session.
+  }
+}
 
 function loadSessionId(): string | null {
   if (typeof window === "undefined") return null;
@@ -986,12 +1026,16 @@ export default function ChatPage() {
   const [searchConfigError, setSearchConfigError] = useState<string | null>(null);
   const [searchConfigNotice, setSearchConfigNotice] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [taskNavigation, setTaskNavigation] = useState<M5TaskNavigation | null>(null);
+  const [taskSessionLoading, setTaskSessionLoading] = useState(false);
   const [sessionActionBusy, setSessionActionBusy] = useState<"new" | "clear" | null>(null);
   const [sessionNotice, setSessionNotice] = useState<string | null>(null);
   const [historyIndex, setHistoryIndex] = useState<number | null>(null);
   const [historyDraft, setHistoryDraft] = useState("");
   const [showInspector, setShowInspector] = useState(false);
   const [showInbox, setShowInbox] = useState(false);
+  const taskDrafts = useRef(new Map<string, string>());
+  const taskNavigationRequest = useRef(0);
   const [inbox, setInbox] = useState<InboxData>({
     unread: 0,
     messages: [],
@@ -1059,6 +1103,10 @@ export default function ChatPage() {
       const sessionId = loadSessionId();
       if (!sessionId) return;
       if (!cancelled) setSessionId(sessionId);
+      const savedTaskNavigation = loadM5TaskNavigation();
+      if (savedTaskNavigation?.taskSessionId === sessionId && !cancelled) {
+        setTaskNavigation(savedTaskNavigation);
+      }
       try {
         const response = await fetch(`/api/chat/session/${encodeURIComponent(sessionId)}`, {
           cache: "no-store",
@@ -1432,9 +1480,9 @@ export default function ChatPage() {
     }
   }, [messages]);
 
-  const appendLog = (event: LogEvent) => {
+  const appendLog = useCallback((event: LogEvent) => {
     setEvents((prev) => [...prev.slice(-(MAX_ACTIVITY_EVENTS - 1)), sanitizeActivityEvent(event)]);
-  };
+  }, []);
 
   const toggleActivityPane = (pane: ActivityPaneId) => {
     setExpandedActivityPanes((current) => {
@@ -1676,8 +1724,11 @@ export default function ChatPage() {
         throw new Error(payload?.error || `Failed with status ${res.status}`);
       }
       saveSessionId(payload.session_id);
+      saveM5TaskNavigation(null);
+      setTaskNavigation(null);
       setSessionId(payload.session_id);
       setMessages([]);
+      setInput(taskDrafts.current.get(payload.session_id) || "");
       setActiveConnectorSetup(null);
       setHistoryIndex(null);
       setHistoryDraft("");
@@ -1704,6 +1755,99 @@ export default function ChatPage() {
       setSessionActionBusy(null);
     }
   };
+
+  const switchTaskSession = useCallback(async (
+    nextSessionId: string,
+    nextNavigation: M5TaskNavigation | null
+  ) => {
+    if (sending || taskSessionLoading) return;
+    if (attachments.length > 0 || fileAttachments.length > 0) {
+      setSessionNotice("发送或移除当前会话的附件后，再切换任务会话。");
+      return;
+    }
+    if (sessionId) taskDrafts.current.set(sessionId, input);
+    const requestId = ++taskNavigationRequest.current;
+    setTaskSessionLoading(true);
+    setSessionNotice(null);
+    try {
+      let nextMessages: ChatMessage[] = nextSessionId === sessionId ? messages : [];
+      if (nextSessionId !== sessionId) {
+        const response = await fetch(
+          `/api/chat/session/${encodeURIComponent(nextSessionId)}`,
+          { cache: "no-store" }
+        );
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(payload?.error || `Failed to load task session (${response.status})`);
+        }
+        nextMessages = dbMessagesToChatMessages(payload?.messages) || [];
+      }
+      if (requestId !== taskNavigationRequest.current) return;
+      taskDrafts.current.set(nextSessionId, taskDrafts.current.get(nextSessionId) || "");
+      saveSessionId(nextSessionId);
+      saveM5TaskNavigation(nextNavigation);
+      setTaskNavigation(nextNavigation);
+      setSessionId(nextSessionId);
+      setMessages(nextMessages);
+      setInput(taskDrafts.current.get(nextSessionId) || "");
+      setActiveConnectorSetup(null);
+      setHistoryIndex(null);
+      setHistoryDraft("");
+      setSearchConfigNotice(null);
+      appendLog({
+        id: crypto.randomUUID(),
+        category: "memory",
+        title: "Task session",
+        detail: `Opened task session ${nextSessionId.slice(0, 8)}.`,
+        ts: Date.now(),
+      });
+    } catch (cause) {
+      if (requestId === taskNavigationRequest.current) {
+        setSessionNotice(cause instanceof Error ? cause.message : "无法打开任务会话。");
+      }
+    } finally {
+      if (requestId === taskNavigationRequest.current) setTaskSessionLoading(false);
+    }
+  }, [
+    appendLog,
+    attachments.length,
+    fileAttachments.length,
+    input,
+    messages,
+    sending,
+    sessionId,
+    taskSessionLoading,
+  ]);
+
+  const handleOpenTask = useCallback((task: M5Task) => {
+    const originSessionId = taskNavigation?.originSessionId || sessionId;
+    if (!originSessionId) {
+      setSessionNotice("先在来源会话中开始对话，再打开持续任务。");
+      return;
+    }
+    void switchTaskSession(task.task_session_id, {
+      originSessionId,
+      taskId: task.task_id,
+      taskSessionId: task.task_session_id,
+      taskState: task.task_state,
+    });
+  }, [sessionId, switchTaskSession, taskNavigation?.originSessionId]);
+
+  const handleReturnToOrigin = useCallback(() => {
+    if (!taskNavigation) return;
+    void switchTaskSession(taskNavigation.originSessionId, null);
+  }, [switchTaskSession, taskNavigation]);
+
+  const handleTaskSnapshot = useCallback((snapshot: M5TaskSnapshot) => {
+    if (!taskNavigation || taskNavigation.originSessionId !== snapshot.origin_session_id) return;
+    const task = snapshot.tasks.find(
+      (item) => item.task_session_id === taskNavigation.taskSessionId
+    );
+    if (!task || task.task_state === taskNavigation.taskState) return;
+    const next = { ...taskNavigation, taskState: task.task_state };
+    saveM5TaskNavigation(next);
+    setTaskNavigation(next);
+  }, [taskNavigation]);
 
   const handleClearChatContext = async () => {
     if (sending || sessionActionBusy) return;
@@ -1898,6 +2042,13 @@ export default function ChatPage() {
     const overrideText = messageOverride?.trim() || "";
     if ((!overrideText && !input.trim() && attachments.length === 0 && fileAttachments.length === 0) || sending) return null;
     if (!voiceOnly && attachmentsPreparing) return null;
+    if (
+      taskNavigation?.taskSessionId === sessionId &&
+      taskNavigation.taskState === "working"
+    ) {
+      setSessionNotice("后台任务仍在处理中；完成后可在任务列表中继续发送。");
+      return null;
+    }
 
     // Attached files were already preserved and read when they were attached;
     // sending is what commits them to memory and hands their text to the turn.
@@ -2792,11 +2943,15 @@ export default function ChatPage() {
               </button>
               <VoiceRecorder disabled={sending || attachmentsPreparing} onTranscript={handleVoiceTranscript} />
               <TalkMode
-                disabled={sending || attachmentsPreparing || Boolean(input.trim()) || attachments.length > 0 || fileAttachments.length > 0}
+                disabled={sending || taskSessionLoading || (taskNavigation?.taskSessionId === sessionId && taskNavigation.taskState === "working") || attachmentsPreparing || Boolean(input.trim()) || attachments.length > 0 || fileAttachments.length > 0}
                 sessionId={sessionId}
                 onSessionId={(nextSessionId) => {
                   saveSessionId(nextSessionId);
                   setSessionId(nextSessionId);
+                  if (taskNavigation?.taskSessionId !== nextSessionId) {
+                    saveM5TaskNavigation(null);
+                    setTaskNavigation(null);
+                  }
                 }}
               />
               <textarea
@@ -2810,7 +2965,14 @@ export default function ChatPage() {
                 onPaste={handlePaste}
                 rows={1}
               />
-              <button type="button" aria-label="Send message" title={attachmentsPreparing ? "Reading the attached file..." : "Send"} onClick={() => { void handleSend(); }} disabled={sending || attachmentsPreparing || (!input.trim() && attachments.length === 0 && fileAttachments.length === 0)} className="flex h-10 w-10 flex-none items-center justify-center rounded-md bg-[var(--foreground)] text-white hover:bg-[var(--teal)] disabled:opacity-35">
+              <TaskList
+                originSessionId={taskNavigation?.originSessionId || sessionId}
+                currentTaskSessionId={taskNavigation?.taskSessionId === sessionId ? taskNavigation.taskSessionId : null}
+                onOpenTask={handleOpenTask}
+                onReturnToOrigin={handleReturnToOrigin}
+                onSnapshot={handleTaskSnapshot}
+              />
+              <button type="button" aria-label="Send message" title={attachmentsPreparing ? "Reading the attached file..." : "Send"} onClick={() => { void handleSend(); }} disabled={sending || taskSessionLoading || (taskNavigation?.taskSessionId === sessionId && taskNavigation.taskState === "working") || attachmentsPreparing || (!input.trim() && attachments.length === 0 && fileAttachments.length === 0)} className="flex h-10 w-10 flex-none items-center justify-center rounded-md bg-[var(--foreground)] text-white hover:bg-[var(--teal)] disabled:opacity-35">
                 <Send size={17} />
               </button>
             </div>

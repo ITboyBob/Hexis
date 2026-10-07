@@ -46,6 +46,10 @@ class M5ReportReceiver:
         async with self._pool.acquire() as conn:
             try:
                 async with conn.transaction():
+                    report_before = await conn.fetchrow(
+                        "SELECT task_id,origin_session_id,outcome FROM public.m5_reports WHERE report_id=$1 FOR UPDATE",
+                        report_uuid,
+                    )
                     raw = await conn.fetchval(
                         "SELECT public.deliver_m5_report($1,$2,$3,$4)",
                         report_uuid,
@@ -53,6 +57,24 @@ class M5ReportReceiver:
                         summary,
                         actual_call_id,
                     )
+                    saved = json.loads(raw) if isinstance(raw, str) else raw
+                    round_result = saved.get("round") if isinstance(saved, dict) else None
+                    if (
+                        report_before is not None
+                        and report_before["outcome"] == "pending"
+                        and isinstance(saved, dict)
+                        and saved.get("outcome") == "delivered"
+                        and isinstance(round_result, dict)
+                        and round_result.get("finished") is True
+                    ):
+                        from services.m5_task_service import M5TaskService
+
+                        await M5TaskService(self._pool).record_task_changed_on_connection(
+                            conn,
+                            origin_uuid,
+                            report_before["task_id"],
+                            authorization={"actual_call_id": actual_call_id},
+                        )
             except Exception as exc:
                 message = str(exc).lower()
                 if "origin does not match" in message or "task binding" in message:

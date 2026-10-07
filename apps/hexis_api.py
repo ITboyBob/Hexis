@@ -2035,6 +2035,139 @@ async def event_stream():
     )
 
 
+@app.get("/api/m5/tasks")
+async def get_m5_tasks(origin_session_id: uuid.UUID):
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    from services.m5_task_service import M5TaskService
+
+    try:
+        snapshot = await M5TaskService(pool).list_tasks_for_origin(origin_session_id)
+    except Exception:
+        logger.exception("Could not read M5 tasks for origin=%s", origin_session_id)
+        return JSONResponse({"error": "Task state is temporarily unavailable."}, status_code=503)
+    if snapshot is None:
+        return JSONResponse({"error": "The source chat is unavailable."}, status_code=404)
+    return JSONResponse(snapshot)
+
+
+@app.get("/api/m5/tasks/events")
+async def m5_task_events(request: Request, origin_session_id: uuid.UUID):
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    from services.m5_task_service import task_event_stream_id
+
+    async with pool.acquire() as conn:
+        source_active = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM public.chat_sessions WHERE id=$1 AND status='active')",
+            origin_session_id,
+        )
+    if not source_active:
+        return JSONResponse({"error": "The source chat is unavailable."}, status_code=404)
+
+    requested_cursor = request.headers.get("last-event-id")
+    if requested_cursor is None:
+        requested_cursor = request.query_params.get("after_seq")
+    try:
+        after_seq = int(requested_cursor or "0")
+        if after_seq < 0:
+            raise ValueError("after_seq must be non-negative")
+    except ValueError:
+        return JSONResponse({"error": "after_seq must be a non-negative integer."}, status_code=400)
+
+    return StreamingResponse(
+        _stream_m5_task_events(pool, origin_session_id, after_seq),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _stream_m5_task_events(
+    pool: asyncpg.Pool, origin_session_id: uuid.UUID, after_seq: int
+) -> AsyncIterator[str]:
+    """Replay one origin's durable M5 stream; notifications only wake the reader."""
+    from services.behavior_events import query_behavior_events_on_connection
+    from services.m5_task_service import task_event_stream_id
+
+    import asyncio
+
+    stream_id = task_event_stream_id(origin_session_id)
+    queue: asyncio.Queue[str] = asyncio.Queue()
+
+    def _on_notify(_conn, _pid, _channel, payload):
+        if payload == str(origin_session_id):
+            queue.put_nowait(payload)
+
+    conn = await pool.acquire()
+    try:
+        await conn.add_listener("m5_task_events", _on_notify)
+        yield _sse_event("m5-connected", {"origin_session_id": str(origin_session_id)})
+        cursor = after_seq
+        maximum = int(
+            await conn.fetchval(
+                "SELECT COALESCE(MAX(seq),0) FROM public.behavior_events WHERE stream_id=$1 AND session_id=$2",
+                stream_id,
+                origin_session_id,
+            )
+            or 0
+        )
+        if cursor > maximum:
+            yield _sse_event(
+                "m5-reset",
+                {"reason": "cursor_ahead", "origin_session_id": str(origin_session_id)},
+            )
+            return
+
+        while True:
+            page = await query_behavior_events_on_connection(
+                conn,
+                session_id=origin_session_id,
+                stream_id=stream_id,
+                limit=1000,
+                cursor={stream_id: cursor},
+            )
+            for event in page["events"]:
+                seq = int(event["seq"])
+                if seq != cursor + 1:
+                    yield _sse_event(
+                        "m5-reset",
+                        {
+                            "reason": "sequence_gap",
+                            "origin_session_id": str(origin_session_id),
+                            "after_seq": cursor,
+                            "before_seq": seq,
+                        },
+                    )
+                    return
+                yield (
+                    f"id: {seq}\nevent: m5-event\ndata: "
+                    f"{json.dumps(event, ensure_ascii=False, default=str)}\n\n"
+                )
+                cursor = seq
+            if page["has_more"]:
+                continue
+            try:
+                await asyncio.wait_for(queue.get(), timeout=15.0)
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("M5 task event stream failed origin=%s", origin_session_id)
+        yield _sse_event(
+            "error",
+            {"message": "Task updates are temporarily unavailable."},
+        )
+    finally:
+        try:
+            await conn.remove_listener("m5_task_events", _on_notify)
+        except Exception:
+            logger.debug("Could not remove M5 task event listener", exc_info=True)
+        await pool.release(conn)
+
+
 @app.post("/api/heartbeat/run")
 async def run_heartbeat_now():
     """Run an explicit heartbeat and stream its complete observable lifecycle."""

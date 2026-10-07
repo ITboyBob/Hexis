@@ -177,17 +177,45 @@ class M5ReportRunner:
         actual_call_id: str | None = None,
     ) -> dict[str, Any]:
         async with self._pool.acquire() as conn:
-            raw = await conn.fetchval(
-                "SELECT public.finish_m5_report_terminal($1,$2,$3,$4,$5)",
-                UUID(str(report_id)),
-                outcome,
-                code,
-                message,
-                actual_call_id,
-            )
-        result = json.loads(raw) if isinstance(raw, str) else raw
+            async with conn.transaction():
+                report_before = await conn.fetchrow(
+                    "SELECT task_id,origin_session_id,outcome FROM public.m5_reports WHERE report_id=$1 FOR UPDATE",
+                    UUID(str(report_id)),
+                )
+                raw = await conn.fetchval(
+                    "SELECT public.finish_m5_report_terminal($1,$2,$3,$4,$5)",
+                    UUID(str(report_id)),
+                    outcome,
+                    code,
+                    message,
+                    actual_call_id,
+                )
+                result = json.loads(raw) if isinstance(raw, str) else raw
+                await self._record_closed_report_task_event(conn, report_before, result)
         self._wake_next_work(result)
         return result
+
+    async def _record_closed_report_task_event(
+        self, conn: Any, report_before: Mapping[str, Any] | None, result: Any
+    ) -> None:
+        round_result = result.get("round") if isinstance(result, dict) else None
+        if (
+            report_before is None
+            or report_before["outcome"] != "pending"
+            or not isinstance(result, dict)
+            or result.get("outcome") not in {"exhausted", "refused"}
+            or not isinstance(round_result, dict)
+            or round_result.get("finished") is not True
+        ):
+            return
+        from services.m5_task_service import M5TaskService
+
+        await M5TaskService(self._pool).record_task_changed_on_connection(
+            conn,
+            report_before["origin_session_id"],
+            report_before["task_id"],
+            authorization=None,
+        )
 
     def _wake_next_work(self, result: Mapping[str, Any]) -> None:
         round_result = result.get("round")
@@ -227,15 +255,21 @@ class M5ReportRunner:
         rejected_signature: str | None = None,
     ) -> dict[str, Any]:
         async with self._pool.acquire() as conn:
-            raw = await conn.fetchval(
-                "SELECT public.record_m5_report_failure($1,$2,$3,$4,$5)",
-                report_id,
-                code,
-                message,
-                actual_call_id,
-                rejected_signature,
-            )
-        result = json.loads(raw) if isinstance(raw, str) else raw
+            async with conn.transaction():
+                report_before = await conn.fetchrow(
+                    "SELECT task_id,origin_session_id,outcome FROM public.m5_reports WHERE report_id=$1 FOR UPDATE",
+                    report_id,
+                )
+                raw = await conn.fetchval(
+                    "SELECT public.record_m5_report_failure($1,$2,$3,$4,$5)",
+                    report_id,
+                    code,
+                    message,
+                    actual_call_id,
+                    rejected_signature,
+                )
+                result = json.loads(raw) if isinstance(raw, str) else raw
+                await self._record_closed_report_task_event(conn, report_before, result)
         self._wake_next_work(result)
         return result
 

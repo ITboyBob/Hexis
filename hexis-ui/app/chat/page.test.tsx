@@ -22,6 +22,7 @@ describe("chat attachment helpers", () => {
 
     expect(uploadFileName(file, "pasted-image-1")).toBe("diagram.webp");
   });
+
 });
 
 describe("ChatPage attachments", () => {
@@ -1140,5 +1141,85 @@ describe("ChatPage outbox replies", () => {
         )
       ).toBeInTheDocument();
     });
+  });
+
+  it("opens and returns from the fixed task session without mixing conversation history", async () => {
+    const origin = "11111111-1111-4111-8111-111111111111";
+    const taskSession = "22222222-2222-4222-8222-222222222222";
+    const taskId = "33333333-3333-4333-8333-333333333333";
+    const taskSessionLoads: string[] = [];
+    sessionStorage.setItem("hexis-chat-session-id", origin);
+    class FakeEventSource {
+      static lastUrl = "";
+      onopen: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor(url: string) {
+        FakeEventSource.lastUrl = url;
+        queueMicrotask(() => this.onopen?.());
+      }
+      addEventListener() {}
+      close() {}
+    }
+    vi.stubGlobal("EventSource", FakeEventSource);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/api/status")) {
+          return Response.json({ configured: true, agent_name: "Samantha" });
+        }
+        if (url.endsWith("/api/outbox")) {
+          return Response.json({ unread: 0, messages: [], pending_requests: [] });
+        }
+        if (url.startsWith("/api/m5/tasks?")) {
+          return Response.json({
+            origin_session_id: origin,
+            event_cursor: { "m5-tasks": 0 },
+            tasks: [
+              {
+                task_id: taskId,
+                task_title: "S9专项任务",
+                task_state: "idle",
+                task_session_id: taskSession,
+                revision: 2,
+                pending: [],
+              },
+            ],
+          });
+        }
+        if (url === `/api/chat/session/${origin}`) {
+          return Response.json({
+            messages: [{ role: "assistant", content: "来源会话历史", message_id: "origin-message" }],
+          });
+        }
+        if (url === `/api/chat/session/${taskSession}`) {
+          taskSessionLoads.push(url);
+          return Response.json({
+            messages: [{ role: "assistant", content: "任务专属正文", message_id: "task-message" }],
+          });
+        }
+        return Response.json({});
+      }) as unknown as typeof fetch
+    );
+
+    render(<ChatPage />);
+    await screen.findByText("来源会话历史");
+    fireEvent.click(screen.getByRole("button", { name: "任务列表" }));
+    fireEvent.click(await screen.findByRole("button", { name: /进入任务：S9专项任务/ }));
+
+    expect(await screen.findByText("任务专属正文")).toBeInTheDocument();
+    expect(screen.queryByText("来源会话历史")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "任务列表" }));
+    fireEvent.click(screen.getByRole("button", { name: "返回来源会话" }));
+    expect(await screen.findByText("来源会话历史")).toBeInTheDocument();
+    expect(screen.queryByText("任务专属正文")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "任务列表" }));
+    fireEvent.click(await screen.findByRole("button", { name: /进入任务：S9专项任务/ }));
+    expect(await screen.findByText("任务专属正文")).toBeInTheDocument();
+    expect(taskSessionLoads).toEqual([
+      `/api/chat/session/${taskSession}`,
+      `/api/chat/session/${taskSession}`,
+    ]);
   });
 });

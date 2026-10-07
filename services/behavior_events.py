@@ -121,38 +121,47 @@ async def record_behavior_event(pool: Any, event: BehaviorEvent) -> dict[str, An
     """Record one producer-owned event; exact retries deduplicate in Postgres."""
     if pool is None:
         raise ValueError("a database pool is required to record behavior events")
-    _validate(event)
     async with pool.acquire() as conn:
-        raw = await conn.fetchval(
-            """
-            SELECT record_behavior_event(
-                $1::uuid, $2::int, $3, $4, $5::uuid,
-                $6, $7::int, $8, $9, $10, $11::int,
-                $12::uuid, $13, $14, $15::timestamptz,
-                $16, $17, $18::bigint, $19, $20::jsonb
-            )
-            """,
-            event.event_id,
-            event.schema_version,
-            event.event_type,
-            event.stream_id,
-            event.session_id,
-            event.request_id,
-            event.stimulus_revision,
-            event.input_turn_id,
-            event.response_id,
-            event.media_session_id,
-            event.output_epoch,
-            event.turn_id,
-            event.task_id,
-            event.call_id,
-            event.ts,
-            event.source,
-            event.producer_id,
-            event.producer_seq,
-            event.channel,
-            json.dumps(event.payload, default=str),
+        return await record_behavior_event_on_connection(conn, event)
+
+
+async def record_behavior_event_on_connection(
+    conn: Any, event: BehaviorEvent
+) -> dict[str, Any]:
+    """Write through a caller-owned connection, preserving its transaction."""
+    if conn is None:
+        raise ValueError("a database connection is required to record behavior events")
+    _validate(event)
+    raw = await conn.fetchval(
+        """
+        SELECT record_behavior_event(
+            $1::uuid, $2::int, $3, $4, $5::uuid,
+            $6, $7::int, $8, $9, $10, $11::int,
+            $12::uuid, $13, $14, $15::timestamptz,
+            $16, $17, $18::bigint, $19, $20::jsonb
         )
+        """,
+        event.event_id,
+        event.schema_version,
+        event.event_type,
+        event.stream_id,
+        event.session_id,
+        event.request_id,
+        event.stimulus_revision,
+        event.input_turn_id,
+        event.response_id,
+        event.media_session_id,
+        event.output_epoch,
+        event.turn_id,
+        event.task_id,
+        event.call_id,
+        event.ts,
+        event.source,
+        event.producer_id,
+        event.producer_seq,
+        event.channel,
+        json.dumps(event.payload, default=str),
+    )
     result = _json(raw)
     if not isinstance(result, dict):
         raise RuntimeError("the database did not return a behavior event receipt")
@@ -177,31 +186,65 @@ async def query_behavior_events(
     """Query persisted envelopes newest-first for diagnostics and projections."""
     if pool is None:
         raise ValueError("a database pool is required to query behavior events")
+    async with pool.acquire() as conn:
+        return await query_behavior_events_on_connection(
+            conn,
+            session_id=session_id,
+            stream_id=stream_id,
+            event_type=event_type,
+            turn_id=turn_id,
+            request_id=request_id,
+            response_id=response_id,
+            task_id=task_id,
+            call_id=call_id,
+            limit=limit,
+            offset=offset,
+            cursor=cursor,
+        )
+
+
+async def query_behavior_events_on_connection(
+    conn: Any,
+    *,
+    session_id: UUID | None = None,
+    stream_id: str | None = None,
+    event_type: str | None = None,
+    turn_id: UUID | None = None,
+    request_id: str | None = None,
+    response_id: str | None = None,
+    task_id: str | None = None,
+    call_id: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    cursor: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Query behavior events through a caller-owned connection."""
+    if conn is None:
+        raise ValueError("a database connection is required to query behavior events")
     if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
         raise ValueError("limit must be a positive integer")
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         raise ValueError("offset must be a non-negative integer")
     normalized_cursor = _cursor(cursor)
-    async with pool.acquire() as conn:
-        raw = await conn.fetchval(
-            """
-            SELECT get_behavior_events(
-                $1::uuid, $2, $3, $4::uuid, $5, $6, $7, $8,
-                $9::int, $10::int, $11::jsonb
-            )
-            """,
-            session_id,
-            stream_id,
-            event_type,
-            turn_id,
-            request_id,
-            response_id,
-            task_id,
-            call_id,
-            limit,
-            offset,
-            json.dumps(normalized_cursor) if normalized_cursor is not None else None,
+    raw = await conn.fetchval(
+        """
+        SELECT get_behavior_events(
+            $1::uuid, $2, $3, $4::uuid, $5, $6, $7, $8,
+            $9::int, $10::int, $11::jsonb
         )
+        """,
+        session_id,
+        stream_id,
+        event_type,
+        turn_id,
+        request_id,
+        response_id,
+        task_id,
+        call_id,
+        limit,
+        offset,
+        json.dumps(normalized_cursor) if normalized_cursor is not None else None,
+    )
     result = _json(raw)
     if not isinstance(result, dict):
         raise RuntimeError("the database did not return a behavior event page")
@@ -242,5 +285,7 @@ __all__ = [
     "BehaviorEvent",
     "query_behavior_events",
     "record_behavior_event",
+    "record_behavior_event_on_connection",
+    "query_behavior_events_on_connection",
     "replay_behavior_events",
 ]
