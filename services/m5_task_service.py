@@ -256,6 +256,15 @@ class M5TaskService:
                             "message": message["message"],
                         }
                     )
+                open_selections = await conn.fetch(
+                    """
+                    SELECT selection_id, version, message
+                    FROM public.m5_selections
+                    WHERE origin_session_id=$1 AND state='open'
+                    ORDER BY created_at, selection_id
+                    """,
+                    origin_id,
+                )
                 cursor = await conn.fetchval(
                     "SELECT COALESCE(MAX(seq),0) FROM public.behavior_events WHERE stream_id=$1 AND session_id=$2",
                     stream_id,
@@ -264,6 +273,14 @@ class M5TaskService:
         return {
             "origin_session_id": str(origin_id),
             "event_cursor": {"m5-tasks": int(cursor)},
+            "selections": [
+                {
+                    "selection_id": str(selection["selection_id"]),
+                    "version": int(selection["version"]),
+                    "message": selection["message"],
+                }
+                for selection in open_selections
+            ],
             "tasks": [
                 {
                     "task_id": str(task["id"]),

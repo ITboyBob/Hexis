@@ -42,6 +42,63 @@ def lightweight_memory_handlers(executor: Any | None) -> dict[str, ToolHandler]:
     return {name: submit for name in ("remember", "add_evidence")}
 
 
+def pend_message_handler(
+    pool: Any,
+    on_selection_opened: Callable[[dict[str, Any]], Awaitable[None]],
+    *,
+    await_or_closed: Callable[[Awaitable[Any]], Awaitable[Any]] | None = None,
+) -> ToolHandler:
+    """Keep internal selection facts out of the model's v1.0 receipt."""
+    from services.m5_selection_service import M5SelectionService
+
+    async def handle(call: BoundToolCall, arguments: dict[str, Any]) -> dict[str, Any]:
+        service = M5SelectionService(pool)
+        authorization = {
+            "origin_session_id": str(call.origin_session_id),
+            "input_turn_id": call.input_turn_id,
+            "input_order": call.input_order,
+            "stimulus_revision": call.stimulus_revision,
+            "response_id": call.response_id,
+            "supplier_response_id": call.supplier_response_id,
+            "request_id": call.request_id,
+            "actual_call_id": call.actual_call_id,
+        }
+        result = await service.begin_pend_message(
+            origin_session_id=call.origin_session_id,
+            command_id=call.command_id,
+            authorization=authorization,
+            message=arguments["message"],
+        )
+        if result.get("accepted") and result.get("state") == "open":
+            await on_selection_opened(result)
+            waiter = service.wait_for_resolution(
+                selection_id=result["selection_id"],
+                origin_session_id=call.origin_session_id,
+            )
+            result = await await_or_closed(waiter) if await_or_closed else await waiter
+        if result.get("accepted") and result.get("state") == "confirmed":
+            saved = result.get("result") or {}
+            if saved.get("accepted"):
+                return {
+                    "ok": True, "state": "pending", "operation_id": str(call.command_id),
+                    "data": {key: saved[key] for key in ("task_id", "task_title", "task_state", "message_id") if key in saved},
+                    "error": None,
+                }
+        if result.get("accepted") and result.get("state") == "cancelled":
+            return {"ok": True, "state": "selection_cancelled", "operation_id": str(call.command_id), "data": {}, "error": None}
+        failure = result.get("error") or {}
+        return {
+            "ok": False, "state": "failed", "operation_id": str(call.command_id), "data": {},
+            "error": {
+                "code": failure.get("code", "SELECTION_EXPIRED"),
+                "message": failure.get("message", "The task selection is no longer available."),
+                "retryable": bool(failure.get("retryable", False)),
+            },
+        }
+
+    return handle
+
+
 def bind_tool_event(
     session: Any,
     pending: dict[str, BoundToolCall],

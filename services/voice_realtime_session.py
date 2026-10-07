@@ -184,20 +184,22 @@ class VoiceRealtimeSession:
         return await self._await_or_closed(self._committed_events.get())
 
     async def _await_or_closed(self, awaitable: Any) -> Any:
-        if self._closed_event.is_set():
-            raise VoiceRealtimeSessionError("realtime session is closed")
         result_task = asyncio.ensure_future(awaitable)
         closed_task = asyncio.create_task(self._closed_event.wait())
-        done, _pending = await asyncio.wait(
-            (result_task, closed_task), return_when=asyncio.FIRST_COMPLETED
-        )
-        if result_task in done:
-            closed_task.cancel()
-            await asyncio.gather(closed_task, return_exceptions=True)
-            return result_task.result()
-        result_task.cancel()
-        await asyncio.gather(result_task, return_exceptions=True)
-        raise VoiceRealtimeSessionError("realtime session is closed")
+        try:
+            if self._closed_event.is_set():
+                raise VoiceRealtimeSessionError("realtime session is closed")
+            done, _pending = await asyncio.wait(
+                (result_task, closed_task), return_when=asyncio.FIRST_COMPLETED
+            )
+            if result_task in done:
+                return result_task.result()
+            raise VoiceRealtimeSessionError("realtime session is closed")
+        finally:
+            for task in (result_task, closed_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(result_task, closed_task, return_exceptions=True)
 
     def response_instructions(self, input_turn_id: str) -> tuple[str, dict[str, Any]]:
         """Freeze the authorized input's hydrated context and eligible C label."""
@@ -336,10 +338,12 @@ class VoiceRealtimeSession:
         elif not generated["final"]:
             generated["text"] += text
 
-    async def mark_generation_done(self, input_turn_id: str, response_id: str) -> None:
+    async def mark_generation_done(
+        self, input_turn_id: str, response_id: str, *, final_for_turn: bool = True
+    ) -> None:
         turn = self._voice_turns.get(input_turn_id)
         if turn is not None:
-            turn["generation_done"] = True
+            turn["generation_done"] = final_for_turn
             if response_id not in turn["response_ids"]:
                 turn["response_ids"].append(response_id)
         state = self._playback_state.get(response_id)
@@ -375,10 +379,21 @@ class VoiceRealtimeSession:
         if turn is None:
             return None
         final_response_id = turn["response_ids"][-1] if turn["response_ids"] else ""
+        playback_scope = turn["terminal_receipts"].get(final_response_id, {}).get("scope", "unknown")
+        played_texts = [
+            {**turn["terminal_receipts"][response_id], "response_id": response_id, "text": text}
+            for response_id in turn["response_ids"]
+            if turn["terminal_receipts"].get(response_id, {}).get("scope") == "complete"
+            and (text := turn["generated_text"].get(response_id, {}).get("text", "").strip())
+        ]
+        assistant_text = turn["generated_text"].get(final_response_id, {}).get("text", "")
+        if playback_scope == "complete":
+            assistant_text = "\n".join(item["text"] for item in played_texts)
         return {
             **turn,
-            "assistant_text": turn["generated_text"].get(final_response_id, {}).get("text", ""),
-            "playback_scope": turn["terminal_receipts"].get(final_response_id, {}).get("scope", "unknown"),
+            "assistant_text": assistant_text,
+            "playback_scope": playback_scope,
+            "played_response_texts": played_texts,
         }
 
     async def claim_voice_turn_completion(
@@ -395,10 +410,11 @@ class VoiceRealtimeSession:
             if terminal is None:
                 return None
             turn["completion_inflight"] = True
+            snapshot = self.voice_turn_snapshot(input_turn_id)
+            assert snapshot is not None
             return {
-                **turn,
+                **snapshot,
                 "input_turn_id": input_turn_id,
-                "assistant_text": turn["generated_text"].get(final_response_id, {}).get("text", ""),
                 "final_response_id": final_response_id,
                 "playback_scope": terminal["scope"],
                 "terminal": terminal,
@@ -570,7 +586,7 @@ class VoiceRealtimeSession:
                 raise VoiceRealtimeSessionError("voice tool follow-up has no authorized call")
             self.validate_voice_tool_call(bound)
         async with self._instruction_turn_lock:
-            await self._responses_idle.wait()
+            await self._await_or_closed(self._responses_idle.wait())
             instructions, facts = self.response_instructions(input_turn_id)
             for call_id, tool_output in outputs:
                 self.validate_voice_tool_call(self._bound_voice_calls[call_id])

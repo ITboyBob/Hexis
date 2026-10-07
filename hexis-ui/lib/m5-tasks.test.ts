@@ -11,6 +11,7 @@ import {
 const snapshot: M5TaskSnapshot = {
   origin_session_id: "11111111-1111-4111-8111-111111111111",
   event_cursor: { "m5-tasks": 4 },
+  selections: [],
   tasks: [
     {
       task_id: "22222222-2222-4222-8222-222222222222",
@@ -102,6 +103,50 @@ describe("M5 task event projection", () => {
     expect(result.snapshot).toBe(snapshot);
   });
 
+  it("opens and closes a selection on the same source stream without a task id", () => {
+    const opened = mergeM5TaskEvent(
+      snapshot,
+      event({
+        event_type: "m5_selection_opened",
+        seq: 5,
+        task_id: null,
+        payload: {
+          origin_session_id: snapshot.origin_session_id,
+          selection_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          version: 1,
+          state: "open",
+          message: "Continue with the next question.",
+        },
+      })
+    );
+    const closed = mergeM5TaskEvent(
+      opened.snapshot,
+      event({
+        event_type: "m5_selection_closed",
+        seq: 6,
+        task_id: null,
+        payload: {
+          origin_session_id: snapshot.origin_session_id,
+          selection_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          version: 2,
+          state: "cancelled",
+        },
+      })
+    );
+
+    expect(opened.status).toBe("applied");
+    expect(opened.snapshot.selections).toEqual([
+      {
+        selection_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        version: 1,
+        message: "Continue with the next question.",
+      },
+    ]);
+    expect(closed.status).toBe("advanced");
+    expect(closed.snapshot.selections).toEqual([]);
+    expect(closed.snapshot.event_cursor["m5-tasks"]).toBe(6);
+  });
+
   it("advances through selection events without changing the task projection", () => {
     const selection = event({
       event_type: "m5_selection_opened",
@@ -109,14 +154,21 @@ describe("M5 task event projection", () => {
       payload: {
         origin_session_id: snapshot.origin_session_id,
         selection_id: "55555555-5555-4555-8555-555555555555",
-        selection_version: 1,
+        version: 1,
+        state: "open",
+        message: "Continue with this task.",
       },
     });
     const result = mergeM5TaskEvent(snapshot, selection);
 
-    expect(result.status).toBe("advanced");
+    expect(result.status).toBe("applied");
     expect(result.snapshot.event_cursor["m5-tasks"]).toBe(5);
     expect(result.snapshot.tasks).toEqual(snapshot.tasks);
+    expect(result.snapshot.selections).toContainEqual({
+      selection_id: "55555555-5555-4555-8555-555555555555",
+      version: 1,
+      message: "Continue with this task.",
+    });
   });
 });
 
@@ -208,5 +260,20 @@ describe("M5 task subscription lifecycle", () => {
     expect(sources[1].url).toContain("after_seq=7");
     unmount();
     expect(sources[1].closed).toBe(true);
+  });
+
+  it("keeps a selection listener without starting list fallback polling", async () => {
+    vi.useFakeTimers();
+    const { unmount } = renderHook(() => useM5Tasks(origin, true, false));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(sources).toHaveLength(1);
+    act(() => sources[0].dispatchError());
+    await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    unmount();
+    expect(sources[0].closed).toBe(true);
   });
 });

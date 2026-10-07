@@ -16,6 +16,7 @@ export type VoiceRealtimeState =
 type Options = {
   onMessage?: (message: RealtimeServerMessage) => void;
   onStateChange?: (state: VoiceRealtimeState) => void;
+  toolSurface?: "m4" | "m5";
 };
 
 export class VoiceRealtimeClient {
@@ -28,6 +29,16 @@ export class VoiceRealtimeClient {
   private mediaSessionId: string | null = null;
   private playbackEndpoint: string | null = null;
   private producerSequence = 0;
+  private pendingCaptureControls = new Map<
+    string,
+    {
+      type: "capture_suspend" | "capture_resume";
+      captureInstanceId: string;
+      resolve: () => void;
+      reject: (error: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
 
   constructor(private readonly options: Options = {}) {}
 
@@ -78,7 +89,10 @@ export class VoiceRealtimeClient {
       const response = await fetch("/api/voice/realtime/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: effectiveSessionId }),
+        body: JSON.stringify({
+          session_id: effectiveSessionId,
+          tool_surface: this.options.toolSurface ?? "m4",
+        }),
       });
       const payload = (await response.json().catch(() => ({}))) as
         | RealtimeSessionResponse
@@ -113,7 +127,26 @@ export class VoiceRealtimeClient {
       socket.onmessage = (event) => {
         if (generation !== this.generation) return;
         try {
-          this.options.onMessage?.(JSON.parse(String(event.data)));
+          const message = JSON.parse(String(event.data)) as RealtimeServerMessage;
+          if (message.type === "capture_suspended" || message.type === "capture_resumed") {
+            const pending = this.pendingCaptureControls.get(message.control_id);
+            if (pending) {
+              clearTimeout(pending.timer);
+              this.pendingCaptureControls.delete(message.control_id);
+              const expectedType = pending.type === "capture_suspend"
+                ? "capture_suspended"
+                : "capture_resumed";
+              if (
+                message.type !== expectedType ||
+                message.capture_instance_id !== pending.captureInstanceId ||
+                message.media_session_id !== this.mediaSessionId
+              ) {
+                pending.reject(new Error("The voice service acknowledged a different capture identity."));
+              } else pending.resolve();
+            }
+            return;
+          }
+          this.options.onMessage?.(message);
         } catch {
           this.fail("The voice service sent an invalid message.");
         }
@@ -138,6 +171,7 @@ export class VoiceRealtimeClient {
 
   close(): Promise<void> {
     this.generation += 1;
+    this.rejectPendingCaptureControls(new Error("Talk closed before capture control completed."));
     const socket = this.socket;
     this.socket = null;
     this.stopStream();
@@ -198,6 +232,57 @@ export class VoiceRealtimeClient {
       action,
       reason,
     });
+  }
+
+  suspendCapture(captureInstanceId: string): Promise<void> {
+    return this.sendCaptureControl("capture_suspend", captureInstanceId);
+  }
+
+  resumeCapture(captureInstanceId: string): Promise<void> {
+    return this.sendCaptureControl("capture_resume", captureInstanceId);
+  }
+
+  private sendCaptureControl(
+    type: "capture_suspend" | "capture_resume",
+    captureInstanceId: string
+  ): Promise<void> {
+    const controlId = crypto.randomUUID();
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingCaptureControls.delete(controlId);
+        reject(new Error(`The voice service did not acknowledge ${type}.`));
+      }, 5_000);
+      this.pendingCaptureControls.set(controlId, {
+        type,
+        captureInstanceId,
+        resolve,
+        reject,
+        timer,
+      });
+      try {
+        this.send({
+          schema_version: 1,
+          type,
+          session_id: "",
+          media_session_id: "",
+          producer_seq: 0,
+          capture_instance_id: captureInstanceId,
+          control_id: controlId,
+        });
+      } catch (error: unknown) {
+        clearTimeout(timer);
+        this.pendingCaptureControls.delete(controlId);
+        reject(error instanceof Error ? error : new Error("Talk capture control failed."));
+      }
+    });
+  }
+
+  private rejectPendingCaptureControls(error: Error): void {
+    for (const [controlId, pending] of this.pendingCaptureControls) {
+      clearTimeout(pending.timer);
+      this.pendingCaptureControls.delete(controlId);
+      pending.reject(error);
+    }
   }
 
   get mediaStream(): MediaStream | null {
@@ -287,6 +372,7 @@ export class VoiceRealtimeClient {
 
   private fail(message: string) {
     this.generation += 1;
+    this.rejectPendingCaptureControls(new Error(message));
     this.socket?.close();
     this.socket = null;
     this.stopStream();

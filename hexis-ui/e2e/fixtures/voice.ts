@@ -24,9 +24,16 @@ export async function installVoiceWavFeed(
     let audioContext: AudioContext | null = null;
     let destination: MediaStreamAudioDestinationNode | null = null;
     const target = window as Window & {
-      __voiceWavFeed?: { play: (name: string) => Promise<void> };
+      __voiceWavFeed?: {
+        play: (name: string) => Promise<void>;
+        trackState: () => { id: string; enabled: boolean; readyState: string } | null;
+      };
     };
     target.__voiceWavFeed = {
+      trackState() {
+        const track = destination?.stream.getAudioTracks()[0];
+        return track ? { id: track.id, enabled: track.enabled, readyState: track.readyState } : null;
+      },
       async play(name: string): Promise<void> {
         if (!audioContext || !destination) throw new Error("Talk microphone stream is not ready");
         const encoded = encodedWavs[name];
@@ -94,6 +101,24 @@ function waitForHttp(url: string, timeoutMs = 60_000): Promise<void> {
     };
     attempt();
   });
+}
+
+export async function prewarmVoiceUI(uiUrl: string): Promise<void> {
+  const origin = new URL(uiUrl);
+  if (origin.protocol !== "http:" || origin.hostname !== "127.0.0.1") {
+    throw new Error("Voice UI prewarm requires an explicitly selected local URL.");
+  }
+  const nil = "00000000-0000-4000-8000-000000000000";
+  for (const path of [
+    "/api/status", "/api/outbox", "/api/pwa/presence", "/api/chat/session",
+    "/api/voice/realtime/sessions", "/api/voice/playback",
+    `/api/m5/tasks?origin_session_id=${nil}`,
+    `/api/m5/tasks/events?origin_session_id=${nil}`,
+    `/api/m5/selections/${nil}/confirm`, `/api/m5/selections/${nil}/cancel`,
+    "/manifest.webmanifest", "/pwa-icon/192", "/pwa-icon/512", "/chat",
+  ]) {
+    await waitForHttp(new URL(path, origin).toString());
+  }
 }
 
 async function isReachable(url: string): Promise<boolean> {

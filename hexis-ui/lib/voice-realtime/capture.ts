@@ -143,6 +143,8 @@ export function monoBlockFromWorklet(data: unknown): AudioWorkletBlock {
 type CaptureTransport = {
   sendControl?(action: "barge_in", reason: string): void;
   openCapture(captureInstanceId: string): void;
+  suspendCapture(captureInstanceId: string): Promise<void>;
+  resumeCapture(captureInstanceId: string): Promise<void>;
   sendAudioChunk(
     captureInstanceId: string,
     range: {
@@ -165,6 +167,12 @@ type CaptureTransport = {
   ): void;
 };
 
+export type CapturePauseToken = {
+  captureInstanceId: string;
+  trackId: string;
+  ready: Promise<void>;
+};
+
 export class AudioCaptureController {
   private context: AudioContext | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
@@ -175,7 +183,9 @@ export class AudioCaptureController {
   private resampler: StreamingPcmResampler | null = null;
   private vad: StreamingVad | null = null;
   private closed = false;
+  private paused = false;
   private failed = false;
+  private pauseToken: CapturePauseToken | null = null;
   private outputFrame = 0;
   private utteranceParts: Uint8Array[] = [];
   private utteranceByteLength = 0;
@@ -246,7 +256,7 @@ export class AudioCaptureController {
         this.fallbackFrame += input.length;
         const output = event.outputBuffer.getChannelData(0);
         output.fill(0);
-        if (this.workletStarted || this.closed || this.failed) return;
+        if (this.workletStarted || this.closed || this.paused || this.failed) return;
         try {
           if (this.fallbackActive) this.consumeBlock(block);
           else this.fallbackQueue.push(block);
@@ -264,7 +274,7 @@ export class AudioCaptureController {
       this.scriptProcessor = scriptProcessor;
       this.silenceGain = gain;
       worklet.port.onmessage = (event: MessageEvent<unknown>) => {
-        if (this.closed || this.failed) return;
+        if (this.closed || this.paused || this.failed) return;
         try {
           this.workletStarted = true;
           if (this.fallbackTimer !== null) clearTimeout(this.fallbackTimer);
@@ -277,7 +287,7 @@ export class AudioCaptureController {
         }
       };
       this.fallbackTimer = setTimeout(() => {
-        if (this.closed || this.failed || this.workletStarted) return;
+        if (this.closed || this.paused || this.failed || this.workletStarted) return;
         this.fallbackActive = true;
         this.worklet?.disconnect();
         for (let block = this.fallbackQueue.shift(); block; block = this.fallbackQueue.shift()) {
@@ -294,6 +304,8 @@ export class AudioCaptureController {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.paused = false;
+    this.pauseToken = null;
     this.workletQueue.clear();
     this.fallbackQueue.clear();
     if (this.fallbackTimer !== null) clearTimeout(this.fallbackTimer);
@@ -325,6 +337,66 @@ export class AudioCaptureController {
     if (context && context.state !== "closed") await context.close();
   }
 
+  pause(): CapturePauseToken | null {
+    if (this.closed || this.failed || !this.context || !this.audioTrack) return null;
+    if (this.pauseToken) return this.pauseToken;
+
+    const track = this.audioTrack;
+    const token: CapturePauseToken = {
+      captureInstanceId: this.captureInstanceId,
+      trackId: track.id,
+      ready: Promise.resolve(),
+    };
+    this.paused = true;
+    this.pauseToken = token;
+    track.enabled = false;
+    this.workletQueue.clear();
+    this.fallbackQueue.clear();
+    if (this.fallbackTimer !== null) clearTimeout(this.fallbackTimer);
+    this.fallbackTimer = null;
+    this.pendingSamples = [];
+    this.pendingStartFrame = 0;
+    this.pendingStartMs = 0;
+    this.pendingEndMs = 0;
+    this.utteranceParts = [];
+    this.utteranceByteLength = 0;
+    this.utteranceStartMs = null;
+    this.utteranceEndMs = null;
+    this.vad?.reset();
+    this.resampler?.close();
+    this.resampler = new StreamingPcmResampler(this.context.sampleRate, 16_000);
+    token.ready = this.outboundChain.then(async () => {
+      if (this.closed || this.pauseToken !== token) {
+        throw new Error("Talk capture changed before suspension completed.");
+      }
+      await this.transport.suspendCapture(this.captureInstanceId);
+    });
+    return token;
+  }
+
+  async resume(token: CapturePauseToken): Promise<void> {
+    if (
+      this.closed ||
+      this.failed ||
+      !this.context ||
+      !this.audioTrack ||
+      this.pauseToken !== token ||
+      token.captureInstanceId !== this.captureInstanceId ||
+      token.trackId !== this.audioTrack.id
+    ) {
+      throw new Error("Talk capture identity changed while the task selection was open.");
+    }
+    await token.ready;
+    await this.transport.resumeCapture(this.captureInstanceId);
+    if (this.closed || this.pauseToken !== token || !this.audioTrack) {
+      throw new Error("Talk capture closed before it could resume.");
+    }
+    this.vad?.reset();
+    this.audioTrack.enabled = true;
+    this.pauseToken = null;
+    this.paused = false;
+  }
+
   private drainWorkletQueue(): void {
     for (let block = this.workletQueue.shift(); block; block = this.workletQueue.shift()) {
       this.consumeBlock(block);
@@ -332,6 +404,7 @@ export class AudioCaptureController {
   }
 
   private consumeBlock(block: AudioWorkletBlock): void {
+    if (this.paused || this.closed || this.failed) return;
     const resampler = this.resampler;
     const vad = this.vad;
     if (!resampler || !vad) return;
@@ -346,6 +419,7 @@ export class AudioCaptureController {
   }
 
   private handleVadEvent(event: VadEvent): void {
+    if (this.paused || this.closed || this.failed) return;
     if (event.type === "speech_start") {
       this.onSpeechStart?.();
       this.transport.sendControl?.("barge_in", "speech_start");

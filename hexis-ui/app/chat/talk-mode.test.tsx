@@ -12,12 +12,25 @@ vi.mock("../avatar-preview/avatar", () => ({
 const captureMocks = vi.hoisted(() => ({
   start: vi.fn().mockResolvedValue(undefined),
   close: vi.fn().mockResolvedValue(undefined),
+  pause: vi.fn(() => ({
+    captureInstanceId: "capture-1",
+    trackId: "track-1",
+    ready: Promise.resolve(),
+  })),
+  resume: vi.fn().mockResolvedValue(undefined),
   onBargeIn: undefined as (() => void) | undefined,
+  captureInstanceId: "capture-1",
 }));
 
 vi.mock("@/lib/voice-realtime/capture", () => ({
-  AudioCaptureController: vi.fn().mockImplementation((_client, _id, _onError, onBargeIn) => {
+  AudioCaptureController: vi.fn().mockImplementation((_client, id, _onError, onBargeIn) => {
     captureMocks.onBargeIn = onBargeIn;
+    captureMocks.captureInstanceId = id;
+    captureMocks.pause.mockImplementation(() => ({
+      captureInstanceId: id,
+      trackId: "track-1",
+      ready: Promise.resolve(),
+    }));
     return captureMocks;
   }),
 }));
@@ -73,6 +86,17 @@ class FakeWebSocket {
   }
 }
 
+function configureSelectionMedia() {
+  const getUserMedia = vi.fn().mockResolvedValue(new FakeStream());
+  Object.defineProperty(navigator, "mediaDevices", { value: { getUserMedia }, configurable: true });
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+    session_id: "session-1", media_session_id: "media-1",
+    websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1",
+  }), { status: 200 })));
+  vi.stubGlobal("WebSocket", FakeWebSocket);
+  return getUserMedia;
+}
+
 describe("TalkMode", () => {
   beforeEach(() => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -86,6 +110,8 @@ describe("TalkMode", () => {
     vi.useRealTimers();
     captureMocks.start.mockClear();
     captureMocks.close.mockReset().mockResolvedValue(undefined);
+    captureMocks.pause.mockClear();
+    captureMocks.resume.mockReset().mockResolvedValue(undefined);
     captureMocks.onBargeIn = undefined;
     vi.unstubAllGlobals();
     FakeWebSocket.instances = [];
@@ -93,6 +119,37 @@ describe("TalkMode", () => {
       value: true,
       configurable: true,
     });
+  });
+
+  it("keeps a closed microphone closed when the task selection closes", () => {
+    const getUserMedia = configureSelectionMedia();
+    const view = render(<TalkMode sessionId="session-1" selectionOpen />);
+    expect(screen.getByRole("button", { name: "Start Talk mode" })).toBeDisabled();
+    view.rerender(<TalkMode sessionId="session-1" selectionOpen={false} />);
+    expect(screen.getByRole("button", { name: "Start Talk mode" })).toBeEnabled();
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(captureMocks.pause).not.toHaveBeenCalled();
+    expect(captureMocks.resume).not.toHaveBeenCalled();
+  });
+
+  it.each(["manual-close", "session-switch"])("does not resume a selection token invalidated by %s", async (action) => {
+    const getUserMedia = configureSelectionMedia();
+    const view = render(<TalkMode sessionId="session-1" />);
+    fireEvent.click(screen.getByRole("button", { name: "Start Talk mode" }));
+    await screen.findByText("Listening");
+    view.rerender(<TalkMode sessionId="session-1" selectionOpen />);
+    await screen.findByText("Talk paused for task selection");
+    const nextSession = action === "session-switch" ? "session-2" : "session-1";
+    if (action === "manual-close") {
+      fireEvent.click(screen.getByRole("button", { name: "Stop Talk mode" }));
+    } else {
+      view.rerender(<TalkMode sessionId={nextSession} selectionOpen />);
+    }
+    await screen.findByRole("button", { name: "Start Talk mode" });
+    view.rerender(<TalkMode sessionId={nextSession} selectionOpen={false} />);
+    expect(captureMocks.resume).not.toHaveBeenCalled();
+    expect(getUserMedia).toHaveBeenCalledOnce();
+    expect(captureMocks.close).toHaveBeenCalledOnce();
   });
 
   it("requests the microphone immediately and reaches realtime listening", async () => {
@@ -145,6 +202,72 @@ describe("TalkMode", () => {
     );
     expect(track.stop).toHaveBeenCalled();
     expect(FakeWebSocket.instances[0].readyState).toBe(3);
+  });
+
+
+
+  it("pauses the active capture for an M5 selection and resumes only after it closes", async () => {
+    Object.defineProperty(navigator, "mediaDevices", {
+      value: { getUserMedia: vi.fn().mockResolvedValue(new FakeStream()) },
+      configurable: true,
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({
+        session_id: "session-1",
+        media_session_id: "media-1",
+        websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1",
+      }),
+      { status: 200 },
+    )));
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const onSelectionOpened = vi.fn();
+    const view = render(
+      <TalkMode sessionId="session-1" onSelectionOpened={onSelectionOpened} />
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Start Talk mode" }));
+    await screen.findByText("Listening");
+
+    act(() => FakeWebSocket.instances[0].onmessage?.({
+      data: JSON.stringify({
+        schema_version: 1,
+        type: "m5_selection_opened",
+        session_id: "session-1",
+        media_session_id: "media-1",
+        producer_seq: 3,
+        selection: {
+          selection_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          version: 1,
+          message: "Continue with the next question.",
+          state: "open",
+          origin_session_id: "session-1",
+        },
+      }),
+    }));
+
+    await screen.findByText("Talk paused for task selection");
+    expect(captureMocks.pause).toHaveBeenCalledOnce();
+    expect(onSelectionOpened).toHaveBeenCalledWith(expect.objectContaining({
+      selection_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    }));
+
+    view.rerender(
+      <TalkMode
+        sessionId="session-1"
+        selectionOpen
+        onSelectionOpened={onSelectionOpened}
+      />
+    );
+    expect(captureMocks.pause).toHaveBeenCalledOnce();
+    view.rerender(
+      <TalkMode
+        sessionId="session-1"
+        selectionOpen={false}
+        onSelectionOpened={onSelectionOpened}
+      />
+    );
+
+    await waitFor(() => expect(screen.getByText("Listening")).toBeInTheDocument());
+    expect(captureMocks.resume).toHaveBeenCalledOnce();
   });
 
   it("shows the avatar while microphone permission is still pending without claiming listening", async () => {
@@ -463,6 +586,33 @@ describe("TalkMode", () => {
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Stop Talk mode" })));
     expect(screen.queryByText("Speaking")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start Talk mode" })).toBeInTheDocument();
+  });
+
+  it("waits for the open receipt before sending later playback lifecycle receipts", async () => {
+    await startPlaybackTalk();
+    const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+    const actions: string[] = [];
+    let releaseOpen: () => void = () => undefined;
+    vi.mocked(fetch).mockImplementation(async (url, options) => {
+      if (url === "/api/voice/playback") {
+        const event = JSON.parse(String(options?.body)) as { action: string };
+        actions.push(event.action);
+        if (event.action === "open") await new Promise<void>((resolve) => { releaseOpen = resolve; });
+      }
+      return originalFetch(url, options);
+    });
+    vi.useFakeTimers();
+    await act(async () => sendOutput("response-1", 0, btoa("\0".repeat(4800))));
+    await act(async () => vi.advanceTimersByTimeAsync(25));
+    await act(async () => sendGeneration("response-1", "done"));
+    const context = PlaybackContext.instances[0];
+    context.currentTime = 0.12;
+    await act(async () => context.sources[0].onended?.());
+    expect(actions).toEqual(["open"]);
+    await act(async () => releaseOpen());
+    await vi.waitFor(() => expect(actions).toContain("end"));
+    expect(actions[0]).toBe("open");
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Stop Talk mode" })));
   });
 
   it("说话打断后立即恢复Listening，迟到包不改变状态，下一轮再显示Speaking", async () => {

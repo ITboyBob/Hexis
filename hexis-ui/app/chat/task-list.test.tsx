@@ -103,4 +103,24 @@ describe("M5 task list", () => {
     expect(screen.getByText("状态暂不可用")).toBeInTheDocument();
     expect(screen.queryByText("暂无任务")).toBeNull();
   });
+
+  it("shows the M5 pend selection over the task list and keeps the list origin bound", () => {
+    render(
+      <TaskList
+        originSessionId={origin}
+        onOpenTask={vi.fn()}
+        selection={{
+          selection_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          origin_session_id: origin,
+          version: 1,
+          message: "继续下一道题并保留时间限制。",
+        }}
+      />
+    );
+
+    expect(screen.getByRole("dialog", { name: "选择要继续的任务" })).toBeInTheDocument();
+    expect(screen.getByText("继续下一道题并保留时间限制。")).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /整理访谈问题/ })).toBeInTheDocument();
+    expect(useM5TasksMock).toHaveBeenLastCalledWith(origin, true, false);
+  });
 });

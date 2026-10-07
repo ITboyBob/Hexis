@@ -86,6 +86,12 @@ def parse_event(value: dict[str, Any]) -> ProtocolEvent:
             raw=value,
             item_id=value.get("item_id"),
         )
+    if event_type == "input_audio_buffer.cleared":
+        return ProtocolEvent(
+            type="input_audio_buffer_cleared",
+            raw=value,
+            event_id=value.get("event_id"),
+        )
     if event_type == "conversation.item.created":
         item = value.get("item") or {}
         return ProtocolEvent(

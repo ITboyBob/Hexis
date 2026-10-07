@@ -2,7 +2,13 @@
 
 import { useEffect, useState } from "react";
 
-import { useM5Tasks, type M5Task, type M5TaskSnapshot } from "@/lib/m5-tasks";
+import {
+  useM5Tasks,
+  type M5Task,
+  type M5TaskSelection,
+  type M5TaskSnapshot,
+} from "@/lib/m5-tasks";
+import { TaskSelection } from "./task-selection";
 
 type TaskListProps = {
   originSessionId: string | null;
@@ -10,6 +16,8 @@ type TaskListProps = {
   onOpenTask: (task: M5Task) => void;
   onReturnToOrigin?: () => void;
   onSnapshot?: (snapshot: M5TaskSnapshot) => void;
+  selection?: M5TaskSelection | null;
+  onSelectionChange?: (selection: M5TaskSelection | null) => void;
 };
 
 function TaskRow({ task, onOpen }: { task: M5Task; onOpen: () => void }) {
@@ -65,30 +73,73 @@ export function TaskList({
   onOpenTask,
   onReturnToOrigin,
   onSnapshot,
+  selection = null,
+  onSelectionChange,
 }: TaskListProps) {
   const [open, setOpen] = useState(false);
-  const { snapshot, loading, error, reload } = useM5Tasks(originSessionId, open);
+  const [handledSelection, setHandledSelection] = useState<{
+    originSessionId: string;
+    selectionId: string;
+  } | null>(null);
+  const currentSelection =
+    selection &&
+    (!selection.origin_session_id || selection.origin_session_id === originSessionId)
+      ? selection
+      : null;
+  const { snapshot, loading, error, reload } = useM5Tasks(
+    originSessionId,
+    open || Boolean(currentSelection),
+    open
+  );
   const usableSnapshot =
     snapshot?.origin_session_id === originSessionId ? snapshot : null;
+  const snapshotSelection =
+    usableSnapshot?.selections?.find(
+      (item) =>
+        !(
+          handledSelection?.originSessionId === originSessionId &&
+          handledSelection.selectionId === item.selection_id
+        )
+    ) ?? null;
+  const activeSelection = currentSelection ?? snapshotSelection;
 
   useEffect(() => {
     if (usableSnapshot) onSnapshot?.(usableSnapshot);
   }, [usableSnapshot, onSnapshot]);
 
+  useEffect(() => {
+    if (!currentSelection && snapshotSelection && originSessionId) {
+      onSelectionChange?.({
+        ...snapshotSelection,
+        origin_session_id: originSessionId,
+      });
+    }
+  }, [currentSelection, snapshotSelection, originSessionId, onSelectionChange]);
+
+  const handleSelectionHandled = () => {
+    if (!activeSelection || !originSessionId) return;
+    setHandledSelection({
+      originSessionId,
+      selectionId: activeSelection.selection_id,
+    });
+    onSelectionChange?.(null);
+  };
+
   return (
-    <div className="relative flex-none">
-      <button
-        type="button"
-        aria-label="任务列表"
-        aria-expanded={open}
-        aria-controls="m5-task-list-panel"
-        disabled={!originSessionId}
-        onClick={() => setOpen((value) => !value)}
-        className="h-10 rounded-md px-3 text-xs font-medium text-[var(--ink-soft)] hover:bg-[var(--outline)] hover:text-[var(--foreground)] disabled:opacity-40"
-      >
-        任务列表
-      </button>
-      {open ? (
+    <>
+      <div className="relative flex-none">
+        <button
+          type="button"
+          aria-label="任务列表"
+          aria-expanded={open}
+          aria-controls="m5-task-list-panel"
+          disabled={!originSessionId}
+          onClick={() => setOpen((value) => !value)}
+          className="h-10 rounded-md px-3 text-xs font-medium text-[var(--ink-soft)] hover:bg-[var(--outline)] hover:text-[var(--foreground)] disabled:opacity-40"
+        >
+          任务列表
+        </button>
+        {open ? (
         <section
           id="m5-task-list-panel"
           role="region"
@@ -175,7 +226,18 @@ export function TaskList({
             </div>
           ) : null}
         </section>
+        ) : null}
+      </div>
+      {activeSelection ? (
+        <TaskSelection
+          key={`${activeSelection.selection_id}:${activeSelection.version}`}
+          selection={activeSelection}
+          tasks={usableSnapshot?.tasks ?? []}
+          loading={loading || !usableSnapshot}
+          unavailable={error}
+          onHandled={handleSelectionHandled}
+        />
       ) : null}
-    </div>
+    </>
   );
 }

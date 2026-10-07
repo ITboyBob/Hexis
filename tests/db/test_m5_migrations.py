@@ -199,8 +199,9 @@ async def test_m5_pending_forward_matches_baseline_and_preserves_work(db_pool, t
                 "ALTER TABLE public.m5_work_rounds DROP CONSTRAINT IF EXISTS m5_work_rounds_message_id_key"
             )
             await conn.execute(
-                "DELETE FROM public.schema_migrations WHERE version=$1",
+                "DELETE FROM public.schema_migrations WHERE version IN ($1,$2)",
                 "0263_m5_pending",
+                "0267_m5_selections",
             )
 
             s4_dir = tmp_path / "s4"
@@ -225,6 +226,13 @@ async def test_m5_pending_forward_matches_baseline_and_preserves_work(db_pool, t
             assert await apply_pending_migrations(
                 conn, migrations_dir=pending_dir
             ) == ["0263_m5_pending"]
+            selection_migration = _MIGRATIONS / "0267_m5_selections.sql"
+            (pending_dir / selection_migration.name).write_bytes(
+                selection_migration.read_bytes()
+            )
+            assert await apply_pending_migrations(
+                conn, migrations_dir=pending_dir
+            ) == ["0267_m5_selections"]
             assert await apply_pending_migrations(
                 conn, migrations_dir=pending_dir
             ) == []
@@ -283,6 +291,11 @@ async def test_m5_reports_forward_matches_baseline(db_pool, tmp_path):
         transaction = conn.transaction()
         await transaction.start()
         try:
+            await conn.execute("DROP TABLE IF EXISTS public.m5_selections CASCADE")
+            await conn.execute(
+                "DELETE FROM public.schema_migrations WHERE version=$1",
+                "0267_m5_selections",
+            )
             await conn.execute("DROP FUNCTION IF EXISTS public.deliver_m5_report(uuid,uuid,text,text)")
             await conn.execute("DROP TABLE IF EXISTS public.m5_reports CASCADE")
             await conn.execute("DROP INDEX IF EXISTS public.idx_m5_reports_pending")
@@ -293,8 +306,13 @@ async def test_m5_reports_forward_matches_baseline(db_pool, tmp_path):
             )
             migration = _MIGRATIONS / "0264_m5_reports.sql"
             (tmp_path / migration.name).write_bytes(migration.read_bytes())
+            selection_migration = _MIGRATIONS / "0267_m5_selections.sql"
+            (tmp_path / selection_migration.name).write_bytes(
+                selection_migration.read_bytes()
+            )
             assert await apply_pending_migrations(conn, migrations_dir=tmp_path) == [
-                "0264_m5_reports"
+                "0264_m5_reports",
+                "0267_m5_selections"
             ]
             assert (await migration_status(conn, migrations_dir=tmp_path))["pending"] == []
             assert await _m5_s6_schema_snapshot(conn) == expected
@@ -445,5 +463,109 @@ async def test_m5_lightweight_forward_matches_baseline_and_preserves_existing_ac
             assert json.loads(preserved["result"])==action_result
             assert preserved["arguments"] is None
             assert preserved["execution_started_at"] is None
+        finally:
+            await transaction.rollback()
+
+
+async def test_m5_s10_selection_forward_migration_preserves_prior_actions(
+    db_pool, tmp_path
+):
+    from core.migrations import apply_pending_migrations, migration_status
+
+    migration = _MIGRATIONS / "0267_m5_selections.sql"
+    async with db_pool.acquire() as conn:
+        expected_functions = {
+            signature: await conn.fetchval(
+                "SELECT pg_get_functiondef($1::regprocedure)", signature
+            )
+            for signature in (
+                "public.append_m5_message(uuid,uuid,uuid,text,jsonb)",
+                "public.begin_m5_selection(uuid,uuid,uuid,text,jsonb,text,text)",
+                "public.close_m5_selection(uuid,uuid,bigint,text,uuid)",
+            )
+        }
+        origin = await conn.fetchval(
+            "SELECT (get_or_create_chat_session(NULL,'chat',$1,'{}'::jsonb)->>'session_id')::uuid",
+            f"m5-selection-migration-{uuid4()}",
+        )
+        command_id = uuid4()
+        prior_result = {"accepted": True, "state": "accepted", "data": {}}
+        await conn.execute(
+            """INSERT INTO public.m5_actions(
+                command_id,origin_session_id,tool_name,argument_digest,
+                "authorization",actual_call_id,state,result
+            ) VALUES($1,$2,'submit',$3,'{}'::jsonb,'prior-submit','accepted',$4::jsonb)""",
+            command_id,
+            origin,
+            "b" * 64,
+            json.dumps(prior_result),
+        )
+        transaction = conn.transaction()
+        await transaction.start()
+        try:
+            await conn.execute(
+                "DROP FUNCTION IF EXISTS public.close_m5_selection(uuid,uuid,bigint,text,uuid)"
+            )
+            await conn.execute(
+                "DROP FUNCTION IF EXISTS public.begin_m5_selection(uuid,uuid,uuid,text,jsonb,text,text)"
+            )
+            await conn.execute(
+                "DROP FUNCTION IF EXISTS public.append_m5_message(uuid,uuid,uuid,text,jsonb)"
+            )
+            await conn.execute("DROP TABLE IF EXISTS public.m5_selections")
+            await conn.execute(
+                "DELETE FROM public.schema_migrations WHERE version=$1",
+                "0267_m5_selections",
+            )
+            (tmp_path / migration.name).write_bytes(migration.read_bytes())
+
+            assert await apply_pending_migrations(
+                conn, migrations_dir=tmp_path
+            ) == ["0267_m5_selections"]
+            assert (await migration_status(conn, migrations_dir=tmp_path))["pending"] == []
+
+            columns = await conn.fetch(
+                """SELECT column_name FROM information_schema.columns
+                   WHERE table_schema='public' AND table_name='m5_selections'"""
+            )
+            assert {row["column_name"] for row in columns} >= {
+                "selection_id",
+                "command_id",
+                "origin_session_id",
+                "actual_call_id",
+                "authorization",
+                "message",
+                "state",
+                "chosen_task_id",
+                "version",
+            }
+            constraints = await conn.fetch(
+                "SELECT conname FROM pg_constraint WHERE conrelid='public.m5_selections'::regclass"
+            )
+            assert {row["conname"] for row in constraints} >= {
+                "m5_selections_pkey",
+                "m5_selections_command_id_key",
+                "m5_selections_chosen_task_origin_fkey",
+                "m5_selections_chosen_task_state_check",
+            }
+            indexes = await conn.fetch(
+                "SELECT indexname FROM pg_indexes WHERE schemaname='public' AND tablename='m5_selections'"
+            )
+            assert "idx_m5_selections_origin_state" in {
+                row["indexname"] for row in indexes
+            }
+            for signature, expected_definition in expected_functions.items():
+                actual = await conn.fetchval(
+                    "SELECT pg_get_functiondef($1::regprocedure)", signature
+                )
+                assert actual == expected_definition
+            preserved = await conn.fetchrow(
+                "SELECT origin_session_id,tool_name,state,result FROM public.m5_actions WHERE command_id=$1",
+                command_id,
+            )
+            assert preserved["origin_session_id"] == origin
+            assert preserved["tool_name"] == "submit"
+            assert preserved["state"] == "accepted"
+            assert json.loads(preserved["result"]) == prior_result
         finally:
             await transaction.rollback()

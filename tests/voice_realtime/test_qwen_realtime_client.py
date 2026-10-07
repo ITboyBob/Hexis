@@ -129,6 +129,27 @@ async def test_connect_waits_for_session_updated_and_does_not_send_response():
     await client.close()
 
 
+async def test_clear_uncommitted_audio_waits_for_provider_clear_receipt():
+    client, observed = make_client(
+        [{"type": "session.updated", "session": {"id": "qwen-1"}}]
+    )
+    await client.connect("稳定层")
+    websocket = observed["websocket"]
+
+    clear_task = asyncio.create_task(client.clear_uncommitted_audio())
+    await asyncio.sleep(0)
+    assert websocket.sent[-1]["type"] == "input_audio_buffer.clear"
+    assert websocket.sent[-1]["event_id"].startswith("event_")
+
+    websocket.incoming.put_nowait(
+        json.dumps({"type": "input_audio_buffer.cleared", "event_id": "clear-1"})
+    )
+    receipt = await clear_task
+
+    assert receipt.type == "input_audio_buffer_cleared"
+    await client.close()
+
+
 async def test_turn_instruction_update_waits_for_matching_session_receipt_before_response():
     client, observed = make_client(
         [{"type": "session.updated", "session": {"id": "qwen-1"}}]

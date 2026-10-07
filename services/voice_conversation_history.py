@@ -105,6 +105,8 @@ class VoiceConversationHistory:
                     "playback_scope": playback_scope,
                     "response_ids": response_ids,
                     "playback_ids": playback_ids,
+                    **({"played_response_texts": metadata["played_response_texts"]}
+                       if metadata.get("played_response_texts") else {}),
                 },
             }
             for index, event_type in enumerate(

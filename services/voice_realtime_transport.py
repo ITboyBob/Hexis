@@ -33,6 +33,18 @@ class CaptureOpen(ClientEnvelope):
     sample_format: Literal["s16le"]
 
 
+class CaptureSuspend(ClientEnvelope):
+    type: Literal["capture_suspend"]
+    capture_instance_id: UUID
+    control_id: UUID
+
+
+class CaptureResume(ClientEnvelope):
+    type: Literal["capture_resume"]
+    capture_instance_id: UUID
+    control_id: UUID
+
+
 class ClientAudioChunk(ClientEnvelope):
     type: Literal["audio_chunk"]
     capture_instance_id: UUID
@@ -71,7 +83,14 @@ class ClientControl(ClientEnvelope):
 
 
 ClientMessage = Annotated[
-    Union[CaptureOpen, ClientAudioChunk, UtteranceEnd, ClientControl],
+    Union[
+        CaptureOpen,
+        CaptureSuspend,
+        CaptureResume,
+        ClientAudioChunk,
+        UtteranceEnd,
+        ClientControl,
+    ],
     Field(discriminator="type"),
 ]
 _client_adapter: TypeAdapter[ClientMessage] = TypeAdapter(ClientMessage)
@@ -173,6 +192,10 @@ class VoiceClientTransport:
 
         if isinstance(message, CaptureOpen):
             return self._accept_capture_open(message)
+        if isinstance(message, CaptureSuspend):
+            return self._accept_capture_suspend(message)
+        if isinstance(message, CaptureResume):
+            return self._accept_capture_resume(message)
         if isinstance(message, ClientAudioChunk):
             return self._accept_audio_chunk(message)
         if isinstance(message, UtteranceEnd):
@@ -196,12 +219,37 @@ class VoiceClientTransport:
             "format": facts,
             "next_frame": 0,
             "range": None,
+            "suspended": False,
             "sha256": hashlib.sha256(),
         }
         return {"accepted": True, "deduplicated": False}
 
+    def _accept_capture_suspend(self, message: CaptureSuspend) -> dict[str, Any]:
+        capture = self._require_capture(message.capture_instance_id)
+        if capture["suspended"]:
+            return {"accepted": True, "state": "suspended", "discarded_range": None}
+        current = capture["range"]
+        discarded = (
+            {"start_frame": current["start_frame"], "end_frame": current["end_frame"]}
+            if current is not None
+            else None
+        )
+        capture["range"] = None
+        capture["sha256"] = hashlib.sha256()
+        capture["suspended"] = True
+        return {"accepted": True, "state": "suspended", "discarded_range": discarded}
+
+    def _accept_capture_resume(self, message: CaptureResume) -> dict[str, Any]:
+        capture = self._require_capture(message.capture_instance_id)
+        capture["suspended"] = False
+        capture["range"] = None
+        capture["sha256"] = hashlib.sha256()
+        return {"accepted": True, "state": "capturing"}
+
     def _accept_audio_chunk(self, message: ClientAudioChunk) -> dict[str, Any]:
         capture = self._require_capture(message.capture_instance_id)
+        if capture["suspended"]:
+            raise ClientTransportError("audio cannot be accepted while capture is suspended")
         if message.end_frame < message.start_frame:
             raise ClientTransportError("audio range end precedes start")
         if message.end_monotonic_ms < message.start_monotonic_ms:
@@ -257,6 +305,8 @@ class VoiceClientTransport:
 
     def _accept_utterance_end(self, message: UtteranceEnd) -> dict[str, Any]:
         capture = self._require_capture(message.capture_instance_id)
+        if capture["suspended"]:
+            raise ClientTransportError("utterance cannot end while capture is suspended")
         current = capture["range"]
         if current is None:
             raise ClientTransportError("utterance_end has no preceding audio range")

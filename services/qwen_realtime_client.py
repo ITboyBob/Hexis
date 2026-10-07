@@ -75,6 +75,8 @@ class QwenRealtimeClient:
         self._session_update_waiter: asyncio.Future[ProtocolEvent] | None = None
         self._session_update_expected_instructions: str | None = None
         self._session_update_lock = asyncio.Lock()
+        self._audio_buffer_clear_waiter: asyncio.Future[ProtocolEvent] | None = None
+        self._audio_buffer_clear_lock = asyncio.Lock()
         self._stable_instructions = ""
         self._session_config: dict[str, Any] | None = None
         self._events: asyncio.Queue[ProtocolEvent] = asyncio.Queue()
@@ -141,6 +143,22 @@ class QwenRealtimeClient:
 
     async def commit_audio(self) -> None:
         await self._send({"type": "input_audio_buffer.commit"})
+
+    async def clear_uncommitted_audio(self, *, timeout: float = 5.0) -> ProtocolEvent:
+        """Clear the provider's uncommitted input buffer and await its receipt."""
+        self._require_connected()
+        async with self._audio_buffer_clear_lock:
+            loop = asyncio.get_running_loop()
+            waiter: asyncio.Future[ProtocolEvent] = loop.create_future()
+            self._audio_buffer_clear_waiter = waiter
+            try:
+                await self._send(
+                    {"type": "input_audio_buffer.clear", "event_id": f"event_{uuid4().hex}"}
+                )
+                return await asyncio.wait_for(waiter, timeout)
+            finally:
+                if self._audio_buffer_clear_waiter is waiter:
+                    self._audio_buffer_clear_waiter = None
 
     async def update_session_instructions(
         self, per_turn_instructions: str, *, timeout: float = 10.0
@@ -279,6 +297,11 @@ class QwenRealtimeClient:
         return await asyncio.wait_for(wait(), timeout)
 
     async def close(self) -> None:
+        clear_waiter = self._audio_buffer_clear_waiter
+        if clear_waiter is not None and not clear_waiter.done():
+            clear_waiter.set_exception(
+                QwenRealtimeProtocolError("Qwen Realtime closed before audio clear was acknowledged")
+            )
         receive_task = self._receive_task
         if receive_task is not None:
             receive_task.cancel()
@@ -311,6 +334,10 @@ class QwenRealtimeClient:
                 return
 
             await self._events.put(event)
+            if event.type == "input_audio_buffer_cleared":
+                waiter = self._audio_buffer_clear_waiter
+                if waiter is not None and not waiter.done():
+                    waiter.set_result(event)
             if event.type == "session.updated":
                 waiter = self._session_update_waiter
                 if (

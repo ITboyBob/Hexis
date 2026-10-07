@@ -17,10 +17,18 @@ export type M5Task = {
   pending: M5TaskPendingMessage[];
 };
 
+export type M5TaskSelection = {
+  selection_id: string;
+  version: number;
+  message: string;
+  origin_session_id?: string;
+};
+
 export type M5TaskSnapshot = {
   origin_session_id: string;
   event_cursor: { "m5-tasks": number };
   tasks: M5Task[];
+  selections?: M5TaskSelection[];
 };
 
 export type M5TaskEvent = {
@@ -49,6 +57,15 @@ function validSnapshot(value: unknown, originSessionId: string): value is M5Task
     Number.isSafeInteger(cursor) &&
     (cursor as number) >= 0 &&
     Array.isArray(snapshot.tasks) &&
+    (snapshot.selections === undefined ||
+      (Array.isArray(snapshot.selections) &&
+        snapshot.selections.every(
+          (selection) =>
+            selection &&
+            typeof selection.selection_id === "string" &&
+            Number.isSafeInteger(selection.version) &&
+            typeof selection.message === "string"
+        ))) &&
     snapshot.tasks.every(
       (task) =>
         task &&
@@ -82,7 +99,7 @@ export async function fetchM5TaskSnapshot(
   if (!validSnapshot(body, originSessionId)) {
     throw new Error("The task snapshot did not match the active source chat.");
   }
-  return body;
+  return { ...body, selections: body.selections ?? [] };
 }
 
 function taskFromEvent(event: M5TaskEvent, originSessionId: string): M5Task | null {
@@ -144,6 +161,37 @@ export function mergeM5TaskEvent(
     ...snapshot,
     event_cursor: { ...snapshot.event_cursor, [TASK_STREAM]: event.seq },
   };
+  if (event.event_type === "m5_selection_opened") {
+    const payload = event.payload;
+    const selectionId = payload.selection_id;
+    const version = payload.version;
+    const message = payload.message;
+    if (
+      typeof selectionId !== "string" ||
+      !Number.isSafeInteger(version) ||
+      typeof message !== "string" ||
+      payload.state !== "open"
+    ) {
+      return { status: "invalid", snapshot };
+    }
+    const selections = [...(snapshot.selections ?? [])];
+    const index = selections.findIndex((item) => item.selection_id === selectionId);
+    const selection = { selection_id: selectionId, version: version as number, message };
+    if (index < 0) selections.push(selection);
+    else if (selections[index].version < selection.version) selections[index] = selection;
+    return { status: "applied", snapshot: { ...nextSnapshot, selections } };
+  }
+  if (event.event_type === "m5_selection_closed") {
+    const selectionId = event.payload.selection_id;
+    const version = event.payload.version;
+    if (typeof selectionId !== "string" || !Number.isSafeInteger(version)) {
+      return { status: "invalid", snapshot };
+    }
+    const selections = (snapshot.selections ?? []).filter(
+      (item) => item.selection_id !== selectionId || item.version >= (version as number)
+    );
+    return { status: "advanced", snapshot: { ...nextSnapshot, selections } };
+  }
   if (event.event_type !== "m5_task_changed") {
     return { status: "advanced", snapshot: nextSnapshot };
   }
@@ -164,7 +212,11 @@ export function mergeM5TaskEvent(
   return { status: "applied", snapshot: { ...nextSnapshot, tasks } };
 }
 
-export function useM5Tasks(originSessionId: string | null, enabled: boolean) {
+export function useM5Tasks(
+  originSessionId: string | null,
+  enabled: boolean,
+  fallbackEnabled = enabled
+) {
   const [snapshot, setSnapshot] = useState<M5TaskSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -209,7 +261,7 @@ export function useM5Tasks(originSessionId: string | null, enabled: boolean) {
       }
     };
     const startFallback = () => {
-      if (fallbackTimer !== null || closed) return;
+      if (fallbackTimer !== null || closed || !fallbackEnabled) return;
       fallbackTimer = window.setInterval(() => void connect(), 2000);
     };
     const connect = async () => {
@@ -236,8 +288,10 @@ export function useM5Tasks(originSessionId: string | null, enabled: boolean) {
         });
         source.onopen = () => clearFallback();
         source.onerror = () => {
-          closeSource();
-          startFallback();
+          if (fallbackEnabled) {
+            closeSource();
+            startFallback();
+          }
         };
       } catch (cause) {
         if (!closed && !(cause instanceof DOMException && cause.name === "AbortError")) {
@@ -257,7 +311,7 @@ export function useM5Tasks(originSessionId: string | null, enabled: boolean) {
       closeSource();
       clearFallback();
     };
-  }, [originSessionId, enabled, refresh]);
+  }, [originSessionId, enabled, fallbackEnabled, refresh]);
 
   return { snapshot, loading, error, reload };
 }

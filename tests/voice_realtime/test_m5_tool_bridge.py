@@ -31,6 +31,30 @@ class _Client:
     async def create_first_response(self, response_id):
         self.responses.append(response_id)
 
+    async def close(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_voice_wait_releases_the_underlying_waiter():
+    session = VoiceRealtimeSession(session_id=uuid4(), media_session_id="cancelled-wait", client=_Client())
+    started = asyncio.Event()
+    released = asyncio.Event()
+
+    async def operation():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            released.set()
+
+    pending = asyncio.create_task(session._await_or_closed(operation()))
+    await started.wait()
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert released.is_set(), "the voice wait must release its DB/notification child on cancellation"
+
 
 async def _authorized_session(*, tool_surface="m5", input_order=4, revision=2):
     from services.voice_instructions import load_m5_instructions
@@ -68,6 +92,55 @@ async def _authorized_session(*, tool_surface="m5", input_order=4, revision=2):
         "playback_ids": [],
     }
     return session, client, input_turn_id, response_id
+
+
+@pytest.mark.asyncio
+async def test_tool_audio_uses_playback_barrier_without_completing_voice_turn():
+    session, _client, input_id, response_id = await _authorized_session()
+    turn = session._voice_turns[input_id]
+    turn.update(generation_done=False, terminal_receipts={}, generated_text={})
+    session.subscribe_response(response_id)
+    session._responses_idle.clear()
+    session._playback_ids[response_id] = "tool-audio-playback"
+    session._playback_state[response_id] = {
+        "output_epoch": 1, "playback_id": "tool-audio-playback", "scheduled_frames": 2400,
+        "scheduled_ms": 100, "opened": True, "terminal": False, "last_seq": 1,
+        "receipts": {}, "played_ms": 0, "invalidated": False,
+    }
+    await session.mark_generation_done(input_id, response_id, final_for_turn=False)
+    assert not session._responses_idle.is_set()
+    assert turn["generation_done"] is False
+    receipt = SimpleNamespace(
+        action="end", session_id=session.session_id, response_id=response_id,
+        playback_id="tool-audio-playback", producer_seq=2, output_epoch=1,
+        media_session_id=session.media_session_id, turn_id=turn["turn_id"],
+        played_ms=100, scope="complete", model_dump=lambda mode="json": {},
+    )
+    assert session.accept_playback_receipt(receipt)
+    session.record_playback_terminal(input_id, response_id, "tool-audio-playback", "complete", 100, 1)
+    await session.finish_response_playback(response_id)
+    assert session._responses_idle.is_set()
+    assert await session.claim_voice_turn_completion(input_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix_scope", ["complete", "partial", "unplayed", "unknown"])
+async def test_played_history_keeps_only_complete_tool_response_fragments(prefix_scope):
+    session, _client, input_id, _response_id = await _authorized_session()
+    turn = session._voice_turns[input_id]
+    turn.update(
+        generation_done=True,
+        response_ids=["tool-response", "followup-response"],
+        generated_text={"tool-response": {"text": "Please choose a task."}, "followup-response": {"text": "The message was saved."}},
+        terminal_receipts={
+            "tool-response": {"response_id": "tool-response", "scope": prefix_scope},
+            "followup-response": {"response_id": "followup-response", "scope": "complete"},
+        },
+    )
+    snapshot = await session.claim_voice_turn_completion(input_id)
+    expected = "Please choose a task.\nThe message was saved." if prefix_scope == "complete" else "The message was saved."
+    assert snapshot["assistant_text"] == expected
+    assert all(item["scope"] == "complete" for item in snapshot["played_response_texts"])
 
 
 @pytest.mark.asyncio

@@ -2,9 +2,10 @@
 
 import { Radio, Square, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { AudioCaptureController } from "@/lib/voice-realtime/capture";
+import { AudioCaptureController, type CapturePauseToken } from "@/lib/voice-realtime/capture";
 import { VoiceRealtimeClient } from "@/lib/voice-realtime/client";
 import type { RealtimeServerMessage } from "@/lib/voice-realtime/contracts";
+import type { M5TaskSelection } from "@/lib/m5-tasks";
 import { NativeOutputQueue, REALTIME_OUTPUT_SAMPLE_RATE } from "@/lib/voice-realtime/output-queue";
 import { decodeBase64ToPcm } from "@/lib/voice-playback/native-output-source";
 import { NativeOutputPlayer } from "@/lib/voice-playback/native-player";
@@ -19,8 +20,14 @@ import {
 } from "@/lib/voice-realtime/avatar-projection";
 import { VoiceAvatar } from "./voice-avatar";
 
-type TalkPhase = "idle" | "connecting" | "listening" | "failed" | "closing";
+type TalkPhase = "idle" | "connecting" | "listening" | "suspended" | "failed" | "closing";
 type TalkOutput = { queue: NativeOutputQueue; player: NativeOutputPlayer; failed: boolean; speaking: boolean };
+type SelectionPause = {
+  client: VoiceRealtimeClient;
+  capture: AudioCaptureController;
+  token: CapturePauseToken;
+  mediaSessionId: string;
+};
 
 async function postPlaybackReceipt(
   endpoint: string,
@@ -52,10 +59,14 @@ export function TalkMode({
   disabled,
   sessionId,
   onSessionId,
+  selectionOpen = false,
+  onSelectionOpened,
 }: {
   disabled?: boolean;
   sessionId?: string | null;
   onSessionId?: (sessionId: string) => void;
+  selectionOpen?: boolean;
+  onSelectionOpened?: (selection: M5TaskSelection) => void;
 }) {
   const [phase, setPhase] = useState<TalkPhase>("idle");
   const [speaking, setSpeaking] = useState(false);
@@ -70,6 +81,7 @@ export function TalkMode({
   const activeRef = useRef(false);
   const mountedRef = useRef(true);
   const sessionIdRef = useRef(sessionId);
+  const selectionPauseRef = useRef<SelectionPause | null>(null);
   const statusCardRef = useRef<HTMLDivElement>(null);
   const avatar = projectVoiceAvatar(avatarState);
 
@@ -128,6 +140,7 @@ export function TalkMode({
 
   const stopTalk = useCallback(async (message?: string) => {
     activeRef.current = false;
+    selectionPauseRef.current = null;
     if (mountedRef.current) setPhase("closing");
     const capture = captureRef.current;
     captureRef.current = null;
@@ -139,6 +152,71 @@ export function TalkMode({
     setError(message ?? null);
     setRetryAvailable(Boolean(message));
   }, [stopOutputs]);
+
+  const pauseForSelection = useCallback(() => {
+    if (selectionPauseRef.current) return;
+    const client = clientRef.current;
+    const capture = captureRef.current;
+    const mediaSessionId = client?.activeMediaSessionId;
+    if (!activeRef.current || !client || !capture || !mediaSessionId) return;
+    const token = capture.pause();
+    if (!token) return;
+    const paused: SelectionPause = { client, capture, token, mediaSessionId };
+    selectionPauseRef.current = paused;
+    setPhase("suspended");
+    void token.ready.then(() => {
+      if (
+        selectionPauseRef.current === paused &&
+        activeRef.current &&
+        clientRef.current === client &&
+        client.activeMediaSessionId === mediaSessionId
+      ) {
+        setPhase("suspended");
+      }
+    }).catch((pauseError: unknown) => {
+      if (selectionPauseRef.current !== paused) return;
+      const message = pauseError instanceof Error
+        ? pauseError.message
+        : "Talk could not pause safely for task selection.";
+      setError(message);
+      setRetryAvailable(true);
+      void stopTalk("Talk stopped because uncommitted input could not be cleared safely.");
+    });
+  }, [stopTalk]);
+
+  const resumeAfterSelection = useCallback(() => {
+    const paused = selectionPauseRef.current;
+    if (!paused) return;
+    selectionPauseRef.current = null;
+    if (
+      !activeRef.current ||
+      clientRef.current !== paused.client ||
+      captureRef.current !== paused.capture ||
+      paused.client.activeMediaSessionId !== paused.mediaSessionId
+    ) return;
+    void paused.capture.resume(paused.token).then(() => {
+      if (
+        activeRef.current &&
+        clientRef.current === paused.client &&
+        captureRef.current === paused.capture &&
+        paused.client.activeMediaSessionId === paused.mediaSessionId
+      ) {
+        setPhase("listening");
+      }
+    }).catch((resumeError: unknown) => {
+      const message = resumeError instanceof Error
+        ? resumeError.message
+        : "Talk could not resume after task selection.";
+      setError(message);
+      setRetryAvailable(true);
+      void stopTalk("Talk stopped because the original capture could not be resumed.");
+    });
+  }, [stopTalk]);
+
+  useEffect(() => {
+    if (selectionOpen) pauseForSelection();
+    else resumeAfterSelection();
+  }, [selectionOpen, pauseForSelection, resumeAfterSelection]);
 
   useEffect(() => {
     if (sessionId && avatarState.session_id !== sessionId) {
@@ -215,8 +293,14 @@ export function TalkMode({
     setPhase("connecting");
     if (clientRef.current === null) {
       clientRef.current = new VoiceRealtimeClient({
+        toolSurface: "m5",
         onMessage: (message: RealtimeServerMessage) => {
           if (!activeRef.current) return;
+          if (message.type === "m5_selection_opened") {
+            pauseForSelection();
+            onSelectionOpened?.(message.selection);
+            return;
+          }
           if (message.type === "ready") {
             setAvatarState((current) => {
               const sessionState = current.session_id === message.session_id
@@ -246,6 +330,7 @@ export function TalkMode({
               setError(null);
               setRetryAvailable(false);
               const queue = new NativeOutputQueue();
+              let receiptChain = Promise.resolve();
               const player = new NativeOutputPlayer({
                 identity: {
                   playback_id: message.playback_id,
@@ -272,7 +357,7 @@ export function TalkMode({
                     void queue[Symbol.asyncIterator]().return?.();
                     void player.destroy().catch(() => undefined);
                   }
-                  void postPlaybackReceipt(endpoint, event).catch((receiptError: unknown) => {
+                  receiptChain = receiptChain.then(() => postPlaybackReceipt(endpoint, event)).catch((receiptError: unknown) => {
                     if (mountedRef.current && !output?.failed) {
                       setError(receiptError instanceof Error ? receiptError.message : "Playback receipt could not be saved.");
                       setRetryAvailable(true);
@@ -349,12 +434,13 @@ export function TalkMode({
       setError(startError instanceof Error ? startError.message : "Talk could not start.");
       setRetryAvailable(true);
     }
-  }, [onSessionId, stopOutputsForBargeIn, stopTalk, failOutput, invalidateResponse, refreshSpeaking]);
+  }, [onSessionId, onSelectionOpened, pauseForSelection, stopOutputsForBargeIn, stopTalk, failOutput, invalidateResponse, refreshSpeaking]);
 
   const phaseLabel: Record<TalkPhase, string> = {
     idle: "Talk off",
     connecting: "Connecting Talk",
     listening: speaking ? "Speaking" : "Listening",
+    suspended: "Talk paused for task selection",
     failed: "Talk needs attention",
     closing: "Stopping Talk",
   };
@@ -373,7 +459,7 @@ export function TalkMode({
       {phase === "idle" ? (
         <button
           type="button"
-          disabled={disabled}
+          disabled={disabled || selectionOpen}
           onClick={() => void startTalk()}
           aria-label="Start Talk mode"
           title="Start realtime Talk"
@@ -408,6 +494,8 @@ export function TalkMode({
           <p className="mt-2 text-[11px] text-[var(--ink-soft)]">
             {phase === "listening"
               ? speaking ? "Hexis is speaking. You can interrupt by speaking." : "The microphone stays open while Hexis listens."
+              : phase === "suspended"
+                ? "The microphone is paused until you confirm or cancel the task selection."
               : phase === "closing"
                 ? "The microphone and audio output are closing."
                 : "Talk is starting. Grant microphone permission if your browser asks."}

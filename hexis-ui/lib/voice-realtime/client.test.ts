@@ -20,6 +20,7 @@ class FakeWebSocket {
   sent: string[] = [];
   onopen: (() => void) | null = null;
   onclose: (() => void) | null = null;
+  onmessage: ((event: { data: string }) => void) | null = null;
   private listeners: Record<string, Array<() => void>> = {};
 
   constructor(readonly url: string) {
@@ -48,6 +49,10 @@ class FakeWebSocket {
       this.listeners.close?.forEach((listener) => listener());
       this.onclose?.();
     });
+  }
+
+  receive(value: unknown) {
+    this.onmessage?.({ data: JSON.stringify(value) });
   }
 }
 
@@ -118,6 +123,64 @@ describe("VoiceRealtimeClient", () => {
     expect(track.stop).toHaveBeenCalled();
     expect(socket.readyState).toBe(3);
     expect(client.state).toBe("closed");
+  });
+
+  it("selects M5 tools and waits for matching suspend/resume acknowledgements", async () => {
+    const track = new FakeTrack();
+    Object.defineProperty(navigator, "mediaDevices", {
+      value: { getUserMedia: vi.fn().mockResolvedValue(new FakeStream([track])) },
+      configurable: true,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({
+        session_id: "session-1",
+        media_session_id: "media-1",
+        websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1",
+      }), { status: 200 }))
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const client = new VoiceRealtimeClient({ toolSurface: "m5" });
+
+    await client.open("session-1");
+    const socket = FakeWebSocket.instances[0];
+    const fetchBody = JSON.parse(String((vi.mocked(fetch).mock.calls[0]?.[1] as RequestInit)?.body));
+    expect(fetchBody.tool_surface).toBe("m5");
+
+    const suspending = client.suspendCapture("capture-1");
+    const suspendMessage = JSON.parse(socket.sent.at(-1) || "{}");
+    expect(suspendMessage).toMatchObject({
+      type: "capture_suspend",
+      session_id: "session-1",
+      media_session_id: "media-1",
+      capture_instance_id: "capture-1",
+    });
+    socket.receive({
+      schema_version: 1,
+      type: "capture_suspended",
+      session_id: "session-1",
+      media_session_id: "media-1",
+      producer_seq: 1,
+      capture_instance_id: "capture-1",
+      control_id: suspendMessage.control_id,
+      discarded_range: null,
+    });
+    await expect(suspending).resolves.toBeUndefined();
+
+    const resuming = client.resumeCapture("capture-1");
+    const resumeMessage = JSON.parse(socket.sent.at(-1) || "{}");
+    socket.receive({
+      schema_version: 1,
+      type: "capture_resumed",
+      session_id: "session-1",
+      media_session_id: "media-1",
+      producer_seq: 2,
+      capture_instance_id: "capture-1",
+      control_id: resumeMessage.control_id,
+    });
+    await expect(resuming).resolves.toBeUndefined();
+    expect(track.stop).not.toHaveBeenCalled();
+    await client.close();
   });
 
   it("does not create a realtime session when microphone permission is denied", async () => {

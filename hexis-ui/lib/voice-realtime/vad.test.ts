@@ -7,6 +7,23 @@ function pcm(value: number, count = 160) {
 }
 
 describe("StreamingVad", () => {
+  it("keeps a rejected short candidate in pre-roll without a 683-frame gap", () => {
+    const vad = new StreamingVad({ sampleRate: 16_000 });
+    const push = (value: number, index: number) => vad.push(
+      pcm(value, 683), index * 683, index * 683 / 16, (index + 1) * 683 / 16,
+    );
+    expect(push(0, 0)).toEqual([]);
+    expect(push(4_000, 1)).toEqual([]);
+    expect(push(0, 2)).toEqual([]);
+    expect(push(4_000, 3)).toEqual([]);
+    const event = push(4_000, 4)[0];
+    expect(event.type).toBe("speech_start");
+    if (event.type !== "utterance_end") {
+      expect(event.samples.length).toBe(event.endFrame - event.startFrame);
+      expect(event.samples.slice(683, 1366)).toEqual(pcm(4_000, 683));
+    }
+  });
+
   it("includes pre-roll, holds through a pause, and ends once after hangover", () => {
     const vad = new StreamingVad({
       sampleRate: 16_000,

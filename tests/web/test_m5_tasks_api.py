@@ -9,6 +9,7 @@ from starlette.requests import Request
 
 import apps.hexis_api as api
 from apps.hexis_api import app
+from services.m5_selection_service import M5SelectionService
 from services.m5_task_service import M5TaskService
 
 
@@ -55,6 +56,37 @@ async def _get_json(db_pool, path):
         api._pool = previous_pool
 
 
+async def _post_json(db_pool, path, body):
+    previous_pool = api._pool
+    api._pool = db_pool
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+            return await client.post(path, json=body)
+    finally:
+        api._pool = previous_pool
+
+
+async def _begin_selection(db_pool, origin, message):
+    return await M5SelectionService(db_pool).begin_pend_message(
+        origin_session_id=origin,
+        command_id=uuid4(),
+        authorization={
+            "origin_session_id": str(origin),
+            "input_turn_id": str(uuid4()),
+            "input_order": 2,
+            "stimulus_revision": 0,
+            "response_id": f"selection-response-{uuid4()}",
+            "supplier_response_id": f"selection-supplier-{uuid4()}",
+            "request_id": f"selection-event-{uuid4()}",
+            "actual_call_id": f"selection-call-{uuid4()}",
+        },
+        message=message,
+    )
+
+
 async def test_task_snapshot_is_scoped_and_returns_matching_event_cursor(db_pool):
     first_origin = await _origin(db_pool, "first")
     other_origin = await _origin(db_pool, "other")
@@ -79,6 +111,60 @@ async def test_task_snapshot_is_scoped_and_returns_matching_event_cursor(db_pool
             "pending": [],
         }
     ]
+
+
+async def test_snapshot_projects_open_selection_and_cursor_from_the_bound_origin(db_pool):
+    origin = await _origin(db_pool, "selection-snapshot")
+    task = await _submit(db_pool, origin, "selection-snapshot")
+    selection = await _begin_selection(db_pool, origin, "Continue with the next question.")
+
+    response = await _get_json(
+        db_pool, f"/api/m5/tasks?origin_session_id={origin}"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["event_cursor"] == {"m5-tasks": 2}
+    assert body["selections"] == [
+        {
+            "selection_id": selection["selection_id"],
+            "version": 1,
+            "message": "Continue with the next question.",
+        }
+    ]
+    assert body["tasks"][0]["task_id"] == task["task_id"]
+
+
+async def test_confirm_and_cancel_selection_routes_keep_origin_server_bound(db_pool):
+    confirm_origin = await _origin(db_pool, "selection-confirm-route")
+    confirm_task = await _submit(db_pool, confirm_origin, "selection-confirm-route")
+    confirmation = await _begin_selection(db_pool, confirm_origin, "Append this request.")
+
+    confirmed = await _post_json(
+        db_pool,
+        f"/api/m5/selections/{confirmation['selection_id']}/confirm",
+        {"version": confirmation["version"], "task_id": confirm_task["task_id"]},
+    )
+
+    assert confirmed.status_code == 200
+    assert confirmed.json()["accepted"] is True
+    assert confirmed.json()["task_id"] == confirm_task["task_id"]
+
+    cancel_origin = await _origin(db_pool, "selection-cancel-route")
+    cancellation = await _begin_selection(db_pool, cancel_origin, "Do not enqueue this request.")
+    cancelled = await _post_json(
+        db_pool,
+        f"/api/m5/selections/{cancellation['selection_id']}/cancel",
+        {"version": cancellation["version"]},
+    )
+
+    assert cancelled.status_code == 200
+    assert cancelled.json()["state"] == "selection_cancelled"
+    async with db_pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM m5_pending_messages WHERE command_id=$1::uuid",
+            cancellation["command_id"],
+        ) == 0
 
 
 async def test_task_snapshot_validates_origin_and_reports_inactive_source(db_pool):

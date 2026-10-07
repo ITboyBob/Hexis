@@ -29,7 +29,7 @@ import { Badge } from "../components/ui/badge";
 import { Spinner } from "../components/ui/spinner";
 import { normalizeMessagePresentation } from "../../lib/message-presentation";
 import type { MessagePresentation } from "../../lib/message-presentation";
-import type { M5Task, M5TaskSnapshot } from "../../lib/m5-tasks";
+import type { M5Task, M5TaskSelection, M5TaskSnapshot } from "../../lib/m5-tasks";
 import { isImageAttachmentFile, normalizeUploadFile } from "./attachment-helpers";
 import { AttachmentCard, type AttachmentKind } from "./attachment-card";
 import { MessagePresentationView } from "./message-presentation";
@@ -1027,6 +1027,7 @@ export default function ChatPage() {
   const [searchConfigNotice, setSearchConfigNotice] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [taskNavigation, setTaskNavigation] = useState<M5TaskNavigation | null>(null);
+  const [taskSelection, setTaskSelection] = useState<M5TaskSelection | null>(null);
   const [taskSessionLoading, setTaskSessionLoading] = useState(false);
   const [sessionActionBusy, setSessionActionBusy] = useState<"new" | "clear" | null>(null);
   const [sessionNotice, setSessionNotice] = useState<string | null>(null);
@@ -1848,6 +1849,13 @@ export default function ChatPage() {
     saveM5TaskNavigation(next);
     setTaskNavigation(next);
   }, [taskNavigation]);
+
+  const taskOriginSessionId = taskNavigation?.originSessionId || sessionId;
+  const taskSelectionForOrigin =
+    taskSelection &&
+    (!taskSelection.origin_session_id || taskSelection.origin_session_id === taskOriginSessionId)
+      ? taskSelection
+      : null;
 
   const handleClearChatContext = async () => {
     if (sending || sessionActionBusy) return;
@@ -2945,6 +2953,8 @@ export default function ChatPage() {
               <TalkMode
                 disabled={sending || taskSessionLoading || (taskNavigation?.taskSessionId === sessionId && taskNavigation.taskState === "working") || attachmentsPreparing || Boolean(input.trim()) || attachments.length > 0 || fileAttachments.length > 0}
                 sessionId={sessionId}
+                selectionOpen={Boolean(taskSelectionForOrigin)}
+                onSelectionOpened={setTaskSelection}
                 onSessionId={(nextSessionId) => {
                   saveSessionId(nextSessionId);
                   setSessionId(nextSessionId);
@@ -2966,11 +2976,13 @@ export default function ChatPage() {
                 rows={1}
               />
               <TaskList
-                originSessionId={taskNavigation?.originSessionId || sessionId}
+                originSessionId={taskOriginSessionId}
                 currentTaskSessionId={taskNavigation?.taskSessionId === sessionId ? taskNavigation.taskSessionId : null}
                 onOpenTask={handleOpenTask}
                 onReturnToOrigin={handleReturnToOrigin}
                 onSnapshot={handleTaskSnapshot}
+                selection={taskSelectionForOrigin}
+                onSelectionChange={setTaskSelection}
               />
               <button type="button" aria-label="Send message" title={attachmentsPreparing ? "Reading the attached file..." : "Send"} onClick={() => { void handleSend(); }} disabled={sending || taskSessionLoading || (taskNavigation?.taskSessionId === sessionId && taskNavigation.taskState === "working") || attachmentsPreparing || (!input.trim() && attachments.length === 0 && fileAttachments.length === 0)} className="flex h-10 w-10 flex-none items-center justify-center rounded-md bg-[var(--foreground)] text-white hover:bg-[var(--teal)] disabled:opacity-35">
                 <Send size={17} />

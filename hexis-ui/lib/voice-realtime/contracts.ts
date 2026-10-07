@@ -38,6 +38,15 @@ export type RealtimeClientMessage =
     }
   | {
       schema_version: 1;
+      type: "capture_suspend" | "capture_resume";
+      session_id: string;
+      media_session_id: string;
+      producer_seq: number;
+      capture_instance_id: string;
+      control_id: string;
+    }
+  | {
+      schema_version: 1;
       type: "control";
       session_id: string;
       media_session_id: string;
@@ -79,6 +88,30 @@ export type RealtimeServerMessage =
       producer_seq: number;
       cloud_session_id: string;
       instructions_hash: string;
+    }
+  | {
+      schema_version: 1;
+      type: "m5_selection_opened";
+      session_id: string;
+      media_session_id: string;
+      producer_seq: number;
+      selection: {
+        selection_id: string;
+        version: number;
+        message: string;
+        state: "open";
+        origin_session_id: string;
+      };
+    }
+  | {
+      schema_version: 1;
+      type: "capture_suspended" | "capture_resumed";
+      session_id: string;
+      media_session_id: string;
+      producer_seq: number;
+      capture_instance_id: string;
+      control_id: string;
+      discarded_range?: { start_frame: number; end_frame: number } | null;
     }
   | {
       schema_version: 1;

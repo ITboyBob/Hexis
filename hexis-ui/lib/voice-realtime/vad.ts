@@ -94,6 +94,8 @@ export class StreamingVad {
     if (!this.activeState) {
       if (!voiced) {
         this.updateNoiseFloor(block.samples);
+        // Rejected short speech still occupies frames in the pre-roll timeline.
+        for (const candidate of this.candidate) this.keepPreRoll(candidate);
         this.keepPreRoll(block);
         this.candidate = [];
         this.candidateFrameCount = 0;

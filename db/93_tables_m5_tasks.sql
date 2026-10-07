@@ -135,6 +135,36 @@ BEGIN
 END;
 $$;
 
+-- S10 adds one durable, user-confirmed target for each pend_message action.
+CREATE TABLE IF NOT EXISTS public.m5_selections (
+    selection_id UUID PRIMARY KEY,
+    command_id UUID NOT NULL UNIQUE
+        REFERENCES public.m5_actions(command_id) ON DELETE RESTRICT,
+    origin_session_id UUID NOT NULL
+        REFERENCES public.chat_sessions(id) ON DELETE RESTRICT,
+    actual_call_id TEXT NOT NULL
+        CHECK (NULLIF(btrim(actual_call_id), '') IS NOT NULL),
+    "authorization" JSONB NOT NULL
+        CHECK (jsonb_typeof("authorization") = 'object'),
+    message TEXT NOT NULL
+        CHECK (NULLIF(btrim(message), '') IS NOT NULL),
+    state TEXT NOT NULL DEFAULT 'open'
+        CHECK (state IN ('open', 'confirmed', 'cancelled', 'expired')),
+    chosen_task_id UUID,
+    version BIGINT NOT NULL DEFAULT 1 CHECK (version > 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT m5_selections_chosen_task_origin_fkey
+        FOREIGN KEY (chosen_task_id, origin_session_id)
+        REFERENCES public.m5_tasks(id, origin_session_id) ON DELETE RESTRICT,
+    CONSTRAINT m5_selections_chosen_task_state_check
+        CHECK ((state = 'confirmed') = (chosen_task_id IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_m5_selections_origin_state
+    ON public.m5_selections (origin_session_id, state)
+    WHERE state = 'open';
+
 CREATE INDEX IF NOT EXISTS idx_m5_work_task_started
     ON public.m5_work_rounds (task_id, started_at);
 

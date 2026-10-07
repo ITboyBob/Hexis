@@ -345,6 +345,19 @@ class VoiceRealtimeSessionRequest(BaseModel):
     tool_surface: Literal["m4", "m5"] = "m4"
 
 
+class M5SelectionConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(gt=0)
+    task_id: uuid.UUID
+
+
+class M5SelectionCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(gt=0)
+
+
 class WebPushKeys(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -2052,6 +2065,53 @@ async def get_m5_tasks(origin_session_id: uuid.UUID):
     return JSONResponse(snapshot)
 
 
+@app.post("/api/m5/selections/{selection_id}/confirm")
+async def confirm_m5_selection(
+    selection_id: uuid.UUID, req: M5SelectionConfirmRequest
+):
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    from services.m5_selection_service import M5SelectionService
+
+    try:
+        result = await M5SelectionService(pool).confirm_pend_message(
+            selection_id=selection_id,
+            version=req.version,
+            task_id=req.task_id,
+        )
+    except Exception:
+        logger.exception("Could not confirm M5 selection=%s", selection_id)
+        return JSONResponse(
+            {"error": "The task selection could not be confirmed."},
+            status_code=503,
+        )
+    return JSONResponse(result)
+
+
+@app.post("/api/m5/selections/{selection_id}/cancel")
+async def cancel_m5_selection(
+    selection_id: uuid.UUID, req: M5SelectionCancelRequest
+):
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    from services.m5_selection_service import M5SelectionService
+
+    try:
+        result = await M5SelectionService(pool).cancel_pend_message(
+            selection_id=selection_id,
+            version=req.version,
+        )
+    except Exception:
+        logger.exception("Could not cancel M5 selection=%s", selection_id)
+        return JSONResponse(
+            {"error": "The task selection could not be cancelled."},
+            status_code=503,
+        )
+    return JSONResponse(result)
+
+
 @app.get("/api/m5/tasks/events")
 async def m5_task_events(request: Request, origin_session_id: uuid.UUID):
     pool = _pool
@@ -3334,11 +3394,37 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                         return
                     if pending_voice_calls and not failed:
                         if session.response_has_output(response_id):
-                            raise RuntimeError("voice tool response also contained playable PCM")
-                        await session.release_response(response_id)
+                            from services.m5_tool_contracts import FRONTEND_TOOL_NAMES
+
+                            if not all(
+                                call.tool_surface == "m5" and call.name in FRONTEND_TOOL_NAMES
+                                for call in pending_voice_calls.values()
+                            ):
+                                raise RuntimeError("voice recall response also contained playable PCM")
+                            await send_server_message(
+                                {
+                                    "schema_version": 1,
+                                    "type": "generation",
+                                    "session_id": str(session.session_id),
+                                    "media_session_id": session.media_session_id,
+                                    "producer_seq": session._event_seq,
+                                    "response_id": response_id,
+                                    "playback_id": output["playback_id"],
+                                    "turn_id": output.get("turn_id"),
+                                    "output_epoch": output["output_epoch"],
+                                    "kind": "done",
+                                }
+                            )
+                            await session.mark_generation_done(
+                                output.get("input_turn_id", ""), response_id,
+                                final_for_turn=False,
+                            )
+                        else:
+                            await session.release_response(response_id)
                         from services.m5_tool_bridge import (
                             execute_bound_tool,
                             lightweight_memory_handlers,
+                            pend_message_handler,
                         )
                         from services.voice_recall import VoiceRecallService
                         from services.m5_task_service import M5TaskService
@@ -3412,6 +3498,24 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                                 },
                                 "error": None,
                             }
+
+                        async def open_pend_selection(result: dict[str, Any]) -> None:
+                            await send_server_message(
+                                {
+                                    "schema_version": 1,
+                                    "type": "m5_selection_opened",
+                                    "session_id": str(session.session_id),
+                                    "media_session_id": session.media_session_id,
+                                    "producer_seq": 0,
+                                    "selection": {
+                                        "selection_id": result["selection_id"],
+                                        "version": result["version"],
+                                        "message": result["message"],
+                                        "state": "open",
+                                        "origin_session_id": str(session.session_id),
+                                    },
+                                }
+                            )
 
                         for bound_call in pending_voice_calls.values():
                             session.validate_voice_tool_call(bound_call)
@@ -3489,7 +3593,13 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                                     stimulus_revision=bound_call.stimulus_revision,
                                 )
                             else:
-                                m5_handlers = {"submit": submit_m5_tool}
+                                m5_handlers = {
+                                    "submit": submit_m5_tool,
+                                    "pend_message": pend_message_handler(
+                                        _pool, open_pend_selection,
+                                        await_or_closed=session._await_or_closed,
+                                    ),
+                                }
                                 m5_handlers.update(
                                     lightweight_memory_handlers(_m5_lightweight_executor)
                                 )
@@ -3596,7 +3706,7 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
             try:
                 value = json.loads(raw)
                 message = parse_client_message(value)
-                transport.accept(message)
+                transport_result = transport.accept(message)
             except (json.JSONDecodeError, ValidationError, ClientTransportError) as exc:
                 await send_server_message(
                     {
@@ -3614,7 +3724,51 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                 close_reason = "error"
                 break
 
-            if message.type == "audio_chunk":
+            if message.type == "capture_suspend":
+                try:
+                    await session.client.clear_uncommitted_audio()
+                except Exception as exc:
+                    await send_server_message(
+                        {
+                            "schema_version": 1,
+                            "type": "error",
+                            "session_id": str(session.session_id),
+                            "media_session_id": session.media_session_id,
+                            "producer_seq": 0,
+                            "stage": "capture_suspend",
+                            "code": "provider_buffer_clear_failed",
+                            "message": f"Uncommitted voice input could not be cleared ({type(exc).__name__}). Stop Talk before choosing a task.",
+                            "recoverable": False,
+                        }
+                    )
+                    close_reason = "error"
+                    break
+                speech_open = False
+                await send_server_message(
+                    {
+                        "schema_version": 1,
+                        "type": "capture_suspended",
+                        "session_id": str(session.session_id),
+                        "media_session_id": session.media_session_id,
+                        "producer_seq": 0,
+                        "capture_instance_id": str(message.capture_instance_id),
+                        "control_id": str(message.control_id),
+                        "discarded_range": transport_result.get("discarded_range"),
+                    }
+                )
+            elif message.type == "capture_resume":
+                await send_server_message(
+                    {
+                        "schema_version": 1,
+                        "type": "capture_resumed",
+                        "session_id": str(session.session_id),
+                        "media_session_id": session.media_session_id,
+                        "producer_seq": 0,
+                        "capture_instance_id": str(message.capture_instance_id),
+                        "control_id": str(message.control_id),
+                    }
+                )
+            elif message.type == "audio_chunk":
                 if not speech_open:
                     speech_open = True
                     await session.emit_event(
@@ -3784,6 +3938,10 @@ async def _complete_ready_voice_turn(session: Any, input_turn_id: str) -> dict[s
                 "final_playback_id": terminal["playback_id"],
                 "final_output_epoch": terminal["output_epoch"],
                 "final_played_ms": terminal["played_ms"],
+                **({"played_response_texts": snapshot.get("played_response_texts", [])} if any(
+                    item["response_id"] != snapshot["final_response_id"]
+                    for item in snapshot.get("played_response_texts", [])
+                ) else {}),
             },
             media_session_id=session.media_session_id,
             response_ids=snapshot["response_ids"],
