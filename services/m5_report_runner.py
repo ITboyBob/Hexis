@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import asyncio
+import hashlib
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -10,11 +12,19 @@ from uuid import UUID
 
 from core.llm import normalize_llm_config, resolve_api_key
 from core.llm_config import load_llm_config
-from services.m5_report_receiver import M5ReportReceiver
+from services.m5_report_receiver import M5ReportReceiver, ReportDeliveryError
 from services.m5_tool_contracts import load_contract
-from services.m5_tool_contracts import parse_tool_arguments
+from services.m5_tool_contracts import (
+    M5ToolContractError,
+    decode_tool_arguments_object,
+    validate_tool_arguments_object,
+)
 
-from .m5_report_model import REPORT_TOOL_NAME, request_report_once
+from .m5_report_model import (
+    REPORT_TOOL_NAME,
+    request_report_once,
+    validate_report_config,
+)
 
 
 PROMPT_PATH = Path(__file__).with_name("prompts") / "m5_report.md"
@@ -131,19 +141,71 @@ class M5ReportRunner:
         self._pool = pool
         self._model_request = model_request
         self._receiver = M5ReportReceiver(pool, on_next_work=on_next_work)
+        self._on_next_work = on_next_work
 
     def set_next_work_callback(self, callback: Any) -> None:
+        self._on_next_work = callback
         self._receiver.set_next_work_callback(callback)
 
-    async def run_once(
-        self, report_id: UUID | str, config: Mapping[str, Any]
+    async def pending_report_ids(self, limit: int = 1) -> list[UUID]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT r.report_id
+                FROM public.m5_reports r
+                JOIN public.m5_tasks t ON t.id=r.task_id
+                JOIN public.m5_work_rounds w
+                  ON w.id=r.work_execution_id AND w.task_id=r.task_id
+                WHERE r.outcome='pending'
+                  AND t.product_state='working'
+                  AND t.current_work_execution_id=r.work_execution_id
+                  AND w.status IN ('completed','failed','unknown')
+                ORDER BY r.updated_at,r.report_id
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [row["report_id"] for row in rows]
+
+    async def stop_report(
+        self,
+        report_id: UUID | str,
+        *,
+        outcome: str,
+        code: str,
+        message: str,
+        actual_call_id: str | None = None,
     ) -> dict[str, Any]:
-        report_uuid = UUID(str(report_id))
+        async with self._pool.acquire() as conn:
+            raw = await conn.fetchval(
+                "SELECT public.finish_m5_report_terminal($1,$2,$3,$4,$5)",
+                UUID(str(report_id)),
+                outcome,
+                code,
+                message,
+                actual_call_id,
+            )
+        result = json.loads(raw) if isinstance(raw, str) else raw
+        self._wake_next_work(result)
+        return result
+
+    def _wake_next_work(self, result: Mapping[str, Any]) -> None:
+        round_result = result.get("round")
+        if (
+            self._on_next_work
+            and isinstance(round_result, Mapping)
+            and round_result.get("next_work_execution_id")
+        ):
+            self._on_next_work()
+
+    async def _report_state(self, report_id: UUID) -> dict[str, Any] | None:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT r.report_id,r.task_id,r.origin_session_id,r.work_execution_id,
-                       r.outcome,t.task_description,t.product_state,t.current_work_execution_id,
+                       r.outcome,r.failure_count,r.attempt_count,r.rejected_signatures,
+                       r.receiver_receipt,r.last_error,r.last_call_id,
+                       t.task_description,t.product_state,t.current_work_execution_id,
                        w.status AS work_status,w.result,w.error AS work_error
                 FROM public.m5_reports r
                 JOIN public.m5_tasks t ON t.id=r.task_id
@@ -151,76 +213,347 @@ class M5ReportRunner:
                   ON w.id=r.work_execution_id AND w.task_id=r.task_id
                 WHERE r.report_id=$1
                 """,
-                report_uuid,
+                report_id,
             )
-        if row is None or row["outcome"] != "pending":
-            raise ReportRunError("M5 report identity is missing or already terminal")
-        if (
-            row["work_status"] not in {"completed", "failed", "unknown"}
-            or row["product_state"] != "working"
-            or row["current_work_execution_id"] != row["work_execution_id"]
-        ):
-            raise ReportRunError("M5 report requires the bound work round to be terminal")
-        work_result = (
-            json.loads(row["result"])
-            if isinstance(row["result"], str)
-            else row["result"]
+        return dict(row) if row is not None else None
+
+    async def _record_failure(
+        self,
+        report_id: UUID,
+        *,
+        code: str,
+        message: str,
+        actual_call_id: str | None = None,
+        rejected_signature: str | None = None,
+    ) -> dict[str, Any]:
+        async with self._pool.acquire() as conn:
+            raw = await conn.fetchval(
+                "SELECT public.record_m5_report_failure($1,$2,$3,$4,$5)",
+                report_id,
+                code,
+                message,
+                actual_call_id,
+                rejected_signature,
+            )
+        result = json.loads(raw) if isinstance(raw, str) else raw
+        self._wake_next_work(result)
+        return result
+
+    @staticmethod
+    def _signature(tool_name: str, arguments: dict[str, Any]) -> str:
+        canonical = json.dumps(
+            {"tool": tool_name, "arguments": arguments},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
         )
-        if work_result is None:
-            work_result = {
-                "status": row["work_status"],
-                "error": row["work_error"],
-                "result": None,
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _tool_error(code: str, message: str, retryable: bool = False) -> str:
+        return json.dumps(
+            {
+                "ok": False,
+                "error": {"code": code, "message": message, "retryable": retryable},
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _receipt_for_call(
+        receipt: Any, actual_call_id: str | None = None
+    ) -> dict[str, Any]:
+        value = json.loads(receipt) if isinstance(receipt, str) else receipt
+        if not isinstance(value, dict):
+            return {"outcome": "delivered", "receiver_receipt": value}
+        original_call = value.get("actual_call_id")
+        if actual_call_id and actual_call_id != original_call:
+            return value | {
+                "receiver_actual_call_id": original_call,
+                "actual_call_id": actual_call_id,
+                "replayed": True,
             }
-        elif isinstance(work_result, dict):
-            work_result = dict(work_result) | {"status": row["work_status"]}
-        else:
-            raise ReportRunError("M5 report work result is not an object")
+        return value | {"replayed": False}
 
-        messages = build_report_messages(
-            row["task_description"],
-            work_result,
-            ["摘要只代表本轮真实结果，不表示持续任务整体完成。"],
-        )
-        tool = report_tool_definition()
-        raw_response = await self._model_request(config, messages, tool)
-        try:
-            choices = raw_response["choices"]
-            message = choices[0]["message"]
-            tool_calls = message["tool_calls"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise ReportRunError("M5 report response did not contain Function Calling") from exc
-        if not isinstance(message, dict):
-            raise ReportRunError("M5 report assistant message is malformed")
-        if message.get("role") != "assistant":
-            raise ReportRunError("M5 report response is not an assistant message")
-        if not isinstance(tool_calls, list) or len(tool_calls) != 1:
-            raise ReportRunError("M5 report requires exactly one Function Calling result")
-        call = tool_calls[0]
-        function = call.get("function") if isinstance(call, dict) else None
-        actual_call_id = call.get("id") if isinstance(call, dict) else None
-        if (
-            not isinstance(function, dict)
-            or function.get("name") != REPORT_TOOL_NAME
-            or not isinstance(actual_call_id, str)
-            or not actual_call_id.strip()
-        ):
-            raise ReportRunError("M5 report Function Calling identity is invalid")
-        raw_arguments = function.get("arguments")
-        try:
-            arguments = parse_tool_arguments(REPORT_TOOL_NAME, raw_arguments)
-        except Exception as exc:
-            raise ReportRunError("M5 report Function Calling arguments are invalid") from exc
-
-        receipt = await self._receiver.deliver(
-            row["report_id"],
-            row["origin_session_id"],
-            arguments["summary"],
-            actual_call_id,
-        )
+    async def _terminal_from_state(
+        self, row: Mapping[str, Any], *, actual_call_id: str | None = None
+    ) -> dict[str, Any]:
+        if row["outcome"] == "delivered":
+            return {
+                "outcome": "delivered",
+                "receipt": self._receipt_for_call(row["receiver_receipt"], actual_call_id),
+            }
+        last_error = row["last_error"]
+        if isinstance(last_error, str):
+            try:
+                last_error = json.loads(last_error)
+            except ValueError:
+                last_error = {"message": last_error}
         return {
-            "raw_response": raw_response,
-            "raw_tool_call": call,
-            "arguments": arguments,
-            "receipt": receipt,
+            "outcome": row["outcome"],
+            "code": last_error.get("code") if isinstance(last_error, dict) else None,
+            "error": last_error,
+            "failure_count": row["failure_count"],
+            "attempt_count": row["attempt_count"],
         }
+
+    async def run_once(
+        self, report_id: UUID | str, config: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        report_uuid = UUID(str(report_id))
+        messages: list[dict[str, Any]] | None = None
+        config_checked = False
+        while True:
+            row = await self._report_state(report_uuid)
+            if row is None:
+                raise ReportRunError("M5 report identity is unavailable")
+            if row["outcome"] != "pending":
+                return await self._terminal_from_state(row)
+            if not config_checked:
+                try:
+                    validate_report_config(config)
+                except (TypeError, ValueError) as exc:
+                    return await self.stop_report(
+                        report_uuid,
+                        outcome="refused",
+                        code="CONFIGURATION_INVALID",
+                        message=str(exc),
+                    )
+                config_checked = True
+            if (
+                row["work_status"] not in {"completed", "failed", "unknown"}
+                or row["product_state"] != "working"
+                or row["current_work_execution_id"] != row["work_execution_id"]
+            ):
+                raise ReportRunError("M5 report requires the bound work round to be terminal")
+            if row["failure_count"] >= 3:
+                return await self.stop_report(
+                    report_uuid,
+                    outcome="exhausted",
+                    code="RETRY_EXHAUSTED",
+                    message="The report failure budget is exhausted.",
+                    actual_call_id=row["last_call_id"],
+                )
+            if row["attempt_count"] >= 16:
+                return await self.stop_report(
+                    report_uuid,
+                    outcome="exhausted",
+                    code="TOOL_ATTEMPT_LIMIT",
+                    message="The report tool attempt budget is exhausted.",
+                    actual_call_id=row["last_call_id"],
+                )
+
+            work_result = (
+                json.loads(row["result"])
+                if isinstance(row["result"], str)
+                else row["result"]
+            )
+            if work_result is None:
+                work_result = {
+                    "status": row["work_status"],
+                    "error": row["work_error"],
+                    "result": None,
+                }
+            elif isinstance(work_result, dict):
+                work_result = dict(work_result) | {"status": row["work_status"]}
+            else:
+                raise ReportRunError("M5 report work result is not an object")
+            if messages is None:
+                messages = build_report_messages(
+                    row["task_description"],
+                    work_result,
+                    ["摘要只代表本轮真实结果，不表示持续任务整体完成。"],
+                )
+            try:
+                raw_response = await self._model_request(
+                    config, messages, report_tool_definition()
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                error_text = str(exc) or type(exc).__name__
+                code = (
+                    "MODEL_REQUEST_TIMEOUT"
+                    if isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+                    or "timeout" in error_text.lower()
+                    else "MODEL_REQUEST_FAILED"
+                )
+                result = await self._record_failure(
+                    report_uuid, code=code, message=error_text
+                )
+                if result.get("outcome") != "pending":
+                    return result
+                continue
+
+            try:
+                message = raw_response["choices"][0]["message"]
+                tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+            except (KeyError, IndexError, TypeError, AttributeError):
+                message = None
+                tool_calls = None
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                message = {"role": "assistant", "content": ""}
+                tool_calls = None
+            if not isinstance(tool_calls, list) or not tool_calls:
+                result = await self._record_failure(
+                    report_uuid,
+                    code="MISSING_TOOL_CALL",
+                    message="The report response did not contain Function Calling.",
+                )
+                if isinstance(message.get("content"), str) and message["content"]:
+                    messages.append({"role": "assistant", "content": message["content"]})
+                if result.get("outcome") != "pending":
+                    return result
+                continue
+            if len(tool_calls) != 1:
+                call_ids = [
+                    item.get("id") for item in tool_calls if isinstance(item, dict)
+                ]
+                return await self.stop_report(
+                    report_uuid,
+                    outcome="refused",
+                    code="TOOL_NOT_ALLOWED",
+                    message="The report response returned multiple tool calls.",
+                    actual_call_id=next((value for value in call_ids if isinstance(value, str)), None),
+                )
+
+            call = tool_calls[0]
+            function = call.get("function") if isinstance(call, dict) else None
+            actual_call_id = call.get("id") if isinstance(call, dict) else None
+            if not isinstance(function, dict):
+                result = await self._record_failure(
+                    report_uuid,
+                    code="INVALID_TOOL_CALL",
+                    message="The report tool call envelope was malformed.",
+                    actual_call_id=actual_call_id if isinstance(actual_call_id, str) else None,
+                )
+                if result.get("outcome") != "pending":
+                    return result
+                continue
+            tool_name = function.get("name")
+            if tool_name != REPORT_TOOL_NAME:
+                return await self.stop_report(
+                    report_uuid,
+                    outcome="refused",
+                    code="TOOL_NOT_ALLOWED",
+                    message=f"The report model called an unsupported tool: {tool_name}.",
+                    actual_call_id=actual_call_id if isinstance(actual_call_id, str) else None,
+                )
+            if not isinstance(actual_call_id, str) or not actual_call_id.strip():
+                result = await self._record_failure(
+                    report_uuid,
+                    code="MISSING_CALL_ID",
+                    message="The report tool call has no provider call_id.",
+                )
+                if result.get("outcome") != "pending":
+                    return result
+                continue
+
+            try:
+                arguments_object = decode_tool_arguments_object(function.get("arguments"))
+            except M5ToolContractError as exc:
+                result = await self._record_failure(
+                    report_uuid,
+                    code="INVALID_JSON",
+                    message=str(exc),
+                    actual_call_id=actual_call_id,
+                )
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": message.get("content"), "tool_calls": [call]},
+                        {
+                            "role": "tool",
+                            "tool_call_id": actual_call_id,
+                            "content": self._tool_error("INVALID_JSON", str(exc), True),
+                        },
+                    ]
+                )
+                if result.get("outcome") != "pending":
+                    return result
+                continue
+
+            async with self._pool.acquire() as conn:
+                raw_reservation = await conn.fetchval(
+                    "SELECT public.reserve_m5_report_attempt($1,$2)",
+                    report_uuid,
+                    actual_call_id,
+                )
+            reservation = json.loads(raw_reservation) if isinstance(raw_reservation, str) else raw_reservation
+            if not isinstance(reservation, dict) or not reservation.get("allowed"):
+                return await self.stop_report(
+                    report_uuid,
+                    outcome="exhausted",
+                    code=(reservation or {}).get("code", "TOOL_ATTEMPT_LIMIT"),
+                    message="The report tool attempt budget is exhausted.",
+                    actual_call_id=actual_call_id,
+                )
+
+            try:
+                arguments = validate_tool_arguments_object(REPORT_TOOL_NAME, arguments_object)
+            except M5ToolContractError as exc:
+                result = await self._record_failure(
+                    report_uuid,
+                    code="INVALID_ARGUMENTS",
+                    message=str(exc),
+                    actual_call_id=actual_call_id,
+                    rejected_signature=self._signature(REPORT_TOOL_NAME, arguments_object),
+                )
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": message.get("content"), "tool_calls": [call]},
+                        {
+                            "role": "tool",
+                            "tool_call_id": actual_call_id,
+                            "content": self._tool_error(result.get("code", "INVALID_ARGUMENTS"), str(exc), True),
+                        },
+                    ]
+                )
+                if result.get("outcome") != "pending":
+                    return result
+                continue
+
+            try:
+                receipt = await self._receiver.deliver(
+                    row["report_id"],
+                    row["origin_session_id"],
+                    arguments["summary"],
+                    actual_call_id,
+                )
+            except ReportDeliveryError as exc:
+                refreshed = await self._report_state(report_uuid)
+                if refreshed and refreshed["outcome"] == "delivered":
+                    return await self._terminal_from_state(
+                        refreshed, actual_call_id=actual_call_id
+                    )
+                if not exc.retryable:
+                    return await self.stop_report(
+                        report_uuid,
+                        outcome="refused",
+                        code=exc.code,
+                        message=str(exc),
+                        actual_call_id=actual_call_id,
+                    )
+                result = await self._record_failure(
+                    report_uuid,
+                    code=exc.code,
+                    message=str(exc),
+                    actual_call_id=actual_call_id,
+                )
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": message.get("content"), "tool_calls": [call]},
+                        {
+                            "role": "tool",
+                            "tool_call_id": actual_call_id,
+                            "content": self._tool_error(exc.code, str(exc), True),
+                        },
+                    ]
+                )
+                if result.get("outcome") != "pending":
+                    return result
+                continue
+
+            self._wake_next_work(receipt)
+            return {"outcome": "delivered", "receipt": receipt, "raw_response": raw_response}

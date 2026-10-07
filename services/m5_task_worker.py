@@ -111,6 +111,18 @@ class M5TaskWorker:
                 pass
 
     async def process_one(self) -> bool:
+        if self._report_runner is not None:
+            pending_reports = await self._report_runner.pending_report_ids(limit=1)
+            if pending_reports:
+                await self._run_report_by_id(pending_reports[0])
+                async with self._pool.acquire() as conn:
+                    report_outcome = await conn.fetchval(
+                        "SELECT outcome FROM public.m5_reports WHERE report_id=$1",
+                        pending_reports[0],
+                    )
+                self._idle_event.set()
+                return report_outcome != "pending"
+
         work_ids = await self._service.list_claimable_work(limit=1)
         if not work_ids:
             self._idle_event.set()
@@ -221,18 +233,37 @@ class M5TaskWorker:
             )
 
     async def _run_report_for_work(self, work_id: UUID) -> None:
+        async with self._pool.acquire() as conn:
+            report_id = await conn.fetchval(
+                "SELECT report_id FROM public.m5_reports WHERE work_execution_id=$1",
+                work_id,
+            )
+        if report_id is None:
+            raise RuntimeError("terminal M5 work has no durable report identity")
+        await self._run_report_by_id(report_id)
+
+    async def _run_report_by_id(self, report_id: UUID) -> None:
         try:
-            async with self._pool.acquire() as conn:
-                report_id = await conn.fetchval(
-                    "SELECT report_id FROM public.m5_reports WHERE work_execution_id=$1",
-                    work_id,
-                )
-            if report_id is None:
-                raise RuntimeError("completed M5 work has no durable report identity")
             config = await self._report_config_provider()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "M5 report configuration is unavailable for report=%s: %s",
+                report_id,
+                exc,
+            )
+            await self._report_runner.stop_report(
+                report_id,
+                outcome="refused",
+                code="CONFIGURATION_INVALID",
+                message=str(exc),
+            )
+            return
+        try:
             await self._report_runner.run_once(report_id, config)
         except asyncio.CancelledError:
             raise
         except Exception:
-            # The work row is already terminal. Report failures must never replay it.
-            logger.exception("M5 report attempt failed for completed work=%s", work_id)
+            # The work row is terminal; later report recovery never replays it.
+            logger.exception("M5 report attempt failed for report=%s", report_id)

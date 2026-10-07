@@ -102,6 +102,10 @@ async def lifespan(app: FastAPI):
                    AND to_regclass('public.m5_tasks') IS NOT NULL
                    AND to_regclass('public.m5_work_rounds') IS NOT NULL
                    AND to_regclass('public.m5_reports') IS NOT NULL
+                   AND to_regprocedure('public.deliver_m5_report(uuid,uuid,text,text)') IS NOT NULL
+                   AND to_regprocedure('public.reserve_m5_report_attempt(uuid,text)') IS NOT NULL
+                   AND to_regprocedure('public.record_m5_report_failure(uuid,text,text,text,text)') IS NOT NULL
+                   AND to_regprocedure('public.finish_m5_report_terminal(uuid,text,text,text,text)') IS NOT NULL
                 """
             )
         if m5_ready:

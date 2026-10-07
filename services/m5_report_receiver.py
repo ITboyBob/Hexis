@@ -10,6 +10,13 @@ from uuid import UUID
 class ReportDeliveryError(RuntimeError):
     """The report could not be accepted by its authoritative source chat."""
 
+    def __init__(
+        self, code: str, message: str | None = None, *, retryable: bool = False
+    ) -> None:
+        self.code = code
+        self.retryable = retryable
+        super().__init__(message or code)
+
 
 class M5ReportReceiver:
     def __init__(self, pool: Any, *, on_next_work: Callable[[], None] | None = None):
@@ -30,11 +37,11 @@ class M5ReportReceiver:
             report_uuid = UUID(str(report_id))
             origin_uuid = UUID(str(bound_origin))
         except (TypeError, ValueError) as exc:
-            raise ReportDeliveryError("report or origin identity is invalid") from exc
+            raise ReportDeliveryError("INVALID_REPORT_IDENTITY") from exc
         if not isinstance(summary, str) or not summary.strip():
-            raise ReportDeliveryError("report summary must not be blank")
+            raise ReportDeliveryError("INVALID_SUMMARY")
         if not isinstance(actual_call_id, str) or not actual_call_id.strip():
-            raise ReportDeliveryError("report call id must be preserved from the model")
+            raise ReportDeliveryError("MISSING_CALL_ID")
 
         async with self._pool.acquire() as conn:
             try:
@@ -48,12 +55,39 @@ class M5ReportReceiver:
                     )
             except Exception as exc:
                 message = str(exc).lower()
-                reason = "origin" if "origin" in message else "report delivery was rejected"
-                raise ReportDeliveryError(reason) from exc
+                if "origin does not match" in message or "task binding" in message:
+                    code = "TARGET_OWNERSHIP_MISMATCH"
+                    retryable = False
+                elif "origin session is unavailable" in message:
+                    code = "ORIGIN_SESSION_UNAVAILABLE"
+                    retryable = False
+                elif "report identity is unavailable" in message:
+                    code = "REPORT_NOT_FOUND"
+                    retryable = False
+                elif "work has not ended" in message:
+                    code = "WORK_NOT_TERMINAL"
+                    retryable = False
+                else:
+                    code = "DELIVERY_TEMPORARY_FAILURE"
+                    retryable = True
+                raise ReportDeliveryError(code, str(exc), retryable=retryable) from exc
 
         receipt = json.loads(raw) if isinstance(raw, str) else raw
         if not isinstance(receipt, dict) or receipt.get("outcome") != "delivered":
-            raise ReportDeliveryError("report receiver returned no accepted delivery receipt")
+            raise ReportDeliveryError(
+                "DELIVERY_TEMPORARY_FAILURE",
+                "report receiver returned no accepted delivery receipt",
+                retryable=True,
+            )
+        receiver_call_id = receipt.get("actual_call_id")
+        if receiver_call_id != actual_call_id:
+            receipt = receipt | {
+                "receiver_actual_call_id": receiver_call_id,
+                "actual_call_id": actual_call_id,
+                "replayed": True,
+            }
+        else:
+            receipt = receipt | {"replayed": False}
         if self._on_next_work and (receipt.get("round") or {}).get("next_work_execution_id"):
             self._on_next_work()
         return receipt

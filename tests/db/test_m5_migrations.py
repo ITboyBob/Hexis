@@ -297,3 +297,55 @@ async def test_m5_reports_forward_matches_baseline(db_pool, tmp_path):
             assert await _m5_s6_schema_snapshot(conn) == expected
         finally:
             await transaction.rollback()
+
+
+async def _m5_s7_function_snapshot(conn):
+    rows = await conn.fetch(
+        """
+        SELECT p.proname,pg_get_functiondef(p.oid)
+        FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+        WHERE n.nspname='public' AND p.proname IN (
+            'reserve_m5_report_attempt','record_m5_report_failure',
+            'finish_m5_report_terminal'
+        )
+        ORDER BY p.proname
+        """
+    )
+    return tuple(tuple(row.values()) for row in rows)
+
+
+async def test_m5_report_recovery_forward_matches_baseline(db_pool, tmp_path):
+    from core.migrations import apply_pending_migrations, migration_status
+
+    async with db_pool.acquire() as conn:
+        expected = await _m5_s7_function_snapshot(conn)
+        assert {row[0] for row in expected} == {
+            "finish_m5_report_terminal",
+            "record_m5_report_failure",
+            "reserve_m5_report_attempt",
+        }
+        transaction = conn.transaction()
+        await transaction.start()
+        try:
+            await conn.execute(
+                "DROP FUNCTION IF EXISTS public.finish_m5_report_terminal(uuid,text,text,text,text)"
+            )
+            await conn.execute(
+                "DROP FUNCTION IF EXISTS public.record_m5_report_failure(uuid,text,text,text,text)"
+            )
+            await conn.execute(
+                "DROP FUNCTION IF EXISTS public.reserve_m5_report_attempt(uuid,text)"
+            )
+            await conn.execute(
+                "DELETE FROM public.schema_migrations WHERE version=$1",
+                "0265_m5_report_recovery",
+            )
+            migration = _MIGRATIONS / "0265_m5_report_recovery.sql"
+            (tmp_path / migration.name).write_bytes(migration.read_bytes())
+            assert await apply_pending_migrations(conn, migrations_dir=tmp_path) == [
+                "0265_m5_report_recovery"
+            ]
+            assert (await migration_status(conn, migrations_dir=tmp_path))["pending"] == []
+            assert await _m5_s7_function_snapshot(conn) == expected
+        finally:
+            await transaction.rollback()

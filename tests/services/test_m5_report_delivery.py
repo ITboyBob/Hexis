@@ -68,13 +68,17 @@ async def test_report_delivery_binds_completed_work_origin_and_is_idempotent(db_
     summary = "核对订单金额任务本轮回复：金额为 18 元，计算依据已保存。"
 
     receipt = await receiver.deliver(report_id, origin, summary, "call-report-1")
-    replay = await receiver.deliver(report_id, origin, summary, "call-report-replay")
+    replay = await receiver.deliver(
+        report_id, origin, "新措辞不能覆盖已经接受的摘要。", "call-report-replay"
+    )
 
     assert receipt["outcome"] == "delivered"
     assert receipt["report_id"] == str(report_id)
     assert receipt["operation_id"] == str(report_id)
     assert receipt["actual_call_id"] == "call-report-1"
-    assert receipt == replay
+    assert replay["actual_call_id"] == "call-report-replay"
+    assert replay["receiver_actual_call_id"] == "call-report-1"
+    assert replay["replayed"] is True
     async with db_pool.acquire() as conn:
         saved = await conn.fetchrow(
             "SELECT count(*) AS messages, (array_agg(session_id))[1] AS session_id, min(content) AS content "
@@ -93,7 +97,7 @@ async def test_report_delivery_binds_completed_work_origin_and_is_idempotent(db_
     assert saved["content"] == summary
     assert report["outcome"] == "delivered"
     assert report["summary"] == summary
-    assert json.loads(report["receiver_receipt"]) == receipt
+    assert json.loads(report["receiver_receipt"])["actual_call_id"] == "call-report-1"
     assert state == "idle"
 
 
@@ -140,9 +144,27 @@ async def test_report_delivery_rejects_unfinished_or_unavailable_origin(db_pool)
         await receiver.deliver(report_id, origin, "摘要", "archived-call")
     async with db_pool.acquire() as conn:
         await conn.execute(
+            "UPDATE m5_reports SET outcome='refused' WHERE report_id=$1", report_id
+        )
+    await service.finish_m5_round(
+        task["task_id"],
+        task["work_execution_id"],
+        report_outcome="refused",
+    )
+    async with db_pool.acquire() as conn:
+        await conn.execute(
             "UPDATE m5_work_rounds SET status='failed',finished_at=clock_timestamp() WHERE id=$1",
             open_task["work_execution_id"],
         )
+        await conn.execute(
+            "UPDATE m5_reports SET outcome='refused' WHERE work_execution_id=$1",
+            open_task["work_execution_id"],
+        )
+    await service.finish_m5_round(
+        open_task["task_id"],
+        open_task["work_execution_id"],
+        report_outcome="refused",
+    )
 
 
 async def test_report_runner_requests_after_saved_work_and_delivers_real_tool_call(db_pool):
@@ -202,7 +224,7 @@ async def test_report_runner_requests_after_saved_work_and_delivers_real_tool_ca
 
 
 async def test_report_runner_rejects_plain_text_without_delivery(db_pool):
-    from services.m5_report_runner import M5ReportRunner, ReportRunError
+    from services.m5_report_runner import M5ReportRunner
 
     _, origin, _, report_id = await _completed_round(db_pool)
 
@@ -210,21 +232,22 @@ async def test_report_runner_rejects_plain_text_without_delivery(db_pool):
         return {"choices": [{"message": {"role": "assistant", "content": "已完成。"}}]}
 
     runner = M5ReportRunner(db_pool, model_request=plain_text)
-    with pytest.raises(ReportRunError, match="Function Calling"):
-        await runner.run_once(
-            report_id,
-            {
-                "provider": "openai-chat-completions-endpoint",
-                "model": "qwen-plus",
-                "endpoint": "https://selected.example/v1",
-                "api_key": "test-selected-key",
-                "timeout_seconds": 12,
-            },
-        )
+    result = await runner.run_once(
+        report_id,
+        {
+            "provider": "openai-chat-completions-endpoint",
+            "model": "qwen-plus",
+            "endpoint": "https://selected.example/v1",
+            "api_key": "test-selected-key",
+            "timeout_seconds": 12,
+        },
+    )
+    assert result["outcome"] == "exhausted"
+    assert result["code"] == "RETRY_EXHAUSTED"
     async with db_pool.acquire() as conn:
         assert await conn.fetchval(
             "SELECT outcome FROM m5_reports WHERE report_id=$1", report_id
-        ) == "pending"
+        ) == "exhausted"
         assert await conn.fetchval(
             "SELECT count(*) FROM chat_messages WHERE session_id=$1 AND source_message_id LIKE 'm5-report:%'",
             origin,

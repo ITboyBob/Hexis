@@ -105,17 +105,10 @@ def _require_traceable_source(tool_name: str, arguments: dict[str, Any]) -> None
             raise M5ToolContractError("source requires a non-empty ref or label")
 
 
-def parse_tool_arguments(tool_name: str, raw_arguments: str) -> dict[str, Any]:
-    """Parse one complete JSON object and validate schema and business qualifiers."""
+def decode_tool_arguments_object(raw_arguments: str) -> dict[str, Any]:
+    """Decode one complete JSON object while rejecting duplicate/invalid values."""
     if not isinstance(raw_arguments, str) or not raw_arguments.strip():
         raise M5ToolContractError("tool arguments must be a non-empty JSON object")
-    contract = load_contract()
-    definitions = {
-        item["function"]["name"]: item["function"]["parameters"]
-        for item in contract["tools"]
-    }
-    if tool_name not in definitions:
-        raise M5ToolContractError(f"unknown M5 tool: {tool_name}")
     try:
         arguments = json.loads(
             raw_arguments,
@@ -128,6 +121,22 @@ def parse_tool_arguments(tool_name: str, raw_arguments: str) -> dict[str, Any]:
         raise M5ToolContractError("tool arguments must be one complete JSON value") from exc
     if not isinstance(arguments, dict):
         raise M5ToolContractError("tool arguments must be a JSON object")
+    return arguments
+
+
+def validate_tool_arguments_object(
+    tool_name: str, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate an already-decoded object against schema and business rules."""
+    if not isinstance(arguments, dict):
+        raise M5ToolContractError("tool arguments must be a JSON object")
+    contract = load_contract()
+    definitions = {
+        item["function"]["name"]: item["function"]["parameters"]
+        for item in contract["tools"]
+    }
+    if tool_name not in definitions:
+        raise M5ToolContractError(f"unknown M5 tool: {tool_name}")
 
     validator = Draft202012Validator(
         definitions[tool_name], format_checker=FormatChecker()
@@ -142,6 +151,13 @@ def parse_tool_arguments(tool_name: str, raw_arguments: str) -> dict[str, Any]:
     _nonblank_strings(arguments)
     _require_traceable_source(tool_name, arguments)
     return arguments
+
+
+def parse_tool_arguments(tool_name: str, raw_arguments: str) -> dict[str, Any]:
+    """Parse one complete JSON object and validate schema and business qualifiers."""
+    return validate_tool_arguments_object(
+        tool_name, decode_tool_arguments_object(raw_arguments)
+    )
 
 
 def build_receipt(

@@ -51,6 +51,11 @@ def _resolved_selected_config(config: Mapping[str, Any]) -> dict[str, Any]:
     return normalized | {"timeout_seconds": float(timeout)}
 
 
+def validate_report_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate selected identity, endpoint, credential and configured timeout."""
+    return _resolved_selected_config(config)
+
+
 def _validate_report_tool(report_tool: Mapping[str, Any]) -> dict[str, Any]:
     tool = dict(report_tool)
     function = tool.get("function")
