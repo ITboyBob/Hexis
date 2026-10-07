@@ -16,6 +16,26 @@ from services.m5_task_service import M5TaskService
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
 
 
+async def test_cancelled_sse_returns_its_database_connection(db_pool):
+    """复现Starlette取消作用域中UNLISTEN打断后连接未归还。"""
+    import anyio
+    import asyncpg
+    from tests.utils import _db_dsn
+
+    origin = await _origin(db_pool, "cancelled-stream")
+    pool = await asyncpg.create_pool(_db_dsn(), min_size=1, max_size=1)
+    iterator = api._stream_m5_task_events(pool, origin, 0)
+    try:
+        assert "m5-connected" in await anext(iterator)
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await iterator.aclose()
+        async with pool.acquire(timeout=0.3) as conn:
+            assert await conn.fetchval("SELECT 1") == 1
+    finally:
+        pool.terminate()
+
+
 async def _origin(db_pool, label):
     async with db_pool.acquire() as conn:
         return await conn.fetchval(

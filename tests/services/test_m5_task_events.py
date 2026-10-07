@@ -89,19 +89,24 @@ async def test_pending_while_working_increments_revision_and_publishes_projectio
     origin = await _origin(db_pool, "pending")
     task = await _submit(service, origin, label="pending")
     command_id = uuid4()
+    authorization = _authorization(origin, task_id=task["task_id"], label="pending-message")
     receipt = await service.append_m5_message(
         origin,
         task["task_id"],
         command_id,
         "追加一条待处理要求",
-        _authorization(origin, task_id=task["task_id"], label="pending-message"),
+        authorization,
     )
     replay = await service.append_m5_message(
         origin,
         task["task_id"],
         command_id,
         "追加一条待处理要求",
-        _authorization(origin, task_id=task["task_id"], label="pending-replay"),
+        authorization,
+    )
+    conflict = await service.append_m5_message(
+        origin, task["task_id"], command_id, "追加一条待处理要求",
+        _authorization(origin, task_id=task["task_id"], label="different-call"),
     )
 
     page = await _events(db_pool, origin)
@@ -115,6 +120,8 @@ async def test_pending_while_working_increments_revision_and_publishes_projectio
         )
     assert receipt["accepted"] is True
     assert replay["replayed"] is True
+    assert conflict["accepted"] is False
+    assert conflict["error"]["code"] == "IDEMPOTENCY_CONFLICT"
     assert revision == 2
     assert pending_count == 1
     assert len(page["events"]) == 2

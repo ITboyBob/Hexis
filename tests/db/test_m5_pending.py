@@ -63,6 +63,7 @@ async def test_three_pending_messages_replay_once_and_claim_in_fifo_order(db_poo
         "最后将总价和依据合为一句中文。",
     ]
     command_ids = [uuid4() for _ in messages]
+    authorizations = [_authorization(origin, submitted["task_id"], f"pend-{index}") for index in range(1, 4)]
     accepted = []
     for index, (command_id, message) in enumerate(zip(command_ids, messages), 1):
         accepted.append(
@@ -71,7 +72,7 @@ async def test_three_pending_messages_replay_once_and_claim_in_fifo_order(db_poo
                 submitted["task_id"],
                 command_id,
                 message,
-                _authorization(origin, submitted["task_id"], f"pend-{index}"),
+                authorizations[index - 1],
             )
         )
     replay = await service.append_m5_message(
@@ -79,14 +80,14 @@ async def test_three_pending_messages_replay_once_and_claim_in_fifo_order(db_poo
         submitted["task_id"],
         command_ids[0],
         messages[0],
-        _authorization(origin, submitted["task_id"], "pend-replay"),
+        authorizations[0],
     )
     conflict = await service.append_m5_message(
         origin,
         submitted["task_id"],
         command_ids[0],
         "changed message for the same command",
-        _authorization(origin, submitted["task_id"], "pend-conflict"),
+        authorizations[0],
     )
     async with db_pool.acquire() as conn:
         other_origin = await _origin_session(conn)

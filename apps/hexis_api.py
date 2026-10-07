@@ -68,17 +68,34 @@ _pool: asyncpg.Pool | None = None
 _voice_realtime_registry: Any | None = None
 _voice_playback_watchdog: Any | None = None
 _m5_task_worker: Any | None = None
+_m5_acceptance_runtime_fingerprints: dict[str, str] | None = None
 _m5_lightweight_executor: Any | None = None
 
 
 def _dsn() -> str:
+    selected_run = os.environ.get("HEXIS_M5_ACCEPTANCE_RUN")
+    if selected_run:
+        from apps.m5_acceptance_probe import runtime_dsn
+
+        return runtime_dsn(selected_run)
     return db_dsn_from_env()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pool, _m5_task_worker, _m5_lightweight_executor
+    global _pool, _m5_task_worker, _m5_lightweight_executor, _m5_acceptance_runtime_fingerprints
     dsn = _dsn()
+    selected_run = os.environ.get("HEXIS_M5_ACCEPTANCE_RUN")
+    if selected_run:
+        from pathlib import Path
+        from apps.m5_acceptance_probe import _fingerprints, load_run
+
+        run, _ = load_run(selected_run)
+        _m5_acceptance_runtime_fingerprints = _fingerprints(Path(run["source_root"]))
+        if _m5_acceptance_runtime_fingerprints != run["source_fingerprints"]:
+            raise RuntimeError("M5 acceptance source fingerprints changed before API startup")
+    else:
+        _m5_acceptance_runtime_fingerprints = None
     # Bring the schema up to date on startup (advisory-locked, idempotent, no data loss).
     try:
         from core.agent_api import apply_migrations
@@ -123,9 +140,16 @@ async def lifespan(app: FastAPI):
                     "Marked %d interrupted M5 work round(s) unknown; they will not be rerun",
                     interrupted,
                 )
+            selected_run = os.environ.get("HEXIS_M5_ACCEPTANCE_RUN")
+            if selected_run:
+                from apps.m5_acceptance_probe import acceptance_report_request
+
+                report_runner = M5ReportRunner(_pool, model_request=acceptance_report_request(selected_run))
+            else:
+                report_runner = M5ReportRunner(_pool)
             _m5_task_worker = M5TaskWorker(
                 _pool,
-                report_runner=M5ReportRunner(_pool),
+                report_runner=report_runner,
                 report_config_provider=lambda: load_selected_report_config(_pool),
             )
             _m5_task_worker.start()
@@ -814,16 +838,30 @@ async def init_openai_codex_models():
 @app.get("/health")
 async def health():
     checks = {"db": False}
+    acceptance = None
     try:
         if _pool:
             async with _pool.acquire() as conn:
                 await conn.fetchval("SELECT 1")
+                selected_run = os.environ.get("HEXIS_M5_ACCEPTANCE_RUN")
+                if selected_run:
+                    from apps.m5_acceptance_probe import load_run
+
+                    run, _ = load_run(selected_run)
+                    acceptance = {
+                        "run_id": run["run_id"],
+                        "database": await conn.fetchval("SELECT current_database()"),
+                        "source_fingerprints": _m5_acceptance_runtime_fingerprints,
+                        "task_worker_running": bool(_m5_task_worker and _m5_task_worker.running),
+                        "lightweight_worker_running": bool(_m5_lightweight_executor and _m5_lightweight_executor.running),
+                    }
             checks["db"] = True
     except Exception:
         pass
     ok = all(checks.values())
     return JSONResponse(
-        {"status": "ok" if ok else "degraded", "checks": checks},
+        {"status": "ok" if ok else "degraded", "checks": checks,
+         **({"m5_acceptance": acceptance} if acceptance is not None else {})},
         status_code=200 if ok else 503,
     )
 
@@ -1069,7 +1107,13 @@ async def spotify_oauth_callback(request: Request):
 @app.get("/api/status")
 async def status():
     try:
-        payload = await status_payload_rich()
+        if os.environ.get("HEXIS_M5_ACCEPTANCE_RUN"):
+            payload = await status_payload_rich(dsn=_dsn())
+            if _pool:
+                async with _pool.acquire() as conn:
+                    payload["database"] = await conn.fetchval("SELECT current_database()")
+        else:
+            payload = await status_payload_rich()
         return JSONResponse(payload)
     except Exception as e:
         logger.error("Status failed: %s", e)
@@ -2221,11 +2265,15 @@ async def _stream_m5_task_events(
             {"message": "Task updates are temporarily unavailable."},
         )
     finally:
-        try:
-            await conn.remove_listener("m5_task_events", _on_notify)
-        except Exception:
-            logger.debug("Could not remove M5 task event listener", exc_info=True)
-        await pool.release(conn)
+        from anyio import CancelScope
+
+        with CancelScope(shield=True):
+            try:
+                await conn.remove_listener("m5_task_events", _on_notify)
+            except Exception:
+                logger.debug("Could not remove M5 task event listener", exc_info=True)
+            finally:
+                await pool.release(conn)
 
 
 @app.post("/api/heartbeat/run")
@@ -2927,7 +2975,20 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
                 stale_id,
             )
 
-    config = load_selected_config()
+    selected_realtime_path = os.environ.get("HEXIS_REALTIME_CONFIG")
+    if selected_realtime_path:
+        from pathlib import Path
+
+        try:
+            config = json.loads(Path(selected_realtime_path).read_text(encoding="utf-8"))
+            if not isinstance(config, dict) or any(
+                not config.get(key) for key in ("endpoint", "model", "api_key_env")
+            ):
+                raise ValueError("explicit realtime configuration is incomplete")
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail="The explicitly selected realtime configuration is unavailable or incomplete.") from exc
+    else:
+        config = load_selected_config()
     api_key = selected_env_value(config["api_key_env"])
     if not api_key:
         raise HTTPException(
@@ -2960,6 +3021,17 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
             session_id=req.session_id,
             stable_instructions=instructions,
         )
+        selected_run = os.environ.get("HEXIS_M5_ACCEPTANCE_RUN")
+        if selected_run and tool_surface == "m5":
+            from apps.m5_acceptance_probe import augment_evidence_hydration
+
+            original_hydrator = emotion_coordinator._hydrator
+
+            async def acceptance_hydrator(identity: Any, message: str) -> Any:
+                hydrated = await original_hydrator(identity, message)
+                return augment_evidence_hydration(selected_run, hydrated, req.session_id)
+
+            emotion_coordinator._hydrator = acceptance_hydrator
     except Exception as exc:
         raise HTTPException(
             status_code=503,
@@ -3041,12 +3113,17 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
         await session._response_dispatch(output)
 
     media_session_id = new_media_session_id()
+    connect_factory = _default_connect_factory
+    if os.environ.get("HEXIS_M5_ACCEPTANCE_RUN"):
+        from apps.m5_acceptance_probe import acceptance_connect_factory
+
+        connect_factory = acceptance_connect_factory(os.environ["HEXIS_M5_ACCEPTANCE_RUN"], connect_factory)
     client = QwenRealtimeClient(
         endpoint=config["endpoint"],
         model=config["model"],
         voice=config["voice"],
         api_key=api_key,
-        connect_factory=_default_connect_factory,
+        connect_factory=connect_factory,
     )
     session = VoiceRealtimeSession(
         session_id=req.session_id,
