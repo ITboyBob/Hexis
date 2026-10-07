@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "configuration_id": "voice-barge-in-playback-initial-v1",
+  "validation_status": "unvalidated",
+  "maximum_receipt_prefix_items": 256,
+  "recent_response_limit": 64,
+  "recent_response_retention_ms": 30000,
+  "settlement_timeout_ms": 5000,
+  "timeout_classification": "engineering_failure_boundary_not_experience_acceptance"
+}

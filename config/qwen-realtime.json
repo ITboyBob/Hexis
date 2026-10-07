@@ -1,0 +1,7 @@
+{
+  "endpoint": "wss://llm-n5dppxzleuxpia6o.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime",
+  "model": "qwen3.8-omni-flash-realtime",
+  "voice": "Tina",
+  "api_key_env": "DASHSCOPE_API_KEY",
+  "timeout": 30
+}

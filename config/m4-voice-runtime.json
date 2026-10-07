@@ -1,0 +1,11 @@
+{
+  "db_source": "hexis-env",
+  "memory_limit": 10,
+  "emotion": {
+    "provider": "openai-chat-completions-endpoint",
+    "model": "qwen-plus",
+    "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "api_key_env": "DASHSCOPE_API_KEY",
+    "timeout_ms": 1000
+  }
+}

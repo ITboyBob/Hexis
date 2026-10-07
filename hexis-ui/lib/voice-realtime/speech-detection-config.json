@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "configuration_id": "voice-barge-in-initial-v1",
+  "validation_status": "unvalidated",
+  "model": "v6",
+  "audio": {
+    "sample_rate": 16000,
+    "channels": 1,
+    "sample_format": "s16le",
+    "model_frame_samples": 512,
+    "model_context_samples": 64,
+    "model_state_shape": [
+      2,
+      1,
+      128
+    ]
+  },
+  "capture": {
+    "pre_roll_ms": 240,
+    "silence_threshold_ms": 520,
+    "active_probability_threshold": 0.45,
+    "candidate_reject_window_frames": 3,
+    "candidate_reject_probability_threshold": 0.6,
+    "candidate_buffer_limit_ms": 1000
+  },
+  "input_gate": {
+    "probability_threshold": 0.6,
+    "window_frames": 3,
+    "minimum_positive_frames": 2
+  },
+  "barge_in_gate": {
+    "normal": {
+      "probability_threshold": 0.8,
+      "window_frames": 6,
+      "minimum_positive_frames": 5,
+      "require_current_frame": true
+    },
+    "fast": {
+      "probability_threshold": 0.95,
+      "window_frames": 4,
+      "minimum_positive_frames": 3,
+      "require_current_frame": true
+    }
+  },
+  "worker": {
+    "execution_provider": "wasm",
+    "num_threads": 1,
+    "proxy": false,
+    "maximum_queued_audio_ms": 256,
+    "initialization_timeout_ms": 30000
+  }
+}

@@ -4,7 +4,7 @@ FROM node:20-slim AS builder
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends openssl \
     && rm -rf /var/lib/apt/lists/*
-WORKDIR /app
+WORKDIR /workspace/hexis-ui
 ENV NEXT_TELEMETRY_DISABLED=1
 COPY hexis-ui/package.json hexis-ui/package-lock.json ./
 RUN npm ci --ignore-scripts
@@ -13,7 +13,7 @@ COPY services/prompts/ /services/prompts/
 COPY characters/ /characters/
 ENV HEXIS_PROMPTS_DIR=/services/prompts
 ENV HEXIS_CHARACTERS_DIR=/characters
-RUN npx prisma generate && npm run build
+RUN npm run prepare:voice-vad-assets && npx prisma generate && npm run build
 
 FROM node:20-slim
 # libssl is required at runtime by the Prisma query engine.
@@ -25,9 +25,9 @@ ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV HEXIS_PROMPTS_DIR=/services/prompts
 ENV HEXIS_CHARACTERS_DIR=/characters
-COPY --from=builder /app/.next/standalone ./
-COPY --from=builder /app/.next/static ./.next/static
-COPY --from=builder /app/public ./public
+COPY --from=builder /workspace/hexis-ui/.next/standalone ./
+COPY --from=builder /workspace/hexis-ui/.next/static ./.next/static
+COPY --from=builder /workspace/hexis-ui/public ./public
 COPY --from=builder /services/prompts /services/prompts
 COPY --from=builder /characters /characters
 EXPOSE 3477

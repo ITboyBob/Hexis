@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "configuration_id": "voice-barge-in-audio-cases-v1",
+  "dataset_status": "incomplete",
+  "notes": [
+    "长期场景规范在仓库；实际音频及单次验证证据在运行时显式绑定。",
+    "noise.wav是带噪人声正例，interrupt.wav是长句，不能冒充纯噪音或单字停。",
+    "按原始录音拆分调参集和验收集，TTS不能证明用户现场体验。"
+  ],
+  "cases": [
+    {
+      "id": "pure_environment_noise",
+      "category": "non_speech",
+      "expected_input": false,
+      "expected_barge_in": false,
+      "audio_source_status": "to_be_bound",
+      "audio_asset": null
+    },
+    {
+      "id": "ordinary_chinese_speech",
+      "category": "speech",
+      "expected_input": true,
+      "expected_barge_in": true,
+      "audio_source_status": "bound_tuning_and_acceptance_tts_only",
+      "audio_asset": "/Users/itboybob/.cache/hexis/voice-barge-in/audio/manifest.json#ordinary_chinese_speech"
+    },
+    {
+      "id": "short_stop_instruction",
+      "category": "short_speech",
+      "expected_input": true,
+      "expected_barge_in": true,
+      "audio_source_status": "to_be_bound",
+      "audio_asset": null
+    },
+    {
+      "id": "quiet_speech",
+      "category": "speech",
+      "expected_input": true,
+      "expected_barge_in": true,
+      "audio_source_status": "to_be_bound",
+      "audio_asset": null
+    },
+    {
+      "id": "speech_with_noise",
+      "category": "speech",
+      "expected_input": true,
+      "expected_barge_in": true,
+      "audio_source_status": "bound_tuning_only",
+      "audio_asset": "/Users/itboybob/.cache/hexis/voice-barge-in/audio/manifest.json#speech_with_noise"
+    },
+    {
+      "id": "rejected_candidate_then_speech",
+      "category": "sequence",
+      "expected_input": true,
+      "expected_barge_in": true,
+      "audio_source_status": "to_be_bound",
+      "audio_asset": null
+    }
+  ],
+  "split_policy": "by_original_recording",
+  "human_acceptance_metrics": null
+}

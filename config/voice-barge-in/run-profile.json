@@ -1,0 +1,57 @@
+{
+  "schema_version": 2,
+  "profile_id": "voice-barge-in-local-v2",
+  "status": "planned_not_activated",
+  "path_base": "repository_root",
+  "ui_url": "http://127.0.0.1:3477",
+  "api_url": "http://127.0.0.1:43817",
+  "realtime_config": "config/qwen-realtime.json",
+  "runtime_config": "config/m4-voice-runtime.json",
+  "detection_config": "hexis-ui/lib/voice-realtime/speech-detection-config.json",
+  "asset_manifest": "hexis-ui/lib/voice-realtime/vad-assets-manifest.json",
+  "playback_coordination_config": "config/voice-barge-in/playback-coordination.json",
+  "audio_case_spec": "config/voice-barge-in/audio-cases.json",
+  "database": {
+    "pytest_service": "pytest-db",
+    "talk_service": "talk-db",
+    "user_env": "POSTGRES_USER",
+    "password_env": "POSTGRES_PASSWORD",
+    "admin_database": "postgres"
+  },
+  "runtime_environment": {
+    "api_environment_record_env": "HEXIS_VOICE_BARGE_IN_ENV",
+    "api_start_record_env": "HEXIS_VOICE_BARGE_IN_API_START_RECORD",
+    "ui_database_url_env": "HEXIS_DATABASE_URL",
+    "ui_database_url_compat_env": "DATABASE_URL",
+    "ui_api_url_env": "HEXIS_API_URL"
+  },
+  "credentials_policy": "values_only_in_environment",
+  "record_outputs": {
+    "base": "hexis_cache_directory",
+    "environment_record": "voice-barge-in/environments/<env-id>/environment.json",
+    "worker_run_record": "voice-barge-in/ui-runs/<run-id>-worker.json",
+    "talk_ui_run_record": "voice-barge-in/ui-runs/<run-id>-talk.json",
+    "api_start_record": "voice-barge-in/api-runs/<run-id>.json",
+    "selection_directory": "voice-barge-in/selections",
+    "audio_manifest": "voice-barge-in/audio/manifest.json",
+    "evidence_directory": "voice-barge-in/evidence"
+  },
+  "browser": {
+    "inspection": "in_app",
+    "automation": "playwright_chrome",
+    "headless": false,
+    "sprint_usage": {
+      "S1": ["inspection"],
+      "S2": ["inspection", "automation"],
+      "S3": [],
+      "S4": ["inspection"],
+      "S5": ["automation"],
+      "S6": ["inspection"]
+    }
+  },
+  "notes": [
+    "长期配置与场景规范在仓库；每次运行身份、指纹、DB实例及证据作为临时记录。",
+    "schema_version 2 显式选择隔离数据库、运行时地址环境变量及每个 Sprint 的浏览器用途。",
+    "数据库密码和云凭据只从环境读取，不写入 profile、E1、W1、U1 或 C3。"
+  ]
+}

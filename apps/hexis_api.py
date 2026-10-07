@@ -29,6 +29,8 @@ import time
 import uuid
 import urllib.parse
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
 import asyncpg
@@ -70,22 +72,114 @@ _voice_playback_watchdog: Any | None = None
 _m5_task_worker: Any | None = None
 _m5_acceptance_runtime_fingerprints: dict[str, str] | None = None
 _m5_lightweight_executor: Any | None = None
+_voice_barge_in_environment: dict[str, Any] | None = None
+_voice_barge_in_start_record: dict[str, Any] | None = None
+
+
+def _should_start_m5_background_workers(voice_barge_in_selected: bool) -> bool:
+    return not voice_barge_in_selected
 
 
 def _dsn() -> str:
     selected_run = os.environ.get("HEXIS_M5_ACCEPTANCE_RUN")
+    selected_voice_run = os.environ.get("HEXIS_VOICE_BARGE_IN_ENV")
+    if selected_run and selected_voice_run:
+        raise RuntimeError("HEXIS_M5_ACCEPTANCE_RUN and HEXIS_VOICE_BARGE_IN_ENV cannot be active together")
     if selected_run:
         from apps.m5_acceptance_probe import runtime_dsn
 
         return runtime_dsn(selected_run)
+    if selected_voice_run:
+        from apps.voice_barge_in_environment import runtime_dsn_from_environment_record
+
+        global _voice_barge_in_environment
+        dsn, _voice_barge_in_environment = runtime_dsn_from_environment_record(selected_voice_run, dict(os.environ))
+        return dsn
     return db_dsn_from_env()
+
+
+def _voice_barge_in_api_start_record_path(environment_record_path: str) -> Path:
+    record_path = Path(environment_record_path).expanduser().resolve()
+    cache_root = record_path.parent.parent.parent.parent
+    api_runs = (cache_root / "voice-barge-in" / "api-runs").resolve()
+    output = Path(os.environ.get("HEXIS_VOICE_BARGE_IN_API_START_RECORD", "")).expanduser().resolve()
+    if not output.is_relative_to(api_runs) or output == api_runs:
+        raise RuntimeError("HEXIS_VOICE_BARGE_IN_API_START_RECORD must select a new file under the M6 api-runs cache directory")
+    if output.exists():
+        raise RuntimeError("selected API start record already exists; choose a new output path")
+    return output
+
+
+def _write_voice_barge_in_api_start_record(
+    record_path: Path,
+    environment_record: dict[str, Any],
+    database_identity: dict[str, Any],
+) -> dict[str, Any]:
+    source_root = Path(environment_record["repository_root"])
+    config_paths = {
+        "C1": "hexis-ui/lib/voice-realtime/speech-detection-config.json",
+        "C2": "hexis-ui/lib/voice-realtime/vad-assets-manifest.json",
+        "C4": "config/m4-voice-runtime.json",
+        "C5": "config/qwen-realtime.json",
+        "C6": "config/voice-barge-in/run-profile.json",
+        "C7": "config/voice-barge-in/playback-coordination.json",
+        "C8": "config/voice-barge-in/audio-cases.json",
+    }
+    fingerprints = {}
+    for label, relative in config_paths.items():
+        file_path = source_root / relative
+        if not file_path.is_file():
+            raise RuntimeError(f"M6 API startup configuration {label} is missing: {relative}")
+        fingerprints[label] = hashlib.sha256(file_path.read_bytes()).hexdigest()
+    environment_id = environment_record["env_id"]
+    listen_host = os.environ.get("HEXIS_VOICE_BARGE_IN_LISTEN_HOST", "127.0.0.1")
+    listen_port = int(os.environ.get("HEXIS_VOICE_BARGE_IN_LISTEN_PORT", "43817"))
+    record = {
+        "schema_version": 1,
+        "environment_id": environment_id,
+        "start_id": str(uuid.uuid4()),
+        "pid": os.getpid(),
+        "start_time": datetime.now(timezone.utc).isoformat(),
+        "source": {"repository_root": str(source_root), "head": environment_record["head"]},
+        "source_clone": {
+            key: environment_record.get("source_clone", {}).get(key)
+            for key in (
+                "container_id",
+                "database",
+                "source_image_digest",
+                "dump_sha256",
+                "row_count_fingerprint",
+                "source_data_fingerprint",
+                "target_data_fingerprint",
+                "agent_status_fingerprint",
+            )
+            if environment_record.get("source_clone", {}).get(key) is not None
+        },
+        "config_fingerprints": fingerprints,
+        "actual_current_database": database_identity["database"],
+        "actual_server_address_and_port": {
+            "address": database_identity["server_address"],
+            "port": database_identity["server_port"],
+        },
+        "endpoints": {"api_host": listen_host, "api_port": listen_port, "health": "/health", "voice_realtime": "/api/voice/realtime"},
+        "status": "started",
+    }
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(record_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(record, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+    return record
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pool, _m5_task_worker, _m5_lightweight_executor, _m5_acceptance_runtime_fingerprints
+    global _pool, _m5_task_worker, _m5_lightweight_executor, _m5_acceptance_runtime_fingerprints, _voice_barge_in_start_record
     dsn = _dsn()
     selected_run = os.environ.get("HEXIS_M5_ACCEPTANCE_RUN")
+    selected_voice_run = os.environ.get("HEXIS_VOICE_BARGE_IN_ENV")
+    if selected_voice_run:
+        _voice_barge_in_api_start_record_path(selected_voice_run)
     if selected_run:
         from pathlib import Path
         from apps.m5_acceptance_probe import _fingerprints, load_run
@@ -106,12 +200,28 @@ async def lifespan(app: FastAPI):
                 "Applied %d schema migration(s) on startup: %s", len(applied), applied
             )
     except Exception as exc:
+        if selected_voice_run:
+            raise RuntimeError(f"M6 selected database migration failed; API startup is blocked: {exc}") from exc
         logger.warning("Startup migration check failed (continuing): %s", exc)
     _min, _max = pool_sizes_from_env(2, 10)
     _pool = await asyncpg.create_pool(dsn, min_size=_min, max_size=_max)
     from core.usage import set_usage_pool
 
     set_usage_pool(_pool)
+    if selected_voice_run:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT current_database() AS database, inet_server_addr()::text AS server_address, inet_server_port() AS server_port"
+            )
+        _voice_barge_in_start_record = _write_voice_barge_in_api_start_record(
+            _voice_barge_in_api_start_record_path(selected_voice_run),
+            _voice_barge_in_environment or {},
+            {
+                "database": row["database"],
+                "server_address": row["server_address"],
+                "server_port": row["server_port"],
+            },
+        )
     try:
         async with _pool.acquire() as conn:
             m5_ready = await conn.fetchval(
@@ -126,7 +236,7 @@ async def lifespan(app: FastAPI):
                    AND to_regprocedure('public.finish_m5_report_terminal(uuid,text,text,text,text)') IS NOT NULL
                 """
             )
-        if m5_ready:
+        if m5_ready and _should_start_m5_background_workers(bool(selected_voice_run)):
             from services.m5_task_service import M5TaskService
             from services.m5_task_worker import M5TaskWorker
             from services.m5_report_runner import (
@@ -191,6 +301,8 @@ async def lifespan(app: FastAPI):
             except Exception:
                 _m5_lightweight_executor = None
                 logger.exception("M5 lightweight memory executor could not start")
+        elif selected_voice_run:
+            logger.info("M6 cloned database selected; M5 background workers are not started")
         else:
             logger.warning("M5 task worker is disabled because the M5 schema is unavailable")
     except Exception:
@@ -858,9 +970,19 @@ async def health():
             checks["db"] = True
     except Exception:
         pass
+    voice_barge_in = None
+    if _voice_barge_in_environment and _voice_barge_in_start_record:
+        voice_barge_in = {
+            "environment_id": _voice_barge_in_start_record["environment_id"],
+            "start_id": _voice_barge_in_start_record["start_id"],
+            "database": _voice_barge_in_start_record["actual_current_database"],
+            "server_address_and_port": _voice_barge_in_start_record["actual_server_address_and_port"],
+            "status": _voice_barge_in_start_record["status"],
+        }
     ok = all(checks.values())
     return JSONResponse(
         {"status": "ok" if ok else "degraded", "checks": checks,
+         **({"voice_barge_in": voice_barge_in} if voice_barge_in is not None else {}),
          **({"m5_acceptance": acceptance} if acceptance is not None else {})},
         status_code=200 if ok else 503,
     )

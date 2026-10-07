@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "configuration_id": "voice-barge-in-assets-v1",
+  "delivery_status": "materialized",
+  "path_base": "repository_root",
+  "primary_model": "silero_vad_v6.onnx",
+  "comparison_model": "silero_vad_v5.onnx",
+  "packages": [
+    {
+      "name": "@ricky0123/vad-web",
+      "version": "0.0.31",
+      "tarball_url": "https://registry.npmjs.org/@ricky0123/vad-web/-/vad-web-0.0.31.tgz",
+      "registry_integrity": "sha512-ePVq8TvB21sdHSxVMZOEIf9JVa7MAYpaIaNXeGgsPOiMCN8xbPCdF2LS5aYj7VRR3ZxzutedgV9ZplV65IA1Fg==",
+      "archive_sha256": "d1a211cf1a2ed26297da52cc08de79e75d79838a274bfc6de546feb1f828c940",
+      "license": "ISC"
+    },
+    {
+      "name": "onnxruntime-web",
+      "version": "1.22.0",
+      "tarball_url": "https://registry.npmjs.org/onnxruntime-web/-/onnxruntime-web-1.22.0.tgz",
+      "registry_integrity": "sha512-Ud/+EBo6mhuaQWt/OjaOk0iNWjXqJoeeMFr6xQEERZdIZH2OWpGzuujz7lfuOBjUa6TEE/sc4nb7Da5dNL34fg==",
+      "archive_sha256": "e293551f9d36d003e293d0f2937fee7b3dfdcef76d71d1449b55e2d4157c7aea",
+      "license": "MIT"
+    }
+  ],
+  "assets": [
+    {
+      "id": "silero_vad_v6.onnx",
+      "role": "primary",
+      "package": "@ricky0123/vad-web",
+      "package_version": "0.0.31",
+      "source_member": "dist/silero_vad_v6.onnx",
+      "target_relative_path": "hexis-ui/public/voice-realtime/vad-assets/models/silero_vad_v6.onnx",
+      "url_path": "/voice-realtime/vad-assets/models/silero_vad_v6.onnx",
+      "bytes": 2327524,
+      "sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+    },
+    {
+      "id": "silero_vad_v5.onnx",
+      "role": "comparison",
+      "package": "@ricky0123/vad-web",
+      "package_version": "0.0.31",
+      "source_member": "dist/silero_vad_v5.onnx",
+      "target_relative_path": "hexis-ui/public/voice-realtime/vad-assets/models/silero_vad_v5.onnx",
+      "url_path": "/voice-realtime/vad-assets/models/silero_vad_v5.onnx",
+      "bytes": 2327524,
+      "sha256": "2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f"
+    },
+    {
+      "id": "ort.wasm.min.mjs",
+      "role": "primary",
+      "package": "onnxruntime-web",
+      "package_version": "1.22.0",
+      "source_member": "dist/ort.wasm.min.mjs",
+      "target_relative_path": "hexis-ui/public/voice-realtime/vad-assets/ort-1.22.0/ort.wasm.min.mjs",
+      "url_path": "/voice-realtime/vad-assets/ort-1.22.0/ort.wasm.min.mjs",
+      "bytes": 48259,
+      "sha256": "6ef726f355b791129f7ddf3f62e7877a16b9b777abe87004b8ab306e6b9cf265"
+    },
+    {
+      "id": "ort-wasm-simd-threaded.mjs",
+      "role": "primary",
+      "package": "onnxruntime-web",
+      "package_version": "1.22.0",
+      "source_member": "dist/ort-wasm-simd-threaded.mjs",
+      "target_relative_path": "hexis-ui/public/voice-realtime/vad-assets/ort-1.22.0/ort-wasm-simd-threaded.mjs",
+      "url_path": "/voice-realtime/vad-assets/ort-1.22.0/ort-wasm-simd-threaded.mjs",
+      "bytes": 20856,
+      "sha256": "30dd851d9c00622940500f71ddd2ff8820c5cb65270816080175b958705385a8"
+    },
+    {
+      "id": "ort-wasm-simd-threaded.wasm",
+      "role": "primary",
+      "package": "onnxruntime-web",
+      "package_version": "1.22.0",
+      "source_member": "dist/ort-wasm-simd-threaded.wasm",
+      "target_relative_path": "hexis-ui/public/voice-realtime/vad-assets/ort-1.22.0/ort-wasm-simd-threaded.wasm",
+      "url_path": "/voice-realtime/vad-assets/ort-1.22.0/ort-wasm-simd-threaded.wasm",
+      "bytes": 11210254,
+      "sha256": "71aef04959c5c1b6de461b6538e2058e306610034a85aad2742d0c7fd4533fe4"
+    }
+  ],
+  "notes": [
+    "模型与ORT资源哈希已校验；当前只落盘长期配置，public运行资源仍由S1准备。",
+    "JS、MJS与WASM必须来自同一ORT版本，不依赖个人缓存作为产品运行路径。"
+  ],
+  "model_license": {
+    "name": "MIT",
+    "source_url": "https://raw.githubusercontent.com/snakers4/silero-vad/1e261b036686cd0017d500ee96acd1c4ba572a9d/LICENSE",
+    "text_sha256": "2e63e9a38b6e8fc0c7bc37ce174caca1862870856c6daf5697cfb785e925520b"
+  },
+  "materialized_assets": [
+    {
+      "id": "silero_vad_v6.onnx",
+      "target_relative_path": "hexis-ui/public/voice-realtime/vad-assets/models/silero_vad_v6.onnx",
+      "bytes": 2327524,
+      "sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+    },
+    {
+      "id": "silero_vad_v5.onnx",
+      "target_relative_path": "hexis-ui/public/voice-realtime/vad-assets/models/silero_vad_v5.onnx",
+      "bytes": 2327524,
+      "sha256": "2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f"
+    },
+    {
+      "id": "ort.wasm.min.mjs",
+      "target_relative_path": "hexis-ui/public/voice-realtime/vad-assets/ort-1.22.0/ort.wasm.min.mjs",
+      "bytes": 48259,
+      "sha256": "6ef726f355b791129f7ddf3f62e7877a16b9b777abe87004b8ab306e6b9cf265"
+    },
+    {
+      "id": "ort-wasm-simd-threaded.mjs",
+      "target_relative_path": "hexis-ui/public/voice-realtime/vad-assets/ort-1.22.0/ort-wasm-simd-threaded.mjs",
+      "bytes": 20856,
+      "sha256": "30dd851d9c00622940500f71ddd2ff8820c5cb65270816080175b958705385a8"
+    },
+    {
+      "id": "ort-wasm-simd-threaded.wasm",
+      "target_relative_path": "hexis-ui/public/voice-realtime/vad-assets/ort-1.22.0/ort-wasm-simd-threaded.wasm",
+      "bytes": 11210254,
+      "sha256": "71aef04959c5c1b6de461b6538e2058e306610034a85aad2742d0c7fd4533fe4"
+    }
+  ]
+}

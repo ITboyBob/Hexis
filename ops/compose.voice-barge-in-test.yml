@@ -1,0 +1,50 @@
+services:
+  pytest-db:
+    image: ${VOICE_BARGE_IN_DB_IMAGE:?Set the verified source database image digest}
+    pull_policy: never
+    restart: "no"
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in the shell}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the shell}
+    labels:
+      com.hexis.voice-barge-in.owner: ${VOICE_BARGE_IN_ENV_ID:?Set VOICE_BARGE_IN_ENV_ID}
+      com.hexis.voice-barge-in.scope: pytest
+    ports:
+      - 127.0.0.1:${VOICE_BARGE_IN_PYTEST_DB_PORT:?Set VOICE_BARGE_IN_PYTEST_DB_PORT}:5432
+    volumes:
+      - pytest_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
+    command: ["postgres", "-c", "search_path=public,ag_catalog", "-c", "jit=off"]
+
+  talk-db:
+    image: ${VOICE_BARGE_IN_DB_IMAGE:?Set the verified source database image digest}
+    pull_policy: never
+    restart: "no"
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in the shell}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the shell}
+    labels:
+      com.hexis.voice-barge-in.owner: ${VOICE_BARGE_IN_ENV_ID:?Set VOICE_BARGE_IN_ENV_ID}
+      com.hexis.voice-barge-in.scope: talk
+    ports:
+      - 127.0.0.1:${VOICE_BARGE_IN_TALK_DB_PORT:?Set VOICE_BARGE_IN_TALK_DB_PORT}:5432
+    volumes:
+      - talk_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
+    command: ["postgres", "-c", "search_path=public,ag_catalog", "-c", "jit=off"]
+
+volumes:
+  pytest_data:
+  talk_data:
