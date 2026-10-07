@@ -4,6 +4,9 @@
 ## Now
 {temporal_context 单行}
 
+## Active Persona
+{Active Persona 渲染结果}
+
 ## Conversation Continuity Packet
 {render_chat_continuity_context 裁剪版}
 
