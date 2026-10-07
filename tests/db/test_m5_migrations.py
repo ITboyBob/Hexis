@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -116,6 +117,7 @@ async def _m5_s5_schema_snapshot(conn):
         FROM information_schema.columns
         WHERE table_schema='public'
           AND table_name IN ('m5_actions','m5_tasks','m5_work_rounds','m5_pending_messages')
+          AND NOT (table_name='m5_actions' AND column_name IN ('arguments','execution_started_at'))
         ORDER BY table_name, ordinal_position
         """
     )
@@ -128,6 +130,7 @@ async def _m5_s5_schema_snapshot(conn):
         JOIN pg_namespace n ON n.oid=t.relnamespace
         WHERE n.nspname='public'
           AND t.relname IN ('m5_actions','m5_tasks','m5_work_rounds','m5_pending_messages')
+          AND c.conname NOT IN ('m5_actions_arguments_tool_check','m5_actions_execution_started_tool_check')
         ORDER BY t.relname, c.conname
         """
     )
@@ -347,5 +350,100 @@ async def test_m5_report_recovery_forward_matches_baseline(db_pool, tmp_path):
             ]
             assert (await migration_status(conn, migrations_dir=tmp_path))["pending"] == []
             assert await _m5_s7_function_snapshot(conn) == expected
+        finally:
+            await transaction.rollback()
+
+
+async def _m5_s8_action_snapshot(conn):
+    columns = await conn.fetch(
+        """
+        SELECT column_name,data_type,is_nullable,column_default
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='m5_actions'
+        ORDER BY ordinal_position
+        """
+    )
+    constraints = await conn.fetch(
+        """
+        SELECT c.conname,c.contype,c.condeferrable,c.condeferred,pg_get_constraintdef(c.oid)
+        FROM pg_constraint c
+        JOIN pg_class t ON t.oid=c.conrelid
+        JOIN pg_namespace n ON n.oid=t.relnamespace
+        WHERE n.nspname='public' AND t.relname='m5_actions'
+        ORDER BY c.conname
+        """
+    )
+    functions = await conn.fetch(
+        """
+        SELECT p.proname,pg_get_functiondef(p.oid)
+        FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+        WHERE n.nspname='public' AND p.proname IN (
+            'submit_m5_lightweight','claim_m5_lightweight_action',
+            'finish_m5_lightweight_action'
+        )
+        ORDER BY p.proname
+        """
+    )
+    return tuple(tuple(tuple(row.values()) for row in group) for group in (columns,constraints,functions))
+
+
+async def test_m5_lightweight_forward_matches_baseline_and_preserves_existing_actions(db_pool, tmp_path):
+    from core.migrations import apply_pending_migrations, migration_status
+
+    async with db_pool.acquire() as conn:
+        expected = await _m5_s8_action_snapshot(conn)
+        assert {row[0] for row in expected[0]} >= {"arguments","execution_started_at"}
+        origin = await conn.fetchval(
+            "SELECT (get_or_create_chat_session(NULL,'chat',$1,'{}'::jsonb)->>'session_id')::uuid",
+            f"m5-lightweight-migration-{uuid4()}",
+        )
+        command_id = uuid4()
+        action_result = {
+            "ok": True,
+            "state": "accepted",
+            "operation_id": str(command_id),
+            "data": {},
+            "error": None,
+        }
+        await conn.execute(
+                "INSERT INTO public.m5_actions(command_id,origin_session_id,tool_name,argument_digest,"
+                '"authorization",actual_call_id,state,result) VALUES($1,$2,\'submit\',$3,\'{}\'::jsonb,\'legacy-call\',\'accepted\',$4::jsonb)',
+            command_id,
+            origin,
+            "a"*64,
+            json.dumps(action_result),
+        )
+        transaction = conn.transaction()
+        await transaction.start()
+        try:
+            await conn.execute("DROP FUNCTION IF EXISTS public.submit_m5_lightweight(uuid,uuid,text,jsonb,jsonb)")
+            await conn.execute("DROP FUNCTION IF EXISTS public.claim_m5_lightweight_action()")
+            await conn.execute("DROP FUNCTION IF EXISTS public.finish_m5_lightweight_action(uuid,text,jsonb)")
+            await conn.execute("ALTER TABLE public.m5_actions DROP CONSTRAINT IF EXISTS m5_actions_arguments_tool_check")
+            await conn.execute("ALTER TABLE public.m5_actions DROP CONSTRAINT IF EXISTS m5_actions_execution_started_tool_check")
+            await conn.execute("ALTER TABLE public.m5_actions DROP COLUMN IF EXISTS arguments")
+            await conn.execute("ALTER TABLE public.m5_actions DROP COLUMN IF EXISTS execution_started_at")
+            await conn.execute(
+                "DELETE FROM public.schema_migrations WHERE version=$1",
+                "0266_m5_lightweight_actions",
+            )
+            migration = _MIGRATIONS / "0266_m5_lightweight_actions.sql"
+            (tmp_path / migration.name).write_bytes(migration.read_bytes())
+            assert await apply_pending_migrations(conn,migrations_dir=tmp_path)==[
+                "0266_m5_lightweight_actions"
+            ]
+            assert (await migration_status(conn,migrations_dir=tmp_path))["pending"]==[]
+            assert await _m5_s8_action_snapshot(conn)==expected
+            preserved = await conn.fetchrow(
+                "SELECT origin_session_id,tool_name,state,result,arguments,execution_started_at "
+                "FROM public.m5_actions WHERE command_id=$1",
+                command_id,
+            )
+            assert preserved["origin_session_id"]==origin
+            assert preserved["tool_name"]=="submit"
+            assert preserved["state"]=="accepted"
+            assert json.loads(preserved["result"])==action_result
+            assert preserved["arguments"] is None
+            assert preserved["execution_started_at"] is None
         finally:
             await transaction.rollback()

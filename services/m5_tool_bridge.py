@@ -34,6 +34,14 @@ class BoundToolCall:
 ToolHandler = Callable[[BoundToolCall, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
+def lightweight_memory_handlers(executor: Any | None) -> dict[str, ToolHandler]:
+    """Expose only the two DB-backed asynchronous M5 memory commands."""
+    if executor is None:
+        return {}
+    submit = executor.submit_lightweight
+    return {name: submit for name in ("remember", "add_evidence")}
+
+
 def bind_tool_event(
     session: Any,
     pending: dict[str, BoundToolCall],

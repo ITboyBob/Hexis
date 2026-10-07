@@ -68,6 +68,7 @@ _pool: asyncpg.Pool | None = None
 _voice_realtime_registry: Any | None = None
 _voice_playback_watchdog: Any | None = None
 _m5_task_worker: Any | None = None
+_m5_lightweight_executor: Any | None = None
 
 
 def _dsn() -> str:
@@ -76,7 +77,7 @@ def _dsn() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pool, _m5_task_worker
+    global _pool, _m5_task_worker, _m5_lightweight_executor
     dsn = _dsn()
     # Bring the schema up to date on startup (advisory-locked, idempotent, no data loss).
     try:
@@ -128,6 +129,44 @@ async def lifespan(app: FastAPI):
                 report_config_provider=lambda: load_selected_report_config(_pool),
             )
             _m5_task_worker.start()
+
+            try:
+                async with _pool.acquire() as conn:
+                    lightweight_ready = await conn.fetchval(
+                        """
+                        SELECT to_regprocedure('public.submit_m5_lightweight(uuid,uuid,text,jsonb,jsonb)') IS NOT NULL
+                           AND to_regprocedure('public.claim_m5_lightweight_action()') IS NOT NULL
+                           AND to_regprocedure('public.finish_m5_lightweight_action(uuid,text,jsonb)') IS NOT NULL
+                           AND EXISTS (
+                               SELECT 1 FROM information_schema.columns
+                               WHERE table_schema='public' AND table_name='m5_actions'
+                                 AND column_name='arguments' AND data_type='jsonb'
+                           )
+                           AND EXISTS (
+                               SELECT 1 FROM information_schema.columns
+                               WHERE table_schema='public' AND table_name='m5_actions'
+                                 AND column_name='execution_started_at'
+                           )
+                        """
+                    )
+                if lightweight_ready:
+                    from services.lightweight_memory_executor import LightweightMemoryExecutor
+
+                    _m5_lightweight_executor = LightweightMemoryExecutor(_pool)
+                    interrupted_actions = await _m5_lightweight_executor.mark_interrupted_unknown()
+                    if interrupted_actions:
+                        logger.warning(
+                            "Marked %d interrupted M5 lightweight action(s) unknown; they will not be rerun",
+                            interrupted_actions,
+                        )
+                    _m5_lightweight_executor.start()
+                else:
+                    logger.warning(
+                        "M5 lightweight memory actions are disabled because the S8 schema is unavailable"
+                    )
+            except Exception:
+                _m5_lightweight_executor = None
+                logger.exception("M5 lightweight memory executor could not start")
         else:
             logger.warning("M5 task worker is disabled because the M5 schema is unavailable")
     except Exception:
@@ -145,6 +184,12 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await auth_flow_coordinator.close()
+        if _m5_lightweight_executor is not None:
+            try:
+                await _m5_lightweight_executor.close()
+            except Exception:
+                logger.exception("M5 lightweight memory executor shutdown failed")
+            _m5_lightweight_executor = None
         if _m5_task_worker is not None:
             try:
                 await _m5_task_worker.close()
@@ -3158,7 +3203,10 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                         if session.response_has_output(response_id):
                             raise RuntimeError("voice tool response also contained playable PCM")
                         await session.release_response(response_id)
-                        from services.m5_tool_bridge import execute_bound_tool
+                        from services.m5_tool_bridge import (
+                            execute_bound_tool,
+                            lightweight_memory_handlers,
+                        )
                         from services.voice_recall import VoiceRecallService
                         from services.m5_task_service import M5TaskService
 
@@ -3308,10 +3356,14 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                                     stimulus_revision=bound_call.stimulus_revision,
                                 )
                             else:
+                                m5_handlers = {"submit": submit_m5_tool}
+                                m5_handlers.update(
+                                    lightweight_memory_handlers(_m5_lightweight_executor)
+                                )
                                 tool_output = await execute_bound_tool(
                                     session,
                                     bound_call,
-                                    handlers={"submit": submit_m5_tool},
+                                    handlers=m5_handlers,
                                 )
                             tool_outputs.append(
                                 (bound_call.actual_call_id, tool_output)

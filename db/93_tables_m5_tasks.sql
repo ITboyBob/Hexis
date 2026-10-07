@@ -20,7 +20,15 @@ CREATE TABLE IF NOT EXISTS public.m5_actions (
         )),
     result JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    arguments JSONB,
+    execution_started_at TIMESTAMPTZ,
+    CONSTRAINT m5_actions_arguments_tool_check
+        CHECK (arguments IS NULL OR tool_name IN ('remember', 'add_evidence')),
+    CONSTRAINT m5_actions_execution_started_tool_check
+        CHECK (execution_started_at IS NULL OR tool_name IN ('remember', 'add_evidence')),
+    CONSTRAINT m5_actions_arguments_object_check
+        CHECK (arguments IS NULL OR jsonb_typeof(arguments) = 'object')
 );
 
 CREATE INDEX IF NOT EXISTS idx_m5_actions_accepted
