@@ -60,6 +60,7 @@ from core.gateway import EventSource, Gateway
 from core.rabbitmq_bridge import RabbitMQBridge
 from core.tools import create_default_registry, create_full_registry
 from services.chat import resolve_prompt_addenda, stream_chat_events
+from services.tool_activity import format_tool_result, format_tool_start
 from services.voice_realtime_transport import (
     PlaybackEventRequest,
     build_barge_in_capability,
@@ -2413,6 +2414,98 @@ async def event_stream():
         _sse_event_stream(pool),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/chat/activity")
+async def get_chat_tool_activity(
+    session_id: uuid.UUID,
+    cursor: str | None = None,
+    limit: int = 100,
+):
+    """Read persisted tool events for exactly the selected chat session."""
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 500")
+
+    stream_cursor: dict[str, int] = {}
+    if cursor is not None:
+        try:
+            parsed_cursor = json.loads(cursor)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail="cursor must be a JSON stream cursor") from exc
+        if not isinstance(parsed_cursor, dict):
+            raise HTTPException(status_code=422, detail="cursor must map stream IDs to sequence numbers")
+        for stream_id, after_seq in parsed_cursor.items():
+            if (
+                not isinstance(stream_id, str)
+                or not stream_id.strip()
+                or not isinstance(after_seq, int)
+                or isinstance(after_seq, bool)
+                or after_seq < 0
+            ):
+                raise HTTPException(status_code=422, detail="cursor contains an invalid stream sequence")
+            stream_cursor[stream_id] = after_seq
+
+    from services.behavior_events import query_behavior_events_on_connection
+
+    try:
+        async with pool.acquire() as conn:
+            # The SQL cursor also scopes streams. Discover this session's streams
+            # on every poll so streams created after an earlier page remain visible.
+            session_streams = await conn.fetch(
+                "SELECT DISTINCT stream_id FROM behavior_events WHERE session_id = $1::uuid",
+                session_id,
+            )
+            query_cursor = {row["stream_id"]: 0 for row in session_streams}
+            query_cursor.update(stream_cursor)
+            page = await query_behavior_events_on_connection(
+                conn,
+                session_id=session_id,
+                limit=limit,
+                cursor=query_cursor or None,
+            )
+    except Exception:
+        logger.exception("Could not read tool Activity for session=%s", session_id)
+        return JSONResponse({"error": "Tool Activity is temporarily unavailable."}, status_code=503)
+
+    rows = page.get("events", [])
+    next_cursor = dict(stream_cursor)
+    tool_events = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        stream_id = row.get("stream_id")
+        seq = row.get("seq")
+        if isinstance(stream_id, str) and isinstance(seq, int) and not isinstance(seq, bool):
+            next_cursor[stream_id] = max(next_cursor.get(stream_id, 0), seq)
+        event_type = row.get("event_type")
+        if event_type not in {"TOOL_START", "TOOL_RESULT"}:
+            continue
+        event_data = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        event_id = str(row.get("event_id") or "")
+        activity = (
+            format_tool_start(event_data, event_id=event_id)
+            if event_type == "TOOL_START"
+            else format_tool_result(
+                event_data,
+                event_id=event_id,
+                state=event_data.get("state") if isinstance(event_data.get("state"), str) else None,
+            )
+        )
+        tool_events.append({**row, "activity": activity})
+
+    return JSONResponse(
+        jsonable_encoder(
+            {
+                "session_id": str(session_id),
+                "events": tool_events,
+                "cursor": next_cursor,
+                "has_more": bool(page.get("has_more", False)),
+            }
+        )
     )
 
 
@@ -5679,61 +5772,16 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
             elif event.event == AgentEvent.TOOL_START:
                 yield _sse_event(
                     "log",
-                    {
-                        "id": str(uuid.uuid4()),
-                        "kind": "tool_call",
-                        "title": event.data.get("tool_name", "tool"),
-                        "detail": json.dumps(event.data.get("arguments", {}))[:500],
-                    },
+                    format_tool_start(event.data, event_id=str(uuid.uuid4())),
                 )
 
             elif event.event == AgentEvent.TOOL_RESULT:
-                tool_name = event.data.get("tool_name", "tool")
-                success = event.data.get("success", False)
-                error = event.data.get("error")
-                display_output = event.data.get("display_output")
                 output = event.data.get("output")
                 for citation in citations_from_tool_output(output):
                     citation_sources.setdefault(citation.citation_id, citation)
-                ui_payload = output.get("ui") if isinstance(output, dict) else None
-                detail = f"{'OK' if success else 'FAILED'}"
-                if error:
-                    detail += f": {error}"
-                elif isinstance(display_output, str) and display_output.strip():
-                    detail = display_output.strip()[:1000]
-                payload = {
-                    "id": str(uuid.uuid4()),
-                    "kind": "tool_result",
-                    "title": tool_name,
-                    "detail": detail,
-                    "display_output": display_output,
-                }
-                if isinstance(ui_payload, dict):
-                    payload["ui"] = ui_payload
-                if tool_name == "recall":
-                    payload.pop("display_output", None)
-                    if not success or error:
-                        payload["detail"] = f"FAILED: {error}" if error else "FAILED"
-                    else:
-                        memories = (
-                            output.get("memories") if isinstance(output, dict) else None
-                        )
-                        if not isinstance(memories, list) or any(
-                            not isinstance(memory, dict)
-                            or not isinstance(memory.get("content"), str)
-                            for memory in memories
-                        ):
-                            payload["detail"] = "Recall 返回结构异常：无法读取记忆正文"
-                        else:
-                            payload["detail"] = (
-                                "\n\n".join(
-                                    f"{index}. {memory['content']}"
-                                    for index, memory in enumerate(memories, 1)
-                                )
-                                if memories
-                                else "未召回记忆"
-                            )
-                yield _sse_event("log", payload)
+                payload = format_tool_result(event.data, event_id=str(uuid.uuid4()))
+                if payload is not None:
+                    yield _sse_event("log", payload)
 
             elif event.event == AgentEvent.UI_ARTIFACT:
                 yield _sse_event("ui", event.data)

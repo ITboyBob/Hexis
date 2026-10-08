@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { isImageAttachmentFile, uploadFileName } from "./attachment-helpers";
@@ -796,10 +796,10 @@ describe("ChatPage recall activity", () => {
     detail,
   });
 
-  const doneEvent =
-    'event: done\ndata: {"assistant":"","session_id":"00000000-0000-4000-8000-000000000001"}\n\n';
-
-  const stubFetchWithChatEvents = (chatEvents: string[]) => {
+  const stubFetchWithChatEvents = (
+    chatEvents: string[],
+    responseForSession?: (sessionId: string) => Response,
+  ) => {
     // Desktop viewport: the activity inspector mounts open, matching the
     // real >=1024px layout the recall body is verified against.
     vi.stubGlobal("matchMedia", vi.fn(() => ({
@@ -809,7 +809,7 @@ describe("ChatPage recall activity", () => {
     })));
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (input: RequestInfo | URL) => {
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         if (url.endsWith("/api/status")) {
           return Response.json({
@@ -823,6 +823,9 @@ describe("ChatPage recall activity", () => {
           return Response.json({ unread: 0, messages: [], pending_requests: [] });
         }
         if (url.endsWith("/api/chat")) {
+          const { session_id: sessionId } = JSON.parse(String(init?.body));
+          if (responseForSession) return responseForSession(sessionId);
+          const doneEvent = `event: done\ndata: ${JSON.stringify({ assistant: "", session_id: sessionId })}\n\n`;
           return eventStream([...chatEvents, doneEvent]);
         }
         return Response.json({});
@@ -940,6 +943,161 @@ describe("ChatPage recall activity", () => {
     const target = detailParagraphs(container, searchDetail)[0];
     expect(target.className).toContain("line-clamp-2");
     expect(target.className).not.toContain("whitespace-pre-wrap");
+  });
+
+  it("keeps late text-stream activity in its source session after opening a new conversation", async () => {
+    const nextSessionId = "22222222-2222-4222-8222-222222222222";
+    let sourceSessionId = "";
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const encoder = new TextEncoder();
+    stubFetchWithChatEvents([], (sessionId) => {
+      sourceSessionId = sessionId;
+      return new Response(new ReadableStream({
+        start(streamController) {
+          controller = streamController;
+          controller.enqueue(encoder.encode(logEvent(recallResult("来源会话 recall 正文"))));
+          controller.enqueue(encoder.encode(`event: done\ndata: ${JSON.stringify({ assistant: "", session_id: sessionId })}\n\n`));
+        },
+      }), { headers: { "Content-Type": "text/event-stream" } });
+    });
+    const baseFetch = fetch;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/api/chat/session")) return Response.json({ session_id: nextSessionId });
+      return baseFetch(input, init);
+    }));
+
+    const { container } = render(<ChatPage />);
+    await sendChatMessage();
+    await waitFor(() => expect(detailParagraphs(container, "来源会话 recall 正文")).toHaveLength(1));
+    const newConversation = screen.getByRole("button", { name: "Start new conversation" });
+    await waitFor(() => expect(newConversation).toBeEnabled());
+    fireEvent.click(newConversation);
+    await screen.findByText("New conversation started.");
+    await act(async () => {
+      controller.enqueue(encoder.encode(logEvent(recallResult("旧流迟到 recall 正文"))));
+      controller.enqueue(encoder.encode(`event: done\ndata: ${JSON.stringify({ assistant: "", session_id: sourceSessionId })}\n\n`));
+      controller.close();
+    });
+
+    await waitFor(() => expect(sessionStorage.getItem("hexis-chat-session-id")).toBe(nextSessionId));
+    expect(detailParagraphs(container, "来源会话 recall 正文")).toHaveLength(0);
+    expect(detailParagraphs(container, "旧流迟到 recall 正文")).toHaveLength(0);
+    const savedEvents = JSON.parse(sessionStorage.getItem("hexis-chat-activity-events") || "[]");
+    expect(savedEvents.find((event: { detail: string }) => event.detail === "来源会话 recall 正文")?.sessionId).toBe(sourceSessionId);
+  });
+});
+
+describe("ChatPage persisted tool activity", () => {
+  const sessionId = "11111111-1111-4111-8111-111111111111";
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  it("replays persisted request and result once, consumes accepted results, and keeps long recall text readable", async () => {
+    const recallText = "持久化 voice recall 正文".repeat(80);
+    const calls: URL[] = [];
+    const persisted = {
+      session_id: sessionId,
+      cursor: { "voice-tools": 3 },
+      has_more: false,
+      events: [
+        {
+          event_id: "persisted-start",
+          event_type: "TOOL_START",
+          stream_id: "voice-tools",
+          session_id: sessionId,
+          seq: 1,
+          recorded_at: "2026-10-09T00:00:00.000Z",
+          call_id: "voice-call-1",
+          activity: { id: "persisted-start", kind: "tool_call", title: "voice_recall", detail: '{"query":"Hexis"}' },
+        },
+        {
+          event_id: "persisted-result",
+          event_type: "TOOL_RESULT",
+          stream_id: "voice-tools",
+          session_id: sessionId,
+          seq: 2,
+          recorded_at: "2026-10-09T00:00:01.000Z",
+          call_id: "voice-call-1",
+          activity: { id: "persisted-result", kind: "tool_result", title: "voice_recall", detail: recallText },
+        },
+        {
+          event_id: "accepted-result",
+          event_type: "TOOL_RESULT",
+          stream_id: "voice-tools",
+          session_id: sessionId,
+          seq: 3,
+          recorded_at: "2026-10-09T00:00:02.000Z",
+          call_id: "remember-call",
+          activity: null,
+        },
+      ],
+    };
+    sessionStorage.setItem("hexis-chat-session-id", sessionId);
+    vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() })));
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname === "/api/status") return Response.json({ configured: true, agent_name: "Samantha" });
+      if (url.pathname === "/api/outbox") return Response.json({ unread: 0, messages: [] });
+      if (url.pathname.startsWith("/api/chat/session/")) return Response.json({ session_id: sessionId, messages: [] });
+      if (url.pathname === "/api/chat/activity") {
+        calls.push(url);
+        return Response.json(persisted);
+      }
+      return Response.json({});
+    }) as unknown as typeof fetch);
+
+    const first = render(<ChatPage />);
+    const recallParagraph = await screen.findByText(recallText);
+    expect(recallParagraph.className).toContain("whitespace-pre-wrap");
+    expect(recallParagraph.className).toContain("break-words");
+    expect(recallParagraph.className).not.toContain("line-clamp-2");
+    expect(screen.getByText("2 recent events")).toBeInTheDocument();
+    expect(screen.queryByText("accepted-result")).toBeNull();
+    expect(calls[0].searchParams.get("session_id")).toBe(sessionId);
+
+    first.unmount();
+    render(<ChatPage />);
+    await screen.findByText(recallText);
+    expect(screen.getByText("2 recent events")).toBeInTheDocument();
+  });
+
+  it("shows the neutral unknown receipt label without inferring failure from success=false", async () => {
+    sessionStorage.setItem("hexis-chat-session-id", sessionId);
+    vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() })));
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname === "/api/status") return Response.json({ configured: true, agent_name: "Samantha" });
+      if (url.pathname === "/api/outbox") return Response.json({ unread: 0, messages: [] });
+      if (url.pathname === "/api/chat/activity") return Response.json({
+        session_id: sessionId,
+        cursor: { "voice-tools": 1 },
+        events: [{
+          event_id: "unknown-result",
+          event_type: "TOOL_RESULT",
+          stream_id: "voice-tools",
+          session_id: sessionId,
+          seq: 1,
+          recorded_at: "2026-10-09T00:00:02.000Z",
+          call_id: "remember-call",
+          activity: {
+            id: "unknown-result",
+            kind: "tool_result",
+            title: "remember",
+            detail: "工具调用结果无法确认。",
+            status_label: "结果未确认",
+            state: "unknown",
+          },
+        }],
+      });
+      return Response.json({ session_id: sessionId, messages: [] });
+    }) as unknown as typeof fetch);
+
+    render(<ChatPage />);
+    expect(await screen.findByText("工具调用结果无法确认。")).toBeInTheDocument();
+    expect(screen.getByText("结果未确认")).toBeInTheDocument();
   });
 });
 

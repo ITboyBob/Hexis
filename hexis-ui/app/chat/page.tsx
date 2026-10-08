@@ -31,6 +31,8 @@ import { normalizeMessagePresentation } from "../../lib/message-presentation";
 import type { MessagePresentation } from "../../lib/message-presentation";
 import { toolMessageViewFromDbRecord } from "../../lib/chat-tool-message";
 import type { ToolMessageView } from "../../lib/chat-tool-message";
+import { mergeToolActivityLogs, normalizeToolActivityPage } from "../../lib/tool-activity";
+import type { ToolActivityCursor, ToolActivityLog } from "../../lib/tool-activity";
 import type { M5Task, M5TaskSelection, M5TaskSnapshot } from "../../lib/m5-tasks";
 import { isImageAttachmentFile, normalizeUploadFile } from "./attachment-helpers";
 import { AttachmentCard, type AttachmentKind } from "./attachment-card";
@@ -501,6 +503,7 @@ type LogEvent = {
   detail: string;
   raw?: unknown;
   ts: number;
+  sessionId?: string | null;
 };
 
 type AgentStatus = {
@@ -695,6 +698,7 @@ function parseActivityEvents(value: unknown): LogEvent[] {
       detail: record.detail,
       raw: record.raw,
       ts: record.ts,
+      sessionId: typeof record.sessionId === "string" ? record.sessionId : null,
     }));
   }
   return pruneActivityEvents(events);
@@ -1084,6 +1088,15 @@ export default function ChatPage() {
   const [showInbox, setShowInbox] = useState(false);
   const taskDrafts = useRef(new Map<string, string>());
   const taskNavigationRequest = useRef(0);
+  const sessionIdRef = useRef<string | null>(null);
+  const activityCursors = useRef<Record<string, ToolActivityCursor>>({});
+  const setActiveSessionId = (nextSessionId: string | null) => {
+    sessionIdRef.current = nextSessionId;
+    setSessionId(nextSessionId);
+  };
+  useEffect(() => {
+    sessionIdRef.current = sessionId;
+  }, [sessionId]);
   const [inbox, setInbox] = useState<InboxData>({
     unread: 0,
     messages: [],
@@ -1142,6 +1155,10 @@ export default function ChatPage() {
         .map((msg) => ({ role: msg.role, content: msg.content })),
     [messages]
   );
+  const visibleActivityEvents = useMemo(
+    () => events.filter((event) => (event.sessionId ?? null) === sessionId),
+    [events, sessionId],
+  );
 
   // Load the current DB-owned session on mount, using the browser cache only
   // as a temporary display fallback.
@@ -1154,7 +1171,7 @@ export default function ChatPage() {
 
       const sessionId = loadSessionId();
       if (!sessionId) return;
-      if (!cancelled) setSessionId(sessionId);
+      if (!cancelled) setActiveSessionId(sessionId);
       const savedTaskNavigation = loadM5TaskNavigation();
       if (savedTaskNavigation?.taskSessionId === sessionId && !cancelled) {
         setTaskNavigation(savedTaskNavigation);
@@ -1533,8 +1550,108 @@ export default function ChatPage() {
   }, [messages]);
 
   const appendLog = useCallback((event: LogEvent) => {
-    setEvents((prev) => [...prev.slice(-(MAX_ACTIVITY_EVENTS - 1)), sanitizeActivityEvent(event)]);
-  }, []);
+    const scopedEvent = sanitizeActivityEvent({
+      ...event,
+      sessionId: event.sessionId ?? sessionIdRef.current ?? sessionId,
+    });
+    setEvents((prev) => [
+      ...prev.slice(-(MAX_ACTIVITY_EVENTS - 1)),
+      scopedEvent,
+    ]);
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    const requestedSessionId = sessionId;
+    const controller = new AbortController();
+    let polling = false;
+    let reportedUnavailable = false;
+    const failureId = `tool-activity-sync:${requestedSessionId}`;
+
+    const poll = async () => {
+      if (polling || controller.signal.aborted) return;
+      polling = true;
+      try {
+        let hasMore = true;
+        let pages = 0;
+        while (hasMore && pages < 5 && !controller.signal.aborted) {
+          pages += 1;
+          const cursor = activityCursors.current[requestedSessionId] || {};
+          const params = new URLSearchParams({ session_id: requestedSessionId, limit: "200" });
+          if (Object.keys(cursor).length > 0) params.set("cursor", JSON.stringify(cursor));
+          const response = await fetch(`/api/chat/activity?${params.toString()}`, {
+            cache: "no-store",
+            signal: controller.signal,
+          });
+          if (!response.ok) {
+            throw new Error(`Activity replay returned HTTP ${response.status}`);
+          }
+          const page = normalizeToolActivityPage(await response.json(), requestedSessionId);
+          if (
+            controller.signal.aborted ||
+            sessionIdRef.current !== requestedSessionId
+          ) return;
+
+          const previousCursor = JSON.stringify(cursor);
+          activityCursors.current[requestedSessionId] = page.cursor;
+          setEvents((current) => {
+            const otherEvents = current.filter(
+              (event) => event.sessionId !== requestedSessionId && event.id !== failureId,
+            );
+            const currentSessionTools = current
+              .filter((event) => event.sessionId === requestedSessionId && event.category === "tool")
+              .map((event) => ({
+                id: event.id,
+                category: "tool" as const,
+                title: event.title,
+                detail: event.detail,
+                raw: event.raw,
+                ts: event.ts,
+                session_id: requestedSessionId,
+              }));
+            const merged = mergeToolActivityLogs(currentSessionTools, page.logs, requestedSessionId);
+            const mergedEvents: LogEvent[] = merged.map((event) => ({
+              id: event.id,
+              category: "tool",
+              title: event.title,
+              detail: event.detail,
+              raw: event.raw,
+              ts: event.ts,
+              sessionId: event.session_id,
+            }));
+            return pruneActivityEvents([...otherEvents, ...current.filter((event) => event.sessionId === requestedSessionId && event.category !== "tool"), ...mergedEvents]);
+          });
+          hasMore = page.has_more;
+          if (hasMore && JSON.stringify(page.cursor) === previousCursor) break;
+        }
+        reportedUnavailable = false;
+      } catch (error: unknown) {
+        if (!controller.signal.aborted && sessionIdRef.current === requestedSessionId && !reportedUnavailable) {
+          reportedUnavailable = true;
+          setEvents((current) => [
+            ...current,
+            {
+              id: failureId,
+              category: "error",
+              title: "Activity sync",
+              detail: `Saved tool activity is temporarily unavailable; retrying. ${error instanceof Error ? error.message : "Unknown error"}`,
+              ts: Date.now(),
+              sessionId: requestedSessionId,
+            },
+          ]);
+        }
+      } finally {
+        polling = false;
+      }
+    };
+
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1000);
+    return () => {
+      window.clearInterval(timer);
+      controller.abort();
+    };
+  }, [sessionId]);
 
   const toggleActivityPane = (pane: ActivityPaneId) => {
     setExpandedActivityPanes((current) => {
@@ -1778,7 +1895,7 @@ export default function ChatPage() {
       saveSessionId(payload.session_id);
       saveM5TaskNavigation(null);
       setTaskNavigation(null);
-      setSessionId(payload.session_id);
+      setActiveSessionId(payload.session_id);
       setMessages([]);
       setInput(taskDrafts.current.get(payload.session_id) || "");
       setActiveConnectorSetup(null);
@@ -1839,7 +1956,7 @@ export default function ChatPage() {
       saveSessionId(nextSessionId);
       saveM5TaskNavigation(nextNavigation);
       setTaskNavigation(nextNavigation);
-      setSessionId(nextSessionId);
+      setActiveSessionId(nextSessionId);
       setMessages(nextMessages);
       setInput(taskDrafts.current.get(nextSessionId) || "");
       setActiveConnectorSetup(null);
@@ -1923,7 +2040,7 @@ export default function ChatPage() {
       if (!currentSessionId) {
         setMessages([]);
         clearSessionId();
-        setSessionId(null);
+        setActiveSessionId(null);
         setSessionNotice("Conversation display cleared.");
         return;
       }
@@ -2279,13 +2396,16 @@ export default function ChatPage() {
     let receivedDone = false;
     let streamError: string | null = null;
     let finalAssistantText: string | null = null;
+    let turnSessionId: string | null = sessionIdRef.current;
 
     try {
       const priorSessionId = sessionId || loadSessionId();
       const currentSessionId = priorSessionId || crypto.randomUUID();
+      turnSessionId = currentSessionId;
+      const appendTurnLog = (event: LogEvent) => appendLog({ ...event, sessionId: currentSessionId });
       if (!priorSessionId) {
         saveSessionId(currentSessionId);
-        setSessionId(currentSessionId);
+        setActiveSessionId(currentSessionId);
       }
       const chatBody: {
         message: string;
@@ -2319,7 +2439,7 @@ export default function ChatPage() {
       if (!res.ok || !res.body) {
         const detail = `Failed to reach chat endpoint (${res.status}).`;
         markTurnIncomplete(userMessage.id, assistantMessage.id, detail);
-        appendLog({
+        appendTurnLog({
           id: crypto.randomUUID(),
           category: "error",
           title: "Chat error",
@@ -2353,7 +2473,7 @@ export default function ChatPage() {
               data += line.replace("data:", "").trim();
             }
           }
-          if (!data) continue;
+          if (!data || sessionIdRef.current !== currentSessionId) continue;
           let payload: SsePayload = {};
           try {
             const parsed = JSON.parse(data);
@@ -2396,7 +2516,7 @@ export default function ChatPage() {
           if (eventType === "phase_start") {
             const phase = asString(payload.phase, "phase");
             setCurrentPhase(phase);
-            appendLog({
+            appendTurnLog({
               id: crypto.randomUUID(),
               category: "phase",
               title: streamLabel(phase),
@@ -2407,7 +2527,7 @@ export default function ChatPage() {
 
           if (eventType === "phase_end" && asString(payload.phase) === "subconscious") {
             const output = asRecord(payload.output);
-            appendLog({
+            appendTurnLog({
               id: crypto.randomUUID(),
               category: "subconscious",
               title: "Subconscious appraisal",
@@ -2419,7 +2539,7 @@ export default function ChatPage() {
 
           if (eventType === "trace") {
             const request = asString(payload.kind) === "llm_request";
-            appendLog({
+            appendTurnLog({
               // Request/response traces share payload.id for correlation, so
               // the log entry mints its own key; the pair id stays in raw.
               id: crypto.randomUUID(),
@@ -2443,7 +2563,7 @@ export default function ChatPage() {
               asString(payload.title) ||
               logKind ||
               "Activity";
-            appendLog({
+            appendTurnLog({
               id: crypto.randomUUID(),
               category: logKind.includes("memory") || title.toLowerCase().includes("memory") ? "memory" : "tool",
               title,
@@ -2473,7 +2593,7 @@ export default function ChatPage() {
               connectorUi?.connector_id ||
               (speechUi ? "Speech" : "") ||
               "Setup";
-            appendLog({
+            appendTurnLog({
               id: crypto.randomUUID(),
               category: "tool",
               title,
@@ -2500,7 +2620,7 @@ export default function ChatPage() {
             const questionUi = agentQuestionUiFromPayload(payload);
             if (questionUi) {
               upsertAssistantUi(assistantMessage.id, questionUi);
-              appendLog({
+              appendTurnLog({
                 id: crypto.randomUUID(),
                 category: "tool",
                 title: "Clarification requested",
@@ -2514,7 +2634,7 @@ export default function ChatPage() {
           if (eventType === "error") {
             const detail = asString(payload.message, "Unknown error");
             streamError = detail;
-            appendLog({
+            appendTurnLog({
               id: crypto.randomUUID(),
               category: "error",
               title: "Error",
@@ -2531,7 +2651,7 @@ export default function ChatPage() {
             setAssistantPresentation(assistantMessage.id, payload.presentation);
             if (typeof payload.session_id === "string" && payload.session_id) {
               saveSessionId(payload.session_id);
-              setSessionId(payload.session_id);
+              setActiveSessionId(payload.session_id);
             }
             setSending(false);
             setCurrentPhase(null);
@@ -2546,7 +2666,7 @@ export default function ChatPage() {
             );
             if (typeof payload.session_id === "string" && payload.session_id) {
               saveSessionId(payload.session_id);
-              setSessionId(payload.session_id);
+              setActiveSessionId(payload.session_id);
             }
             setSending(false);
             setCurrentPhase(null);
@@ -2568,6 +2688,7 @@ export default function ChatPage() {
       const detail = err instanceof Error ? err.message : "Unknown error";
       markTurnIncomplete(userMessage.id, assistantMessage.id, detail);
       appendLog({
+        sessionId: turnSessionId,
         id: crypto.randomUUID(),
         category: "error",
         title: "Chat error",
@@ -3035,7 +3156,7 @@ export default function ChatPage() {
                 onSelectionOpened={setTaskSelection}
                 onSessionId={(nextSessionId) => {
                   saveSessionId(nextSessionId);
-                  setSessionId(nextSessionId);
+                  setActiveSessionId(nextSessionId);
                   if (taskNavigation?.taskSessionId !== nextSessionId) {
                     saveM5TaskNavigation(null);
                     setTaskNavigation(null);
@@ -3408,7 +3529,7 @@ export default function ChatPage() {
           </aside>
         ) : showInspector ? (
           <ActivityInspector
-            events={events}
+            events={visibleActivityEvents}
             messages={messages}
             agentStatus={agentStatus}
             currentPhase={currentPhase}
@@ -4704,12 +4825,15 @@ function EmotionSnapshotView({ snapshot, compact = false }: { snapshot: EmotionS
 }
 
 function ActivityEventRow({ event, compact = false }: { event: LogEvent; compact?: boolean }) {
-  const isRecallResult = event.title === "recall" && asRecord(event.raw).kind === "tool_result";
+  const isRecallResult = ["recall", "voice_recall"].includes(event.title) && asRecord(event.raw).kind === "tool_result";
+  const statusLabel = asString(asRecord(event.raw).status_label);
   return (
     <div className={compact ? "" : "border-t border-[var(--outline)] pt-2 first:border-t-0 first:pt-0"}>
       <div className="flex items-center justify-between gap-2">
         <p className="truncate text-xs font-semibold">{event.title}</p>
-        <Badge variant={event.category === "error" ? "error" : "muted"}>{event.category === "error" ? "error" : "tool"}</Badge>
+        <Badge variant={statusLabel || event.category === "error" ? "error" : "muted"}>
+          {statusLabel || (event.category === "error" ? "error" : "tool")}
+        </Badge>
       </div>
       <p className={`${isRecallResult ? "whitespace-pre-wrap break-words" : compact ? "line-clamp-2" : ""} mt-1 text-xs leading-5 text-[var(--ink-soft)]`}>
         {event.detail || "No detail"}
