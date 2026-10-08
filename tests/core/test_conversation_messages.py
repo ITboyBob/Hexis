@@ -95,6 +95,49 @@ def test_internal_provider_roundtrip_uses_explicit_result_authority():
     assert rebuilt[2]["source_message_id"] == f"tool:{FIXTURE_TURN_ID}:{tool_call['id']}:result"
 
 
+def test_memory_projection_keeps_only_user_and_assistant_prose():
+    messages = [
+        {"role": "user", "content": "Please inspect the chart."},
+        {
+            "role": "assistant",
+            "content": "",
+            "content_blocks": [{
+                "type": "toolCall",
+                "id": "call-memory-filter",
+                "name": "read_file",
+                "arguments": {"path": "chart.png"},
+            }],
+        },
+        {
+            "role": "toolResult",
+            "content": "INTERNAL_TOOL_RESULT_SENTINEL",
+            "content_blocks": [{"type": "text", "text": "INTERNAL_TOOL_RESULT_SENTINEL"}],
+            "metadata": {
+                "tool_result": {
+                    "toolCallId": "call-memory-filter",
+                    "toolName": "read_file",
+                    "isError": False,
+                    "details": {"secret": "INTERNAL_TOOL_DETAILS_SENTINEL"},
+                }
+            },
+        },
+        {
+            "role": "system",
+            "content": "INTERNAL_ACTION_EVIDENCE_SENTINEL",
+            "metadata": {"hexis_internal": "action_receipt_evidence"},
+        },
+        {
+            "role": "assistant",
+            "content": "The tool result shows the chart title is Sales.",
+        },
+    ]
+
+    assert project_memory_texts(messages) == [
+        "Please inspect the chart.",
+        "The tool result shows the chart title is Sales.",
+    ]
+
+
 def test_provider_arguments_must_decode_to_json_object():
     provider_messages = [
         {

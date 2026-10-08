@@ -63,9 +63,16 @@ class BackgroundExecutor:
     async def _create_registry(self) -> ToolRegistry:
         return create_default_registry(self._pool)
 
-    async def execute_work(self, prepared: Any, on_event: Any = None) -> AgentLoopResult:
+    async def execute_work(
+        self,
+        prepared: Any,
+        *,
+        work_execution_id: UUID | str | None = None,
+        on_event: Any = None,
+    ) -> AgentLoopResult:
         """Execute one already prepared background turn with host policy intact."""
         options = prepared.loop_options
+        work_id = UUID(str(work_execution_id)) if work_execution_id is not None else None
         config = AgentLoopConfig(
             tool_context=ToolContext.CHAT,
             system_prompt=prepared.system_prompt,
@@ -85,6 +92,9 @@ class BackgroundExecutor:
             surface="background",
             tool_surface_input_hash=hash_input_text(prepared.user_message),
             available_skill_count=len(prepared.selection.available),
+            chat_message_projection=work_id is not None,
+            chat_source_identity=f"m5-work:{work_id}" if work_id is not None else None,
+            chat_work_execution_id=str(work_id) if work_id is not None else None,
         )
         return await AgentLoop(config).run(
             prepared.user_message,

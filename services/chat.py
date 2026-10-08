@@ -1359,6 +1359,21 @@ async def stream_chat_events(
             yield event
 
         full_text = "".join(collected)
+        if agent_turn_id:
+            async with pool.acquire() as conn:
+                persisted_text = await conn.fetchval(
+                    "SELECT result->>'text' FROM public.agent_turns WHERE id=$1::uuid",
+                    agent_turn_id,
+                )
+            if persisted_text is None:
+                logger.error(
+                    "Completed streamed chat turn %s has no persisted final text; "
+                    "conversation memory was not written",
+                    agent_turn_id,
+                )
+                full_text = ""
+            else:
+                full_text = str(persisted_text)
         if full_text and not timed_out and not failed:
             persisted = await _remember_conversation(
                 CognitiveMemory(pool),

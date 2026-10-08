@@ -746,12 +746,13 @@ class M5TaskService:
                     raise ValueError("M5 work input does not match the current claimed task session")
                 raw = await conn.fetchval(
                     """
-                    SELECT public.append_chat_message(
-                        $1, 'user', $2, $3::jsonb, $4, TRUE
+                    SELECT public.append_chat_message_blocks(
+                        $1, 'user', $2, $3::jsonb, $4::jsonb, $5, TRUE
                     )
                     """,
                     session_uuid,
                     text,
+                    json.dumps([{"type": "text", "text": text}]),
                     json.dumps(metadata),
                     f"m5-work:{work_id}:input",
                 )
@@ -784,7 +785,8 @@ class M5TaskService:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     """
-                    SELECT t.task_session_id, t.current_work_execution_id, w.status
+                    SELECT t.task_session_id, t.current_work_execution_id,
+                           t.origin_session_id, w.status, w.input, w.turn_id
                     FROM public.m5_tasks t
                     JOIN public.m5_work_rounds w ON w.task_id=t.id
                     WHERE t.id=$1 AND w.id=$2
@@ -800,18 +802,74 @@ class M5TaskService:
                     or row["status"] != "running"
                 ):
                     return False
-                if status == "completed" and assistant_text and assistant_text.strip():
-                    await conn.fetchval(
-                        """
-                        SELECT public.append_chat_message(
-                            $1, 'assistant', $2, $3::jsonb, $4, TRUE
-                        )
-                        """,
+                if row["turn_id"] is not None and turn_uuid is not None and row["turn_id"] != turn_uuid:
+                    raise ValueError("M5 work completion turn does not match its host-bound AgentLoop turn")
+                if status == "completed" and assistant_text is not None and (
+                    row["turn_id"] is None or turn_uuid != row["turn_id"]
+                ):
+                    raise ValueError("completed M5 work memory requires its host-bound AgentLoop turn")
+                work_result = dict(result or {})
+                if status == "completed" and assistant_text is not None:
+                    source_identity = f"m5-work:{work_id}"
+                    input_source_message_id = f"{source_identity}:input"
+                    assistant_source_message_id = f"{source_identity}:assistant"
+                    input_message = await conn.fetchrow(
+                        "SELECT role,content,metadata FROM public.chat_messages "
+                        "WHERE session_id=$1 AND source_message_id=$2 FOR UPDATE",
                         session_uuid,
-                        assistant_text,
-                        json.dumps(metadata),
-                        f"m5-work:{work_id}:assistant",
+                        input_source_message_id,
                     )
+                    if (
+                        input_message is None
+                        or input_message["role"] != "user"
+                        or input_message["content"] != row["input"]
+                    ):
+                        raise ValueError("M5 work input source is missing or conflicts with the claimed execution")
+                    input_metadata = _coerce_json(input_message["metadata"])
+                    if (
+                        input_metadata.get("m5_task_id") != str(task_uuid)
+                        or input_metadata.get("work_execution_id") != str(work_id)
+                        or input_metadata.get("message_kind") != "m5_work_input"
+                    ):
+                        raise ValueError("M5 work input metadata does not match its claimed execution")
+                    memory_context = {
+                        "metadata": {"type": "conversation"},
+                        "surface": "m5-task",
+                        "host_background": True,
+                        "source_identity": source_identity,
+                        "user_source_message_id": input_source_message_id,
+                        "assistant_source_message_id": assistant_source_message_id,
+                        "user_metadata": input_metadata,
+                        "assistant_metadata": {
+                            **metadata,
+                            **({"agent_turn_id": str(turn_uuid)} if turn_uuid is not None else {}),
+                        },
+                    }
+                    saved_turn = _coerce_json(await conn.fetchval(
+                        "SELECT public.record_chat_session_turn($1::uuid,$2,$3,'m5-task',$4::jsonb)",
+                        session_uuid,
+                        input_message["content"],
+                        assistant_text,
+                        json.dumps(memory_context, ensure_ascii=False),
+                    ))
+                    memory_result = saved_turn.get("memory") if isinstance(saved_turn, dict) else None
+                    raw_memory = memory_result.get("raw") if isinstance(memory_result, dict) else None
+                    memory_status = (
+                        raw_memory.get("status") if isinstance(raw_memory, dict) else None
+                    )
+                    if (
+                        not isinstance(memory_result, dict)
+                        or memory_result.get("status") in {"failed", "conflict"}
+                        or memory_status not in {"stored", "duplicate"}
+                    ):
+                        error_text = (
+                            memory_result.get("error")
+                            if isinstance(memory_result, dict)
+                            else None
+                        ) or f"unexpected RecMem result status: {memory_status!r}"
+                        raise RuntimeError(f"M5 conversation memory write failed: {error_text}")
+                    work_result["memory_status"] = memory_status
+                    work_result["raw_unit_id"] = raw_memory.get("unit_id")
                 updated = await conn.fetchval(
                     """
                     SELECT public.finish_m5_work_round(
@@ -821,8 +879,116 @@ class M5TaskService:
                     task_uuid,
                     work_id,
                     status,
-                    json.dumps(result, ensure_ascii=False) if result is not None else None,
+                    json.dumps(work_result, ensure_ascii=False) if result is not None or work_result else None,
                     error,
                     turn_uuid,
                 )
                 return bool(updated)
+
+    async def repair_work_memory(
+        self, work_execution_id: UUID | str
+    ) -> dict[str, Any]:
+        """Retry only the durable conversation-memory projection for a finished turn."""
+        work_id = _uuid(work_execution_id, "work_execution_id")
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT t.id AS task_id, t.task_session_id, w.status, w.input,
+                           w.turn_id, turn.status AS turn_status,
+                           turn.result->>'text' AS assistant_text,
+                           turn.result->>'stopped_reason' AS stopped_reason,
+                           COALESCE((turn.result->>'timed_out')::boolean,FALSE) AS timed_out
+                    FROM public.m5_work_rounds w
+                    JOIN public.m5_tasks t ON t.id=w.task_id
+                    JOIN public.agent_turns turn
+                      ON turn.id=w.turn_id AND turn.session_id=t.task_session_id
+                    WHERE w.id=$1
+                    FOR UPDATE OF w
+                    """,
+                    work_id,
+                )
+                if row is None or row["status"] != "unknown":
+                    raise ValueError("only an unknown M5 work round with a bound turn can be repaired")
+                if (
+                    row["turn_status"] != "completed"
+                    or row["stopped_reason"] != "completed"
+                    or row["timed_out"]
+                    or row["assistant_text"] is None
+                ):
+                    raise ValueError("M5 work turn has no completed final response to repair")
+
+                task_id = row["task_id"]
+                session_id = row["task_session_id"]
+                source_identity = f"m5-work:{work_id}"
+                input_source_id = f"{source_identity}:input"
+                assistant_source_id = f"{source_identity}:assistant"
+                input_message = await conn.fetchrow(
+                    "SELECT role,content,metadata FROM public.chat_messages "
+                    "WHERE session_id=$1 AND source_message_id=$2 FOR UPDATE",
+                    session_id,
+                    input_source_id,
+                )
+                if (
+                    input_message is None
+                    or input_message["role"] != "user"
+                    or input_message["content"] != row["input"]
+                ):
+                    raise ValueError("M5 work input source is missing or conflicts with the finished execution")
+                input_metadata = _coerce_json(input_message["metadata"])
+                if (
+                    input_metadata.get("m5_task_id") != str(task_id)
+                    or input_metadata.get("work_execution_id") != str(work_id)
+                    or input_metadata.get("message_kind") != "m5_work_input"
+                ):
+                    raise ValueError("M5 work input metadata does not match its finished execution")
+
+                context = {
+                    "metadata": {"type": "conversation"},
+                    "surface": "m5-task",
+                    "host_background": True,
+                    "source_identity": source_identity,
+                    "user_source_message_id": input_source_id,
+                    "assistant_source_message_id": assistant_source_id,
+                    "user_metadata": input_metadata,
+                    "assistant_metadata": {
+                        "m5_task_id": str(task_id),
+                        "work_execution_id": str(work_id),
+                        "message_kind": "m5_work_result",
+                        "agent_turn_id": str(row["turn_id"]),
+                    },
+                }
+                saved_turn = _coerce_json(await conn.fetchval(
+                    "SELECT public.record_chat_session_turn($1::uuid,$2,$3,'m5-task',$4::jsonb)",
+                    session_id,
+                    input_message["content"],
+                    row["assistant_text"],
+                    json.dumps(context, ensure_ascii=False),
+                ))
+                memory_result = saved_turn.get("memory")
+                raw_memory = memory_result.get("raw") if isinstance(memory_result, dict) else None
+                memory_status = raw_memory.get("status") if isinstance(raw_memory, dict) else None
+                if (
+                    not isinstance(memory_result, dict)
+                    or memory_result.get("status") in {"failed", "conflict"}
+                    or memory_status not in {"stored", "duplicate"}
+                ):
+                    error_text = (
+                        memory_result.get("error")
+                        if isinstance(memory_result, dict)
+                        else None
+                    ) or f"unexpected RecMem result status: {memory_status!r}"
+                    raise RuntimeError(f"M5 conversation memory repair failed: {error_text}")
+
+                await conn.execute(
+                    "UPDATE public.m5_work_rounds SET result=COALESCE(result,'{}'::jsonb) "
+                    "|| jsonb_build_object('memory_status',$2::text,'raw_unit_id',$3::text) WHERE id=$1",
+                    work_id,
+                    memory_status,
+                    raw_memory.get("unit_id"),
+                )
+                return {
+                    "repaired": True,
+                    "memory_status": memory_status,
+                    "raw_unit_id": raw_memory.get("unit_id"),
+                }

@@ -467,6 +467,21 @@ class TestToolCalls:
         assert len(result.tool_calls_made) == 2
 
     @patch("core.agent_loop.chat_completion")
+    async def test_empty_final_response_does_not_reuse_tool_call_narration(self, mock_llm):
+        registry = _mock_registry(
+            execute_results={"tool_a": ToolResult.success_result("done")}
+        )
+        mock_llm.side_effect = [
+            _tool_response("Checking the file.", [_tool_call("tool_a", {})]),
+            _text_response(""),
+        ]
+
+        result = await AgentLoop(_make_config(registry=registry)).run("Check it")
+
+        assert result.text == ""
+        assert result.visible_text == "Checking the file."
+
+    @patch("core.agent_loop.chat_completion")
     async def test_use_skill_unlocks_bound_tools_for_next_iteration(self, mock_llm):
         """Skill-first mode starts narrow, then `use_skill` expands the exposed tools."""
         use_skill_spec = ToolSpec(

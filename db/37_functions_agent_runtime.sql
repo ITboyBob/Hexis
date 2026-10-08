@@ -27,7 +27,7 @@ CREATE OR REPLACE FUNCTION start_agent_turn(
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    turn_id UUID;
+    new_turn_id UUID;
     initial_messages JSONB;
     runtime JSONB;
     chat_projection BOOLEAN := COALESCE(
@@ -36,23 +36,65 @@ DECLARE
     );
     chat_source TEXT := NULLIF(p_context#>>'{runtime_state,chat_source_identity}', '');
     chat_client UUID;
+    chat_work_id_text TEXT := NULLIF(p_context#>>'{runtime_state,chat_work_execution_id}', '');
+    chat_work_id UUID;
+    chat_work_task_id UUID;
+    chat_work_input TEXT;
 BEGIN
     IF chat_projection THEN
         IF COALESCE(NULLIF(p_mode, ''), 'chat') <> 'chat' OR p_session_id IS NULL THEN
             RAISE EXCEPTION 'chat_message_projection requires a chat turn and session';
         END IF;
-        IF chat_source IS NULL OR split_part(chat_source, ':', 1) <> 'chat'
-           OR split_part(chat_source, ':', 2) <> p_session_id::text THEN
-            RAISE EXCEPTION 'chat_message_projection requires a matching chat_source_identity';
+        IF chat_work_id_text IS NOT NULL THEN
+            BEGIN
+                chat_work_id := chat_work_id_text::uuid;
+            EXCEPTION WHEN invalid_text_representation THEN
+                RAISE EXCEPTION 'chat_work_execution_id must be a UUID';
+            END;
+            IF chat_source IS DISTINCT FROM format('m5-work:%s', chat_work_id) THEN
+                RAISE EXCEPTION 'M5 work source identity does not match chat_work_execution_id';
+            END IF;
+            SELECT task.id, work.input
+            INTO chat_work_task_id, chat_work_input
+            FROM public.m5_work_rounds AS work
+            JOIN public.m5_tasks AS task ON task.id=work.task_id
+            WHERE work.id=chat_work_id
+              AND task.task_session_id=p_session_id
+              AND task.current_work_execution_id=work.id
+              AND task.product_state='working'
+              AND work.status='running';
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'M5 work execution does not belong to this active task session';
+            END IF;
+            IF NOT EXISTS (
+                SELECT 1
+                FROM public.chat_messages AS input_message
+                WHERE input_message.session_id=p_session_id
+                  AND input_message.role='user'
+                  AND input_message.source_message_id=format('m5-work:%s:input', chat_work_id)
+                  AND input_message.content=chat_work_input
+                  AND input_message.metadata->>'m5_task_id'=chat_work_task_id::text
+                  AND input_message.metadata->>'work_execution_id'=chat_work_id::text
+                  AND input_message.metadata->>'message_kind'='m5_work_input'
+            ) THEN
+                RAISE EXCEPTION 'M5 work input is not durably saved for this execution';
+            END IF;
+        ELSE
+            IF chat_source IS NULL OR split_part(chat_source, ':', 1) <> 'chat'
+               OR split_part(chat_source, ':', 2) <> p_session_id::text THEN
+                RAISE EXCEPTION 'chat_message_projection requires a matching chat_source_identity';
+            END IF;
+            BEGIN
+                chat_client := split_part(chat_source, ':', 3)::uuid;
+            EXCEPTION WHEN invalid_text_representation THEN
+                RAISE EXCEPTION 'chat_message_projection source identity must end in a client UUID';
+            END;
+            IF chat_source <> format('chat:%s:%s', p_session_id, chat_client) THEN
+                RAISE EXCEPTION 'chat_message_projection source identity is malformed';
+            END IF;
         END IF;
-        BEGIN
-            chat_client := split_part(chat_source, ':', 3)::uuid;
-        EXCEPTION WHEN invalid_text_representation THEN
-            RAISE EXCEPTION 'chat_message_projection source identity must end in a client UUID';
-        END;
-        IF chat_source <> format('chat:%s:%s', p_session_id, chat_client) THEN
-            RAISE EXCEPTION 'chat_message_projection source identity is malformed';
-        END IF;
+    ELSIF chat_work_id_text IS NOT NULL THEN
+        RAISE EXCEPTION 'chat_work_execution_id requires chat_message_projection';
     END IF;
     initial_messages := COALESCE(p_context->'messages', '[]'::jsonb);
     runtime := jsonb_build_object(
@@ -80,10 +122,22 @@ BEGIN
         COALESCE(NULLIF(p_context->>'phase', ''), 'execute'),
         'running'
     )
-    RETURNING id INTO turn_id;
+    RETURNING id INTO new_turn_id;
 
-    PERFORM record_agent_turn_event(turn_id, 'loop_start', p_context);
-    RETURN jsonb_build_object('turn_id', turn_id::text, 'status', 'running', 'runtime_state', runtime);
+    IF chat_work_id IS NOT NULL THEN
+        UPDATE public.m5_work_rounds AS work
+        SET turn_id = new_turn_id
+        WHERE work.id = chat_work_id
+          AND work.task_id = chat_work_task_id
+          AND work.status = 'running'
+          AND work.turn_id IS NULL;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'active M5 work execution could not be bound to the new AgentLoop turn';
+        END IF;
+    END IF;
+
+    PERFORM record_agent_turn_event(new_turn_id, 'loop_start', p_context);
+    RETURN jsonb_build_object('turn_id', new_turn_id::text, 'status', 'running', 'runtime_state', runtime);
 END;
 $$;
 

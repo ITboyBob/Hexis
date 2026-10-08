@@ -785,8 +785,12 @@ class AgentLoop:
             # which appends to agent_turns.messages and bumps the iteration count.
             await self._apply_llm_result(response)
 
+            # `text` is the current response, including an intentionally empty
+            # final response after earlier tool-call narration. Keep it as the
+            # turn result instead of leaking the previous iteration forward.
+            self._last_text = text
+
             if text:
-                self._last_text = text
                 self._visible_text_parts.append(text)
                 # Only emit per-iteration TEXT_DELTA in non-streaming mode
                 # (streaming mode emits per-token via the callback)

@@ -75,6 +75,7 @@ async def test_pending_rounds_reuse_task_session_and_wait_for_report_terminal(
 
     prepared_messages: list[str] = []
     task_sessions: list[str] = []
+    work_executions: list[str] = []
     executed = asyncio.Queue()
     release_first = asyncio.Event()
 
@@ -84,7 +85,8 @@ async def test_pending_rounds_reuse_task_session_and_wait_for_report_terminal(
         return SimpleNamespace(user_message=message)
 
     class _Executor:
-        async def execute_work(self, prepared, *, on_event=None):
+        async def execute_work(self, prepared, *, work_execution_id, on_event=None):
+            work_executions.append(str(work_execution_id))
             message = prepared.user_message
             await executed.put(message)
             if message == "核算订单总价":
@@ -164,6 +166,8 @@ async def test_pending_rounds_reuse_task_session_and_wait_for_report_terminal(
 
     assert prepared_messages == ["核算订单总价", *messages]
     assert set(task_sessions) == {submitted["task_session_id"]}
+    assert len(work_executions) == 4
+    assert len(set(work_executions)) == 4
     assert await service.list_pending_messages(submitted["task_id"]) == []
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(

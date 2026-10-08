@@ -168,10 +168,13 @@ class M5TaskWorker:
                 visual_attachments=visual_attachments,
             )
             execution_started = True
-            result = await self._executor.execute_work(prepared)
+            result = await self._executor.execute_work(
+                prepared,
+                work_execution_id=work_id,
+            )
             turn_id = UUID(str(result.turn_id)) if result.turn_id is not None else None
             result_payload = BackgroundExecutor.m5_work_result_payload(result)
-            result_text = result_payload["visible_text"] or result_payload["text"]
+            result_text = result_payload["text"]
             successful_terminal = (
                 not result.timed_out and result.stopped_reason == "completed"
             )

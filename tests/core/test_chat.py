@@ -762,6 +762,10 @@ async def test_stream_chat_events_persists_successful_tool_receipt(monkeypatch, 
             data={"turn_id": turn_id},
         )
         yield AgentEventData(
+            event=AgentEvent.TEXT_DELTA,
+            data={"turn_id": turn_id, "text": "Checking the memory. "},
+        )
+        yield AgentEventData(
             event=AgentEvent.TOOL_RESULT,
             data={
                 "turn_id": turn_id,
@@ -797,6 +801,13 @@ async def test_stream_chat_events_persists_successful_tool_receipt(monkeypatch, 
             "INSERT INTO config (key, value, description) VALUES ('chat.use_rlm', 'false', 'test override') "
             "ON CONFLICT (key) DO UPDATE SET value='false'"
         )
+        await conn.execute(
+            "INSERT INTO agent_turns (id, mode, session_id, status, result) "
+            "VALUES ($1::uuid, 'chat', $2::uuid, 'completed', $3::jsonb)",
+            turn_id,
+            session_id,
+            json.dumps({"text": "Stored it."}),
+        )
 
     monkeypatch.setattr(chat_mod, "get_agent_profile_context", fake_agent_profile)
     monkeypatch.setattr(chat_mod, "stream_agent", fake_stream_agent)
@@ -818,6 +829,7 @@ async def test_stream_chat_events_persists_successful_tool_receipt(monkeypatch, 
 
     assert any(event.event == AgentEvent.TOOL_RESULT for event in events)
     assert captured["agent_turn_id"] == turn_id
+    assert captured["assistant_message"] == "Stored it."
     assert "action_receipts" not in captured
 
 

@@ -10,6 +10,7 @@ import json
 from typing import Any
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
+from types import SimpleNamespace
 
 import pytest
 
@@ -87,6 +88,47 @@ def _loop_result(
         timed_out=timed_out,
         stopped_reason=stopped_reason,
     )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_execute_work_opts_in_only_with_a_host_bound_work_execution(monkeypatch):
+    captured = []
+
+    async def fake_run(self, user_message, history=None, user_content=None):
+        captured.append(self.config)
+        return _loop_result(text="done", visible_text="done")
+
+    monkeypatch.setattr(AgentLoop, "run", fake_run)
+    prepared = SimpleNamespace(
+        loop_options={
+            "timeout_seconds": 20,
+            "temperature": 0.2,
+            "max_tokens": 200,
+            "is_operator": False,
+            "on_approval": None,
+        },
+        system_prompt="background prompt",
+        llm_config={"provider": "test", "model": "test"},
+        registry=object(),
+        session_id=str(uuid4()),
+        selection=SimpleNamespace(skills=[], available=[]),
+        user_message="Task instruction",
+        history=[],
+        user_content="Task instruction",
+    )
+    executor = BackgroundExecutor(object())
+
+    await executor.execute_work(prepared)
+    work_id = uuid4()
+    await executor.execute_work(prepared, work_execution_id=work_id)
+
+    legacy, hosted = captured
+    assert legacy.chat_message_projection is False
+    assert legacy.chat_source_identity is None
+    assert legacy.chat_work_execution_id is None
+    assert hosted.chat_message_projection is True
+    assert hosted.chat_source_identity == f"m5-work:{work_id}"
+    assert hosted.chat_work_execution_id == str(work_id)
 
 
 @pytest.mark.asyncio(loop_scope="session")

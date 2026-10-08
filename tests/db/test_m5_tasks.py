@@ -12,6 +12,10 @@ import pytest
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
 
 
+def _json(value):
+    return json.loads(value) if isinstance(value, str) else value
+
+
 async def _new_origin(conn):
     return await conn.fetchval(
         "SELECT (get_or_create_chat_session($1, 'chat', NULL, '{}'::jsonb)->>'session_id')::uuid",
@@ -94,6 +98,90 @@ async def test_submit_creates_one_task_session_and_first_work_round_atomically(d
     assert task_session["surface"] == "m5-task"
     assert task_session["status"] == "active"
     assert origin_count == 0
+
+
+async def test_m5_work_input_is_source_identified_and_turn_binding_checks_owner(db_pool):
+    from services.m5_task_service import M5TaskService
+
+    service = M5TaskService(db_pool)
+    async with db_pool.acquire() as conn:
+        origin_session_id = await _new_origin(conn)
+    accepted = await service.submit_m5_task(
+        origin_session_id,
+        uuid4(),
+        "Review the project files",
+        "Inspect the project files and report the existing contract.",
+        _authorization(origin_session_id, f"call-{uuid4()}"),
+    )
+    claim = await service.claim_work_round(accepted["work_execution_id"])
+    assert claim is not None
+    input_text = "Review the project files"
+    for _ in range(2):
+        await service.append_work_input(
+            task_id=accepted["task_id"],
+            work_execution_id=accepted["work_execution_id"],
+            task_session_id=accepted["task_session_id"],
+            text=input_text,
+        )
+
+    source_identity = f"m5-work:{accepted['work_execution_id']}"
+    context = {
+        "messages": [{"role": "user", "content": "assembled context"}],
+        "runtime_state": {
+            "chat_message_projection": True,
+            "chat_source_identity": source_identity,
+            "chat_work_execution_id": accepted["work_execution_id"],
+        },
+    }
+    async with db_pool.acquire() as conn:
+        turn = _json(await conn.fetchval(
+            "SELECT start_agent_turn('chat','assembled context',$1::uuid,$2::jsonb)",
+            accepted["task_session_id"],
+            json.dumps(context),
+        ))
+        input_count = await conn.fetchval(
+            "SELECT count(*) FROM chat_messages WHERE session_id=$1::uuid AND source_message_id=$2",
+            accepted["task_session_id"],
+            f"{source_identity}:input",
+        )
+        runtime_state = _json(await conn.fetchval(
+            "SELECT runtime_state FROM agent_turns WHERE id=$1::uuid",
+            turn["turn_id"],
+        ))
+        assert runtime_state["chat_work_execution_id"] == accepted["work_execution_id"]
+        bound_turn = await conn.fetchval(
+            "SELECT turn_id FROM m5_work_rounds WHERE id=$1::uuid",
+            accepted["work_execution_id"],
+        )
+        assert str(bound_turn) == turn["turn_id"]
+        with pytest.raises(Exception, match="bound to a different AgentLoop turn"):
+            await conn.fetchval(
+                "SELECT finish_m5_work_round($1::uuid,$2::uuid,'completed','{}'::jsonb,NULL,$3::uuid)",
+                accepted["task_id"],
+                accepted["work_execution_id"],
+                uuid4(),
+            )
+        assert await conn.fetchval(
+            "SELECT turn_id FROM m5_work_rounds WHERE id=$1::uuid",
+            accepted["work_execution_id"],
+        ) == bound_turn
+        with pytest.raises(Exception, match="could not be bound"):
+            await conn.fetchval(
+                "SELECT start_agent_turn('chat','retry',$1::uuid,$2::jsonb)",
+                accepted["task_session_id"],
+                json.dumps(context),
+            )
+        assert await conn.fetchval(
+            "SELECT count(*) FROM agent_turns WHERE session_id=$1::uuid",
+            accepted["task_session_id"],
+        ) == 1
+        with pytest.raises(Exception, match="m5-work.*session|work.*session"):
+            await conn.fetchval(
+                "SELECT start_agent_turn('chat','wrong session',$1::uuid,$2::jsonb)",
+                origin_session_id,
+                json.dumps(context),
+            )
+    assert input_count == 1
 
 
 async def test_submit_replay_reuses_business_result_but_new_call_and_conflicts_fail(
