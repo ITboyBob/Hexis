@@ -1,5 +1,7 @@
 import os
 import json
+import ipaddress
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,116 @@ from tenacity import (
 )
 
 from tests.utils import _db_dsn
+
+
+_CLONE_DB_ENV = (
+    "HEXIS_TEST_DB_TEMPLATE",
+    "HEXIS_TEST_DB_EXPECTED_HOST",
+    "HEXIS_TEST_DB_EXPECTED_PORT",
+    "HEXIS_TEST_DB_EXPECTED_SERVER_VERSION",
+    "HEXIS_TEST_DB_EXPECTED_SYSTEM_IDENTIFIER",
+    "HEXIS_TEST_DB_EXPECTED_TARGET_DATABASE",
+)
+
+
+def _clone_test_db_config(db_mode: str, env: dict[str, str] | None = None) -> dict[str, Any] | None:
+    """Validate explicit clone/survivor opt-in without consulting ambient DB defaults."""
+    values = os.environ if env is None else env
+    if db_mode not in {"clone", "survivor", "greenfield"}:
+        raise ValueError(f"unknown db mode: {db_mode}")
+
+    template = values.get("HEXIS_TEST_DB_TEMPLATE")
+    if db_mode == "greenfield":
+        if template:
+            raise ValueError("HEXIS_TEST_DB_TEMPLATE requires --db-mode clone or survivor")
+        return None
+    if not template:
+        raise ValueError("HEXIS_TEST_DB_TEMPLATE is required for clone/survivor mode")
+
+    missing = [name for name in _CLONE_DB_ENV if not values.get(name)]
+    if missing:
+        raise ValueError("missing clone DB identity: " + ", ".join(missing))
+
+    host = values.get("POSTGRES_HOST", "localhost")
+    expected_host = values["HEXIS_TEST_DB_EXPECTED_HOST"]
+    try:
+        is_loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = False
+    if not is_loopback or host != expected_host or expected_host != "127.0.0.1":
+        raise ValueError("clone DB host must match the explicitly expected 127.0.0.1 loopback host")
+
+    port = values.get("POSTGRES_PORT", "43815")
+    expected_port = values["HEXIS_TEST_DB_EXPECTED_PORT"]
+    if not port.isdigit() or port != expected_port:
+        raise ValueError("clone DB port does not match HEXIS_TEST_DB_EXPECTED_PORT")
+
+    target = values.get("POSTGRES_DB", "hexis_memory")
+    expected_target = values["HEXIS_TEST_DB_EXPECTED_TARGET_DATABASE"]
+    if target != expected_target:
+        raise ValueError("POSTGRES_DB does not match HEXIS_TEST_DB_EXPECTED_TARGET_DATABASE")
+    if target == template or template in {"postgres", "template0", "template1", "hexis_memory"}:
+        raise ValueError("clone template and target must differ from one another and user databases")
+    if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_]{0,62}", template):
+        raise ValueError("clone template must be a simple PostgreSQL database identifier")
+    admin_db = values.get("POSTGRES_ADMIN_DB", "postgres")
+    if admin_db in {template, target}:
+        raise ValueError("clone admin database must differ from template and target")
+    if not values.get("POSTGRES_USER") or not values.get("POSTGRES_PASSWORD"):
+        raise ValueError("clone DB credentials must come from the explicit runtime environment")
+
+    return {
+        "mode": db_mode,
+        "host": host,
+        "port": int(port),
+        "admin_database": admin_db,
+        "template_database": template,
+        "target_database": target,
+        "database_user": values["POSTGRES_USER"],
+        "server_version": values["HEXIS_TEST_DB_EXPECTED_SERVER_VERSION"],
+        "system_identifier": values["HEXIS_TEST_DB_EXPECTED_SYSTEM_IDENTIFIER"],
+    }
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--db-mode",
+        choices=("clone", "survivor", "greenfield"),
+        default="greenfield",
+        help="explicit database fixture mode; clone/survivor require isolated template identity",
+    )
+
+
+async def _verify_clone_database_server(admin_conn: asyncpg.Connection, config: dict[str, Any]) -> None:
+    identity = await admin_conn.fetchrow(
+        "SELECT current_database(), current_setting('port'), version(), "
+        "(SELECT system_identifier::text FROM pg_control_system())"
+    )
+    if identity[0] != config["admin_database"]:
+        raise RuntimeError("clone DB admin connection resolved to an unexpected database")
+    # The host endpoint is bound by _clone_test_db_config and _db_dsn;
+    # PostgreSQL reports the container listener, not Docker's published port.
+    if int(identity[1]) != 5432:
+        raise RuntimeError("clone DB container port does not match the expected internal port 5432")
+    if not identity[2].startswith(config["server_version"]):
+        raise RuntimeError("clone DB server version does not match the explicit runtime identity")
+    if identity[3] != config["system_identifier"]:
+        raise RuntimeError("clone DB system identifier does not match the explicit runtime identity")
+    databases = await admin_conn.fetch(
+        "SELECT datname, datallowconn FROM pg_database WHERE datname = ANY($1::text[])",
+        [config["template_database"], config["target_database"]],
+    )
+    found = {row["datname"]: row["datallowconn"] for row in databases}
+    if not found.get(config["template_database"]):
+        raise RuntimeError("clone template database is missing or does not allow connections")
+    if config["target_database"] not in found:
+        raise RuntimeError("clone target database is missing")
+    active_template_connections = await admin_conn.fetchval(
+        "SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+        config["template_database"],
+    )
+    if active_template_connections:
+        raise RuntimeError("clone template has active connections and cannot be safely copied")
 
 
 @pytest.fixture(autouse=True)
@@ -38,8 +150,10 @@ async def _connect_with_retry(dsn: str, *, wait_seconds: int, timeout_seconds: f
 
 
 @pytest.fixture(scope="module", autouse=True)
-async def temp_test_db():
+async def temp_test_db(request):
     """Create a dedicated test database per module and drop it after tests."""
+    db_mode = request.config.getoption("--db-mode")
+    clone_config = _clone_test_db_config(db_mode)
     original_db = os.getenv("POSTGRES_DB", "hexis_memory")
     temp_db = f"tmp_test_{uuid.uuid4().hex}"
     os.environ["POSTGRES_DB"] = temp_db
@@ -61,28 +175,35 @@ async def temp_test_db():
             f"(connect_timeout={connect_timeout}s): {exc!r}"
         )
     try:
-        await admin_conn.execute(f'CREATE DATABASE "{temp_db}"')
+        if clone_config is not None:
+            await _verify_clone_database_server(admin_conn, clone_config)
+            await admin_conn.execute(
+                f'CREATE DATABASE "{temp_db}" TEMPLATE "{clone_config["template_database"]}"'
+            )
+        else:
+            await admin_conn.execute(f'CREATE DATABASE "{temp_db}"')
     finally:
         await admin_conn.close()
 
-    schema_dir = Path(__file__).resolve().parents[1] / "db"
-    schema_files = sorted(schema_dir.glob("*.sql"), key=lambda path: path.name)
-    try:
-        test_conn = await _connect_with_retry(
-            _db_dsn(temp_db),
-            wait_seconds=wait_seconds,
-            timeout_seconds=connect_timeout,
-        )
-    except Exception as exc:
-        pytest.fail(
-            f"Postgres not available for schema init after {wait_seconds}s "
-            f"(connect_timeout={connect_timeout}s): {exc!r}"
-        )
-    try:
-        for schema_path in schema_files:
-            await test_conn.execute(schema_path.read_text(encoding="utf-8"))
-    finally:
-        await test_conn.close()
+    if clone_config is None:
+        schema_dir = Path(__file__).resolve().parents[1] / "db"
+        schema_files = sorted(schema_dir.glob("*.sql"), key=lambda path: path.name)
+        try:
+            test_conn = await _connect_with_retry(
+                _db_dsn(temp_db),
+                wait_seconds=wait_seconds,
+                timeout_seconds=connect_timeout,
+            )
+        except Exception as exc:
+            pytest.fail(
+                f"Postgres not available for schema init after {wait_seconds}s "
+                f"(connect_timeout={connect_timeout}s): {exc!r}"
+            )
+        try:
+            for schema_path in schema_files:
+                await test_conn.execute(schema_path.read_text(encoding="utf-8"))
+        finally:
+            await test_conn.close()
 
     yield
 
@@ -304,10 +425,14 @@ async def configure_agent_for_tests(db_pool):
 
 
 @pytest.fixture(scope="module", autouse=True)
-async def apply_repo_migrations(db_pool):
+async def apply_repo_migrations(db_pool, request):
     """Apply the forward-delta migrations (db/migrations/) after the baseline replay,
     so each temp test DB equals a real deployment: current = baseline + migrations.
     Uses the same runner that ships in production; additive + idempotent."""
+    if request.config.getoption("--db-mode") == "survivor":
+        # Migration-survivor modules override this fixture and assert the old
+        # schema before calling the migration runner themselves.
+        return
     from core.migrations import apply_pending_migrations
 
     async with db_pool.acquire() as conn:

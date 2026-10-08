@@ -317,8 +317,10 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id UUID NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
     ordinal INT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant')),
+    role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'toolResult')),
     content TEXT NOT NULL,
+    content_blocks JSONB NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(content_blocks) = 'array'),
     visible_in_context BOOLEAN NOT NULL DEFAULT TRUE,
     source_message_id TEXT,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -333,6 +335,9 @@ CREATE INDEX IF NOT EXISTS idx_chat_messages_context
     ON chat_messages (session_id, visible_in_context, ordinal DESC);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_metadata
     ON chat_messages USING GIN (metadata);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_messages_session_source_message_id
+    ON chat_messages (session_id, source_message_id)
+    WHERE source_message_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS workflow_step_runs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

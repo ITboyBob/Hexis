@@ -290,76 +290,6 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION append_chat_message(
-    p_session_id UUID,
-    p_role TEXT,
-    p_content TEXT,
-    p_metadata JSONB DEFAULT '{}'::jsonb,
-    p_source_message_id TEXT DEFAULT NULL,
-    p_visible_in_context BOOLEAN DEFAULT TRUE
-) RETURNS JSONB
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    row_message chat_messages%ROWTYPE;
-    next_ordinal INT;
-    normalized_role TEXT := lower(COALESCE(NULLIF(btrim(p_role), ''), ''));
-BEGIN
-    IF p_session_id IS NULL THEN
-        RAISE EXCEPTION 'session_id is required';
-    END IF;
-    PERFORM pg_advisory_xact_lock(hashtext(p_session_id::text));
-    IF normalized_role NOT IN ('system', 'user', 'assistant') THEN
-        RAISE EXCEPTION 'chat message role must be system, user, or assistant';
-    END IF;
-    IF p_content IS NULL THEN
-        RAISE EXCEPTION 'chat message content is required';
-    END IF;
-
-    PERFORM get_or_create_chat_session(p_session_id);
-    SELECT COALESCE(MAX(ordinal), -1) + 1
-    INTO next_ordinal
-    FROM chat_messages
-    WHERE session_id = p_session_id;
-
-    INSERT INTO chat_messages (
-        session_id,
-        ordinal,
-        role,
-        content,
-        metadata,
-        source_message_id,
-        visible_in_context
-    )
-    VALUES (
-        p_session_id,
-        next_ordinal,
-        normalized_role,
-        p_content,
-        COALESCE(p_metadata, '{}'::jsonb),
-        NULLIF(btrim(COALESCE(p_source_message_id, '')), ''),
-        COALESCE(p_visible_in_context, TRUE)
-    )
-    RETURNING * INTO row_message;
-
-    UPDATE chat_sessions
-    SET updated_at = CURRENT_TIMESTAMP,
-        last_active_at = CURRENT_TIMESTAMP
-    WHERE id = p_session_id;
-
-    RETURN jsonb_build_object(
-        'message_id', row_message.id::text,
-        'session_id', row_message.session_id::text,
-        'ordinal', row_message.ordinal,
-        'role', row_message.role,
-        'content', row_message.content,
-        'visible_in_context', row_message.visible_in_context,
-        'metadata', row_message.metadata,
-        'created_at', row_message.created_at
-    );
-END;
-$$;
-
 CREATE OR REPLACE FUNCTION hydrate_chat_session(
     p_session_id UUID,
     p_limit INT DEFAULT NULL,
@@ -390,7 +320,7 @@ BEGIN
     END IF;
 
     WITH selected AS (
-        SELECT role, content, ordinal, id, created_at, metadata
+        SELECT role, content, content_blocks, source_message_id, ordinal, id, created_at, metadata
         FROM chat_messages
         WHERE session_id = p_session_id
           AND visible_in_context
@@ -402,6 +332,8 @@ BEGIN
         jsonb_build_object(
             'role', role,
             'content', content,
+            'content_blocks', content_blocks,
+            'source_message_id', source_message_id,
             'ordinal', ordinal,
             'message_id', id::text,
             'created_at', created_at,
@@ -595,6 +527,7 @@ BEGIN
                 'ordinal', ordinal,
                 'role', role,
                 'content', content,
+                'content_blocks', content_blocks,
                 'visible_in_context', visible_in_context,
                 'source_message_id', source_message_id,
                 'metadata', metadata,
@@ -742,6 +675,7 @@ BEGIN
         ordinal,
         role,
         content,
+        content_blocks,
         visible_in_context,
         source_message_id,
         metadata
@@ -751,6 +685,7 @@ BEGIN
         ordinal,
         role,
         content,
+        content_blocks,
         visible_in_context,
         source_message_id,
         metadata || jsonb_build_object('forked_from_message_id', id::text)
@@ -1153,4 +1088,292 @@ LANGUAGE sql
 STABLE
 AS $$
     SELECT render_chat_continuity_context(p_session_id, p_exclude_sensitive)
+$$;
+
+-- New block-aware write API. Existing callers keep using the six-argument
+-- append_chat_message wrapper defined immediately after this function.
+CREATE OR REPLACE FUNCTION append_chat_message_blocks(
+    p_session_id UUID,
+    p_role TEXT,
+    p_content TEXT,
+    p_content_blocks JSONB,
+    p_metadata JSONB DEFAULT '{}'::jsonb,
+    p_source_message_id TEXT DEFAULT NULL,
+    p_visible_in_context BOOLEAN DEFAULT TRUE
+) RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    row_message chat_messages%ROWTYPE;
+    next_ordinal INT;
+    normalized_role TEXT := NULLIF(btrim(p_role), '');
+    normalized_source TEXT := NULLIF(btrim(COALESCE(p_source_message_id, '')), '');
+    normalized_blocks JSONB := p_content_blocks;
+    normalized_metadata JSONB := COALESCE(p_metadata, '{}'::jsonb);
+    block_value JSONB;
+    text_projection TEXT;
+    text_block_count INT;
+    tool_call_count INT;
+    distinct_call_count INT;
+    turn_id UUID;
+    tool_call_id TEXT;
+    tool_name TEXT;
+BEGIN
+    IF p_session_id IS NULL THEN
+        RAISE EXCEPTION 'session_id is required';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtext(p_session_id::text));
+
+    IF normalized_role IS NULL OR normalized_role NOT IN ('system', 'user', 'assistant', 'toolResult') THEN
+        RAISE EXCEPTION 'chat message role must be system, user, assistant, or toolResult';
+    END IF;
+    IF p_content IS NULL THEN
+        RAISE EXCEPTION 'chat message content is required';
+    END IF;
+    IF normalized_blocks IS NULL OR jsonb_typeof(normalized_blocks) <> 'array' THEN
+        RAISE EXCEPTION 'content_blocks must be a JSON array';
+    END IF;
+    IF jsonb_typeof(normalized_metadata) <> 'object' THEN
+        RAISE EXCEPTION 'message metadata must be a JSON object';
+    END IF;
+
+    FOR block_value IN SELECT value FROM jsonb_array_elements(normalized_blocks)
+    LOOP
+        IF jsonb_typeof(block_value) <> 'object' THEN
+            RAISE EXCEPTION 'each content block must be an object';
+        END IF;
+        IF block_value->>'type' = 'text' THEN
+            IF (SELECT count(*) FROM jsonb_object_keys(block_value)) <> 2
+               OR jsonb_typeof(block_value->'text') <> 'string' THEN
+                RAISE EXCEPTION 'text blocks require exactly type and string text';
+            END IF;
+        ELSIF block_value->>'type' = 'toolCall' THEN
+            IF normalized_role <> 'assistant' THEN
+                RAISE EXCEPTION 'toolCall blocks are allowed only on assistant messages';
+            END IF;
+            IF (SELECT count(*) FROM jsonb_object_keys(block_value)) <> 4
+               OR jsonb_typeof(block_value->'id') <> 'string'
+               OR NULLIF(btrim(block_value->>'id'), '') IS NULL
+               OR jsonb_typeof(block_value->'name') <> 'string'
+               OR NULLIF(btrim(block_value->>'name'), '') IS NULL
+               OR jsonb_typeof(block_value->'arguments') <> 'object' THEN
+                RAISE EXCEPTION 'toolCall requires id, name, and object arguments';
+            END IF;
+            tool_call_id := block_value->>'id';
+        ELSE
+            RAISE EXCEPTION 'unsupported content block type: %', COALESCE(block_value->>'type', '<missing>');
+        END IF;
+    END LOOP;
+
+    SELECT count(*) FILTER (WHERE value->>'type'='text'),
+           COALESCE(string_agg(value->>'text', '' ORDER BY ordinal), '')
+    INTO text_block_count, text_projection
+    FROM jsonb_array_elements(normalized_blocks) WITH ORDINALITY AS blocks(value, ordinal);
+    IF text_block_count > 0 AND text_projection IS DISTINCT FROM p_content THEN
+        RAISE EXCEPTION 'content must equal its text-block compatibility projection';
+    END IF;
+
+    SELECT count(*) FILTER (WHERE value->>'type'='toolCall'),
+           count(DISTINCT value->>'id') FILTER (WHERE value->>'type'='toolCall')
+    INTO tool_call_count, distinct_call_count
+    FROM jsonb_array_elements(normalized_blocks) AS blocks(value);
+    IF tool_call_count > distinct_call_count THEN
+        RAISE EXCEPTION 'toolCall ids must be unique within one assistant message';
+    END IF;
+    IF tool_call_count > 1 THEN
+        RAISE EXCEPTION 'persist each tool call as one source-identified assistant message';
+    END IF;
+    IF tool_call_count > 0 AND text_block_count = 0 AND p_content <> '' THEN
+        RAISE EXCEPTION 'tool-only assistant content must be empty';
+    END IF;
+
+    IF normalized_metadata ? 'tool_result' THEN
+        IF normalized_role <> 'toolResult' THEN
+            RAISE EXCEPTION 'metadata.tool_result is allowed only on toolResult messages';
+        END IF;
+        IF jsonb_typeof(normalized_metadata->'tool_result') <> 'object'
+           OR NOT (normalized_metadata->'tool_result' ? 'toolCallId')
+           OR NOT (normalized_metadata->'tool_result' ? 'toolName')
+           OR NOT (normalized_metadata->'tool_result' ? 'isError')
+           OR NOT (normalized_metadata->'tool_result' ? 'details')
+           OR jsonb_typeof(normalized_metadata#>'{tool_result,toolCallId}') <> 'string'
+           OR NULLIF(btrim(normalized_metadata#>>'{tool_result,toolCallId}'), '') IS NULL
+           OR jsonb_typeof(normalized_metadata#>'{tool_result,toolName}') <> 'string'
+           OR NULLIF(btrim(normalized_metadata#>>'{tool_result,toolName}'), '') IS NULL
+           OR jsonb_typeof(normalized_metadata#>'{tool_result,isError}') <> 'boolean'
+           OR jsonb_typeof(normalized_metadata#>'{tool_result,details}') NOT IN ('object','array','null') THEN
+            RAISE EXCEPTION 'tool_result must contain toolCallId, toolName, boolean isError, and object/array/null details';
+        END IF;
+        IF normalized_source IS NULL THEN
+            RAISE EXCEPTION 'toolResult requires source_message_id';
+        END IF;
+        tool_call_id := normalized_metadata#>>'{tool_result,toolCallId}';
+        tool_name := normalized_metadata#>>'{tool_result,toolName}';
+    ELSIF normalized_role = 'toolResult' THEN
+        RAISE EXCEPTION 'toolResult requires metadata.tool_result';
+    END IF;
+
+    IF normalized_metadata ? 'model_visual_attachments' THEN
+        IF normalized_role <> 'toolResult'
+           OR jsonb_typeof(normalized_metadata->'model_visual_attachments') <> 'array' THEN
+            RAISE EXCEPTION 'model_visual_attachments must be a toolResult array';
+        END IF;
+        IF jsonb_array_length(normalized_metadata->'model_visual_attachments') > 4 THEN
+            RAISE EXCEPTION 'model_visual_attachments cannot contain more than four items';
+        END IF;
+        IF EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements(normalized_metadata->'model_visual_attachments') AS attachments(value)
+            WHERE jsonb_typeof(value) <> 'object'
+               OR jsonb_typeof(value->'data_url') <> 'string'
+               OR jsonb_typeof(value->'mime_type') <> 'string'
+               OR COALESCE(value->>'data_url','') !~ '^data:image/(png|jpeg|webp|gif);base64,'
+               OR COALESCE(value->>'mime_type','') !~ '^image/(png|jpeg|webp|gif)$'
+               OR substring(value->>'data_url' from '^data:image/([^;]+);') <> split_part(value->>'mime_type','/',2)
+               OR (value ? 'name' AND jsonb_typeof(value->'name') <> 'string')
+        ) THEN
+            RAISE EXCEPTION 'model_visual_attachments contains an unsupported image object';
+        END IF;
+    END IF;
+
+    IF tool_call_count > 0 OR normalized_role = 'toolResult' THEN
+        IF normalized_source IS NULL OR jsonb_typeof(normalized_metadata->'agent_turn_id') <> 'string' THEN
+            RAISE EXCEPTION 'tool messages require source_message_id and actual agent_turn_id';
+        END IF;
+        BEGIN
+            turn_id := (normalized_metadata->>'agent_turn_id')::uuid;
+        EXCEPTION WHEN invalid_text_representation THEN
+            RAISE EXCEPTION 'agent_turn_id must be a UUID';
+        END;
+        IF normalized_role = 'assistant'
+           AND normalized_source <> format('tool:%s:%s:call', turn_id, tool_call_id) THEN
+            RAISE EXCEPTION 'toolCall source_message_id does not match its turn and call id';
+        END IF;
+        IF normalized_role = 'toolResult'
+           AND normalized_source <> format('tool:%s:%s:result', turn_id, tool_call_id) THEN
+            RAISE EXCEPTION 'toolResult source_message_id does not match its turn and call id';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM agent_turns WHERE id=turn_id AND session_id=p_session_id) THEN
+            RAISE EXCEPTION 'agent_turn_id does not belong to this chat session';
+        END IF;
+    END IF;
+
+    PERFORM get_or_create_chat_session(p_session_id);
+    IF normalized_source IS NOT NULL THEN
+        SELECT * INTO row_message
+        FROM chat_messages
+        WHERE session_id = p_session_id AND source_message_id = normalized_source
+        FOR UPDATE;
+        IF FOUND THEN
+            IF row_message.role = normalized_role
+               AND row_message.content = p_content
+               AND row_message.content_blocks = normalized_blocks
+               AND row_message.metadata = normalized_metadata
+               AND row_message.visible_in_context = COALESCE(p_visible_in_context, TRUE) THEN
+                RETURN jsonb_build_object(
+                    'message_id', row_message.id::text,
+                    'session_id', row_message.session_id::text,
+                    'ordinal', row_message.ordinal,
+                    'role', row_message.role,
+                    'content', row_message.content,
+                    'content_blocks', row_message.content_blocks,
+                    'source_message_id', row_message.source_message_id,
+                    'visible_in_context', row_message.visible_in_context,
+                    'metadata', row_message.metadata,
+                    'created_at', row_message.created_at
+                );
+            END IF;
+            RAISE EXCEPTION 'source_message_id conflict for session % and source %', p_session_id, normalized_source;
+        END IF;
+    END IF;
+
+    IF tool_call_count > 0 THEN
+        IF EXISTS (
+            SELECT 1
+            FROM chat_messages existing
+            CROSS JOIN LATERAL jsonb_array_elements(existing.content_blocks) AS prior(block)
+            WHERE existing.session_id = p_session_id
+              AND existing.role = 'assistant'
+              AND existing.metadata->>'agent_turn_id' = turn_id::text
+              AND prior.block->>'type' = 'toolCall'
+              AND prior.block->>'id' = tool_call_id
+        ) THEN
+            RAISE EXCEPTION 'tool call identity already exists for this session/turn/call id';
+        END IF;
+    END IF;
+
+    IF normalized_role = 'toolResult' THEN
+        IF NOT EXISTS (
+            SELECT 1
+            FROM chat_messages call_message
+            CROSS JOIN LATERAL jsonb_array_elements(call_message.content_blocks) AS prior(block)
+            WHERE call_message.session_id = p_session_id
+              AND call_message.role = 'assistant'
+              AND call_message.metadata->>'agent_turn_id' = turn_id::text
+              AND prior.block->>'type' = 'toolCall'
+              AND prior.block->>'id' = tool_call_id
+              AND prior.block->>'name' = tool_name
+        ) THEN
+            RAISE EXCEPTION 'toolResult has no matching call in this session and agent turn';
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM chat_messages prior_result
+            WHERE prior_result.session_id = p_session_id
+              AND prior_result.role = 'toolResult'
+              AND prior_result.metadata->>'agent_turn_id' = turn_id::text
+              AND prior_result.metadata#>>'{tool_result,toolCallId}' = tool_call_id
+        ) THEN
+            RAISE EXCEPTION 'tool result identity already exists for this session/turn/call id';
+        END IF;
+    END IF;
+
+    SELECT COALESCE(MAX(ordinal), -1) + 1 INTO next_ordinal
+    FROM chat_messages WHERE session_id = p_session_id;
+    INSERT INTO chat_messages (
+        session_id, ordinal, role, content, content_blocks, metadata, source_message_id, visible_in_context
+    ) VALUES (
+        p_session_id, next_ordinal, normalized_role, p_content, normalized_blocks,
+        normalized_metadata, normalized_source, COALESCE(p_visible_in_context, TRUE)
+    ) RETURNING * INTO row_message;
+
+    UPDATE chat_sessions
+    SET updated_at = CURRENT_TIMESTAMP, last_active_at = CURRENT_TIMESTAMP
+    WHERE id = p_session_id;
+
+    RETURN jsonb_build_object(
+        'message_id', row_message.id::text,
+        'session_id', row_message.session_id::text,
+        'ordinal', row_message.ordinal,
+        'role', row_message.role,
+        'content', row_message.content,
+        'content_blocks', row_message.content_blocks,
+        'source_message_id', row_message.source_message_id,
+        'visible_in_context', row_message.visible_in_context,
+        'metadata', row_message.metadata,
+        'created_at', row_message.created_at
+    );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION append_chat_message(
+    p_session_id UUID,
+    p_role TEXT,
+    p_content TEXT,
+    p_metadata JSONB DEFAULT '{}'::jsonb,
+    p_source_message_id TEXT DEFAULT NULL,
+    p_visible_in_context BOOLEAN DEFAULT TRUE
+) RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    normalized_role TEXT := lower(COALESCE(NULLIF(btrim(p_role), ''), ''));
+BEGIN
+    IF normalized_role NOT IN ('system', 'user', 'assistant') THEN
+        RAISE EXCEPTION 'chat message role must be system, user, or assistant';
+    END IF;
+    RETURN append_chat_message_blocks(
+        p_session_id, normalized_role, p_content, '[]'::jsonb,
+        COALESCE(p_metadata, '{}'::jsonb), p_source_message_id, p_visible_in_context
+    );
+END;
 $$;

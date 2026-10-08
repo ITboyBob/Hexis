@@ -1,0 +1,1225 @@
+{
+  "schema": "bob107-conversation-fixtures-v1",
+  "source_level": "synthetic_static",
+  "说明": "本次授权准备的确定性离线测试数据。UUID、call、结果均为合成值，不证明真实数据库、供应商请求、工具执行或产品验收。",
+  "cases": [
+    {
+      "id": "text",
+      "说明": "普通正文不重复投影",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "已读正文：项目名称是 Hexis",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "已读正文：项目名称是 Hexis"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:assistant"
+        }
+      ],
+      "expected": {
+        "valid": true,
+        "memory_texts": [
+          "请只读检查 Hexis 项目名称",
+          "已读正文：项目名称是 Hexis"
+        ]
+      }
+    },
+    {
+      "id": "details-object",
+      "说明": "结果 details 类型：object",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "read_file",
+              "arguments": {
+                "path": "README.md"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "toolResult",
+          "content": "项目名称是 Hexis",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "项目名称是 Hexis"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001",
+            "tool_result": {
+              "toolCallId": "bob107-static-call-1",
+              "toolName": "read_file",
+              "isError": false,
+              "details": {
+                "project": "Hexis",
+                "sentinel": "BOB107_工具结构哨兵"
+              }
+            }
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:result"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "已读正文：项目名称是 Hexis",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "已读正文：项目名称是 Hexis"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:assistant"
+        }
+      ],
+      "expected": {
+        "valid": true,
+        "provider_roles": [
+          "user",
+          "assistant",
+          "tool",
+          "assistant"
+        ],
+        "memory_texts": [
+          "请只读检查 Hexis 项目名称",
+          "已读正文：项目名称是 Hexis"
+        ],
+        "memory_excludes": [
+          "BOB107_工具结构哨兵",
+          "README.md"
+        ]
+      }
+    },
+    {
+      "id": "details-array",
+      "说明": "结果 details 类型：array",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "read_file",
+              "arguments": {
+                "path": "README.md"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "toolResult",
+          "content": "项目名称是 Hexis",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "项目名称是 Hexis"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001",
+            "tool_result": {
+              "toolCallId": "bob107-static-call-1",
+              "toolName": "read_file",
+              "isError": false,
+              "details": [
+                {
+                  "project": "Hexis",
+                  "sentinel": "BOB107_工具结构哨兵"
+                }
+              ]
+            }
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:result"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "已读正文：项目名称是 Hexis",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "已读正文：项目名称是 Hexis"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:assistant"
+        }
+      ],
+      "expected": {
+        "valid": true,
+        "provider_roles": [
+          "user",
+          "assistant",
+          "tool",
+          "assistant"
+        ],
+        "memory_texts": [
+          "请只读检查 Hexis 项目名称",
+          "已读正文：项目名称是 Hexis"
+        ],
+        "memory_excludes": [
+          "BOB107_工具结构哨兵",
+          "README.md"
+        ]
+      }
+    },
+    {
+      "id": "details-null",
+      "说明": "结果 details 类型：null",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "read_file",
+              "arguments": {
+                "path": "README.md"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "toolResult",
+          "content": "项目名称是 Hexis",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "项目名称是 Hexis"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001",
+            "tool_result": {
+              "toolCallId": "bob107-static-call-1",
+              "toolName": "read_file",
+              "isError": false,
+              "details": null
+            }
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:result"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "已读正文：项目名称是 Hexis",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "已读正文：项目名称是 Hexis"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:assistant"
+        }
+      ],
+      "expected": {
+        "valid": true,
+        "provider_roles": [
+          "user",
+          "assistant",
+          "tool",
+          "assistant"
+        ],
+        "memory_texts": [
+          "请只读检查 Hexis 项目名称",
+          "已读正文：项目名称是 Hexis"
+        ],
+        "memory_excludes": [
+          "BOB107_工具结构哨兵",
+          "README.md"
+        ]
+      }
+    },
+    {
+      "id": "error-string",
+      "说明": "错误字符串仅进入 text 块",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "read_file",
+              "arguments": {
+                "path": "README.md"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "toolResult",
+          "content": "读取失败：文件不存在",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "读取失败：文件不存在"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001",
+            "tool_result": {
+              "toolCallId": "bob107-static-call-1",
+              "toolName": "read_file",
+              "isError": true,
+              "details": null
+            }
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:result"
+        }
+      ],
+      "expected": {
+        "valid": true,
+        "action_success": false,
+        "memory_texts": [
+          "请只读检查 Hexis 项目名称"
+        ]
+      }
+    },
+    {
+      "id": "legacy",
+      "说明": "旧 receipt 保留读取，不制造配对",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "历史已读文件",
+          "content_blocks": [],
+          "metadata": {
+            "action_receipts": [
+              {
+                "tool_name": "read_file",
+                "call_id": "bob107-static-call-1",
+                "arguments": {
+                  "path": "README.md"
+                },
+                "success": true,
+                "display_output": "历史回执"
+              }
+            ]
+          },
+          "source_message_id": null
+        }
+      ],
+      "expected": {
+        "valid": true,
+        "historical_incomplete": true,
+        "replay_allowed": false
+      }
+    },
+    {
+      "id": "missing-call",
+      "说明": "结果缺失调用",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "toolResult",
+          "content": "项目名称是 Hexis",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "项目名称是 Hexis"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001",
+            "tool_result": {
+              "toolCallId": "bob107-static-call-1",
+              "toolName": "read_file",
+              "isError": false,
+              "details": {
+                "project": "Hexis"
+              }
+            }
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:result"
+        }
+      ],
+      "expected": {
+        "valid": true,
+        "historical_incomplete": true,
+        "provider_orphan_tool_allowed": false,
+        "replay_allowed": false
+      }
+    },
+    {
+      "id": "missing-result",
+      "说明": "调用缺失结果",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "read_file",
+              "arguments": {
+                "path": "README.md"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        }
+      ],
+      "expected": {
+        "valid": true,
+        "historical_incomplete": true,
+        "replay_allowed": false
+      }
+    },
+    {
+      "id": "call-conflict",
+      "说明": "同 call 不同参数拒绝",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "read_file",
+              "arguments": {
+                "path": "README.md"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "read_file",
+              "arguments": {
+                "path": "OTHER.md"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        }
+      ],
+      "expected": {
+        "valid": false,
+        "error_category": "call_arguments_conflict",
+        "replay_allowed": false
+      }
+    },
+    {
+      "id": "source-conflict",
+      "说明": "同来源不同正文拒绝",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "不同的用户输入",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "不同的用户输入"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        }
+      ],
+      "expected": {
+        "valid": false,
+        "error_category": "source_identity_conflict",
+        "overwrite_allowed": false
+      }
+    },
+    {
+      "id": "invalid-details-string",
+      "说明": "非法 details 拒绝",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "read_file",
+              "arguments": {
+                "path": "README.md"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "toolResult",
+          "content": "项目名称是 Hexis",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "项目名称是 Hexis"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001",
+            "tool_result": {
+              "toolCallId": "bob107-static-call-1",
+              "toolName": "read_file",
+              "isError": false,
+              "details": "BOB107_工具结构哨兵"
+            }
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:result"
+        }
+      ],
+      "expected": {
+        "valid": false,
+        "error_category": "invalid_details"
+      }
+    },
+    {
+      "id": "invalid-details-number",
+      "说明": "非法 details 拒绝",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "read_file",
+              "arguments": {
+                "path": "README.md"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "toolResult",
+          "content": "项目名称是 Hexis",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "项目名称是 Hexis"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001",
+            "tool_result": {
+              "toolCallId": "bob107-static-call-1",
+              "toolName": "read_file",
+              "isError": false,
+              "details": 1
+            }
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:result"
+        }
+      ],
+      "expected": {
+        "valid": false,
+        "error_category": "invalid_details"
+      }
+    },
+    {
+      "id": "invalid-details-boolean",
+      "说明": "非法 details 拒绝",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "read_file",
+              "arguments": {
+                "path": "README.md"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "toolResult",
+          "content": "项目名称是 Hexis",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "项目名称是 Hexis"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001",
+            "tool_result": {
+              "toolCallId": "bob107-static-call-1",
+              "toolName": "read_file",
+              "isError": false,
+              "details": true
+            }
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:result"
+        }
+      ],
+      "expected": {
+        "valid": false,
+        "error_category": "invalid_details"
+      }
+    },
+    {
+      "id": "invalid-iserror",
+      "说明": "isError 字符串不得冒充 bool",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "read_file",
+              "arguments": {
+                "path": "README.md"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "toolResult",
+          "content": "项目名称是 Hexis",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "项目名称是 Hexis"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001",
+            "tool_result": {
+              "toolCallId": "bob107-static-call-1",
+              "toolName": "read_file",
+              "isError": "false",
+              "details": null
+            }
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:result"
+        }
+      ],
+      "expected": {
+        "valid": false,
+        "error_category": "invalid_is_error"
+      }
+    },
+    {
+      "id": "invalid-blocks",
+      "说明": "blocks 对象不得冒充数组",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": {},
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        }
+      ],
+      "expected": {
+        "valid": false,
+        "error_category": "invalid_content_blocks"
+      }
+    },
+    {
+      "id": "m5-accepted",
+      "说明": "M5 受理与取消不同成果语义",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "submit",
+              "arguments": {
+                "task_description": "只读检查项目"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "toolResult",
+          "content": "{\"contract_version\": \"m5-tool-v1\", \"tool_name\": \"submit\", \"call_id\": \"bob107-static-call-1\", \"operation_id\": \"40000000-0000-4000-8000-000000000001\", \"ok\": true, \"state\": \"accepted\", \"data\": {}, \"error\": null}",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "{\"contract_version\": \"m5-tool-v1\", \"tool_name\": \"submit\", \"call_id\": \"bob107-static-call-1\", \"operation_id\": \"40000000-0000-4000-8000-000000000001\", \"ok\": true, \"state\": \"accepted\", \"data\": {}, \"error\": null}"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001",
+            "tool_result": {
+              "toolCallId": "bob107-static-call-1",
+              "toolName": "submit",
+              "isError": false,
+              "details": {
+                "contract_version": "m5-tool-v1",
+                "tool_name": "submit",
+                "call_id": "bob107-static-call-1",
+                "operation_id": "40000000-0000-4000-8000-000000000001",
+                "ok": true,
+                "state": "accepted",
+                "data": {},
+                "error": null
+              }
+            }
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:result"
+        }
+      ],
+      "expected": {
+        "valid": true,
+        "action_success": true,
+        "task_complete": false,
+        "memory_complete": false,
+        "receipt_fields": 8
+      }
+    },
+    {
+      "id": "m5-pending",
+      "说明": "M5 受理与取消不同成果语义",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "pend_message",
+              "arguments": {
+                "message": "请继续只读检查"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "toolResult",
+          "content": "{\"contract_version\": \"m5-tool-v1\", \"tool_name\": \"pend_message\", \"call_id\": \"bob107-static-call-1\", \"operation_id\": \"40000000-0000-4000-8000-000000000001\", \"ok\": true, \"state\": \"pending\", \"data\": {}, \"error\": null}",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "{\"contract_version\": \"m5-tool-v1\", \"tool_name\": \"pend_message\", \"call_id\": \"bob107-static-call-1\", \"operation_id\": \"40000000-0000-4000-8000-000000000001\", \"ok\": true, \"state\": \"pending\", \"data\": {}, \"error\": null}"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001",
+            "tool_result": {
+              "toolCallId": "bob107-static-call-1",
+              "toolName": "pend_message",
+              "isError": false,
+              "details": {
+                "contract_version": "m5-tool-v1",
+                "tool_name": "pend_message",
+                "call_id": "bob107-static-call-1",
+                "operation_id": "40000000-0000-4000-8000-000000000001",
+                "ok": true,
+                "state": "pending",
+                "data": {},
+                "error": null
+              }
+            }
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:result"
+        }
+      ],
+      "expected": {
+        "valid": true,
+        "action_success": true,
+        "task_complete": false,
+        "memory_complete": false,
+        "receipt_fields": 8
+      }
+    },
+    {
+      "id": "m5-selection_cancelled",
+      "说明": "M5 受理与取消不同成果语义",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "pend_message",
+              "arguments": {
+                "message": "请继续只读检查"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "toolResult",
+          "content": "{\"contract_version\": \"m5-tool-v1\", \"tool_name\": \"pend_message\", \"call_id\": \"bob107-static-call-1\", \"operation_id\": \"40000000-0000-4000-8000-000000000001\", \"ok\": true, \"state\": \"selection_cancelled\", \"data\": {}, \"error\": null}",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "{\"contract_version\": \"m5-tool-v1\", \"tool_name\": \"pend_message\", \"call_id\": \"bob107-static-call-1\", \"operation_id\": \"40000000-0000-4000-8000-000000000001\", \"ok\": true, \"state\": \"selection_cancelled\", \"data\": {}, \"error\": null}"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001",
+            "tool_result": {
+              "toolCallId": "bob107-static-call-1",
+              "toolName": "pend_message",
+              "isError": false,
+              "details": {
+                "contract_version": "m5-tool-v1",
+                "tool_name": "pend_message",
+                "call_id": "bob107-static-call-1",
+                "operation_id": "40000000-0000-4000-8000-000000000001",
+                "ok": true,
+                "state": "selection_cancelled",
+                "data": {},
+                "error": null
+              }
+            }
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:result"
+        }
+      ],
+      "expected": {
+        "valid": true,
+        "action_success": false,
+        "task_complete": false,
+        "memory_complete": false,
+        "receipt_fields": 8
+      }
+    },
+    {
+      "id": "empty-tool-bubble",
+      "说明": "工具-only assistant 不渲染空正文泡",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "read_file",
+              "arguments": {
+                "path": "README.md"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        }
+      ],
+      "expected": {
+        "valid": true,
+        "empty_text_bubble": false,
+        "memory_texts": []
+      }
+    },
+    {
+      "id": "turn-mismatch",
+      "说明": "调用和结果来自不同真实turn时不能配对",
+      "messages": [
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "user",
+          "content": "请只读检查 Hexis 项目名称",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "请只读检查 Hexis 项目名称"
+            }
+          ],
+          "metadata": {},
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:user"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "toolCall",
+              "id": "bob107-static-call-1",
+              "name": "read_file",
+              "arguments": {
+                "path": "README.md"
+              }
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:call"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "toolResult",
+          "content": "项目名称是 Hexis",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "项目名称是 Hexis"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000002",
+            "tool_result": {
+              "toolCallId": "bob107-static-call-1",
+              "toolName": "read_file",
+              "isError": false,
+              "details": {
+                "project": "Hexis",
+                "sentinel": "BOB107_工具结构哨兵"
+              }
+            }
+          },
+          "source_message_id": "tool:20000000-0000-4000-8000-000000000001:bob107-static-call-1:result"
+        },
+        {
+          "session_id": "10000000-0000-4000-8000-000000000001",
+          "role": "assistant",
+          "content": "已读正文：项目名称是 Hexis",
+          "content_blocks": [
+            {
+              "type": "text",
+              "text": "已读正文：项目名称是 Hexis"
+            }
+          ],
+          "metadata": {
+            "agent_turn_id": "20000000-0000-4000-8000-000000000001"
+          },
+          "source_message_id": "chat:10000000-0000-4000-8000-000000000001:30000000-0000-4000-8000-000000000001:assistant"
+        }
+      ],
+      "expected": {
+        "valid": false,
+        "error_category": "turn_identity_mismatch",
+        "replay_allowed": false
+      }
+    }
+  ]
+}

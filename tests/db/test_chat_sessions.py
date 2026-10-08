@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from uuid import uuid4
 
 import pytest
@@ -107,6 +108,268 @@ async def test_record_hydrate_and_clear_chat_session(db_pool):
             assert after_clear["messages"] == []
         finally:
             await tr.rollback()
+
+
+async def test_append_chat_message_blocks_is_idempotent_and_preserves_role_case(db_pool):
+    session_id = uuid4()
+    source_id = f"chat:{session_id}:{uuid4()}:user"
+    content = "Read the README title."
+    blocks = [{"type": "text", "text": content}]
+    metadata = {"client_message_id": str(uuid4())}
+
+    async with db_pool.acquire() as conn:
+        first = _j(await conn.fetchval(
+            "SELECT append_chat_message_blocks($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7)",
+            session_id,
+            "user",
+            content,
+            json.dumps(blocks),
+            json.dumps(metadata),
+            source_id,
+            True,
+        ))
+        repeated = _j(await conn.fetchval(
+            "SELECT append_chat_message_blocks($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7)",
+            session_id,
+            "user",
+            content,
+            json.dumps(blocks),
+            json.dumps(metadata),
+            source_id,
+            True,
+        ))
+        assert first["message_id"] == repeated["message_id"]
+        assert repeated["ordinal"] == first["ordinal"]
+        assert repeated["content_blocks"] == blocks
+
+        with pytest.raises(Exception, match="source_message_id conflict"):
+            async with conn.transaction():
+                await conn.fetchval(
+                    "SELECT append_chat_message_blocks($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7)",
+                    session_id,
+                    "user",
+                    "Changed content.",
+                    json.dumps([{"type": "text", "text": "Changed content."}]),
+                    json.dumps(metadata),
+                    source_id,
+                    True,
+                )
+
+        stored = await conn.fetchrow(
+            "SELECT role,content,content_blocks,source_message_id FROM chat_messages WHERE id=$1::uuid",
+            first["message_id"],
+        )
+        assert stored["role"] == "user"
+        assert stored["content"] == content
+        assert _j(stored["content_blocks"]) == blocks
+        assert stored["source_message_id"] == source_id
+
+
+async def test_append_chat_message_blocks_with_text_before_tool_call(db_pool):
+    session_id = uuid4()
+    call_id = f"call_{uuid4().hex}"
+    content = "I will read the README."
+    blocks = [
+        {"type": "text", "text": content},
+        {"type": "toolCall", "id": call_id, "name": "read_file", "arguments": {"path": "README.md"}},
+    ]
+    async with db_pool.acquire() as conn:
+        turn_id = await conn.fetchval(
+            "INSERT INTO agent_turns(mode,session_id,status,phase) "
+            "VALUES('chat',$1,'running','execute') RETURNING id",
+            session_id,
+        )
+        metadata = json.dumps({"agent_turn_id": str(turn_id)})
+        source_id = f"tool:{turn_id}:{call_id}:call"
+        written = _j(await conn.fetchval(
+            "SELECT append_chat_message_blocks($1,'assistant',$2,$3::jsonb,$4::jsonb,$5,TRUE)",
+            session_id, content, json.dumps(blocks), metadata, source_id,
+        ))
+        stored = await conn.fetchrow(
+            "SELECT content,content_blocks,source_message_id FROM chat_messages WHERE id=$1::uuid",
+            written["message_id"],
+        )
+        assert stored["content"] == content
+        assert _j(stored["content_blocks"]) == blocks
+        assert stored["source_message_id"] == source_id
+
+        with pytest.raises(Exception, match="source_message_id does not match"):
+            async with conn.transaction():
+                await conn.fetchval(
+                    "SELECT append_chat_message_blocks($1,'assistant',$2,$3::jsonb,$4::jsonb,$5,TRUE)",
+                    session_id, content, json.dumps(blocks), metadata,
+                    f"tool:{turn_id}:different-call:call",
+                )
+
+        with pytest.raises(Exception, match="persist each tool call"):
+            async with conn.transaction():
+                await conn.fetchval(
+                    "SELECT append_chat_message_blocks($1,'assistant',$2,$3::jsonb,$4::jsonb,$5,TRUE)",
+                    session_id, content,
+                    json.dumps([*blocks, {"type": "toolCall", "id": "extra-call", "name": "read_file", "arguments": {}}]),
+                    metadata, source_id,
+                )
+
+
+async def test_concurrent_same_source_block_append_creates_one_row(db_pool):
+    session_id = uuid4()
+    source_id = f"chat:{session_id}:{uuid4()}:user"
+    content = "Concurrent source identity."
+    blocks = [{"type": "text", "text": content}]
+
+    async def append_once():
+        async with db_pool.acquire() as conn:
+            return _j(await conn.fetchval(
+                "SELECT append_chat_message_blocks($1,$2,$3,$4::jsonb,'{}'::jsonb,$5,TRUE)",
+                session_id,
+                "user",
+                content,
+                json.dumps(blocks),
+                source_id,
+            ))
+
+    results = await asyncio.gather(*(append_once() for _ in range(8)))
+    assert len({result["message_id"] for result in results}) == 1
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT count(*) FROM chat_messages WHERE session_id=$1 AND source_message_id=$2",
+            session_id,
+            source_id,
+        )
+    assert count == 1
+
+
+async def test_blocks_roundtrip_through_hydrate_artifact_and_fork(db_pool):
+    session_id = uuid4()
+    user_content = "What is the README project title?"
+    assistant_content = "Hexis."
+    async with db_pool.acquire() as conn:
+        await conn.fetchval(
+            "SELECT append_chat_message_blocks($1,'user',$2,$3::jsonb,'{}'::jsonb,$4,TRUE)",
+            session_id,
+            user_content,
+            json.dumps([{"type": "text", "text": user_content}]),
+            f"chat:{session_id}:{uuid4()}:user",
+        )
+        await conn.fetchval(
+            "SELECT append_chat_message_blocks($1,'assistant',$2,$3::jsonb,'{}'::jsonb,$4,TRUE)",
+            session_id,
+            assistant_content,
+            json.dumps([{"type": "text", "text": assistant_content}]),
+            f"chat:{session_id}:{uuid4()}:assistant",
+        )
+        hydrated = _j(await conn.fetchval("SELECT hydrate_chat_session($1::uuid)", session_id))
+        artifact = _j(await conn.fetchval("SELECT get_chat_session_artifact($1::uuid,TRUE,TRUE)", session_id))
+        forked = _j(await conn.fetchval(
+            "SELECT fork_chat_session($1::uuid,NULL,'Conversation blocks fork','{}'::jsonb)", session_id
+        ))
+
+    expected_blocks = [
+        [{"type": "text", "text": user_content}],
+        [{"type": "text", "text": assistant_content}],
+    ]
+    assert [message["content_blocks"] for message in hydrated["messages"]] == expected_blocks
+    assert [message["content_blocks"] for message in artifact["messages"]] == expected_blocks
+    assert [message["content_blocks"] for message in forked["messages"]] == expected_blocks
+    assert all(message["metadata"].get("forked_from_message_id") for message in forked["messages"])
+
+
+async def test_fork_rejects_tool_call_idempotency_with_parent_turn(db_pool):
+    session_id = uuid4()
+    call_id = f"call_{uuid4().hex}"
+    blocks = [{"type": "toolCall", "id": call_id, "name": "read_file", "arguments": {"path": "README.md"}}]
+    async with db_pool.acquire() as conn:
+        turn_id = await conn.fetchval(
+            "INSERT INTO agent_turns(mode,session_id,status,phase) "
+            "VALUES('chat',$1,'running','execute') RETURNING id",
+            session_id,
+        )
+        await conn.fetchval(
+            "SELECT append_chat_message_blocks($1,'assistant','',$2::jsonb,$3::jsonb,$4,TRUE)",
+            session_id, json.dumps(blocks), json.dumps({"agent_turn_id": str(turn_id)}),
+            f"tool:{turn_id}:{call_id}:call",
+        )
+        forked = _j(await conn.fetchval(
+            "SELECT fork_chat_session($1::uuid,NULL,'Historical tool call fork','{}'::jsonb)",
+            session_id,
+        ))
+        fork_id = forked["session"]["session_id"]
+        historical = forked["messages"][0]
+        assert historical["metadata"]["agent_turn_id"] == str(turn_id)
+
+        with pytest.raises(Exception, match="agent_turn_id does not belong"):
+            async with conn.transaction():
+                await conn.fetchval(
+                    "SELECT append_chat_message_blocks($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7)",
+                    fork_id, historical["role"], historical["content"],
+                    json.dumps(historical["content_blocks"]), json.dumps(historical["metadata"]),
+                    historical["source_message_id"], historical["visible_in_context"],
+                )
+
+        rows = await conn.fetch("SELECT id FROM chat_messages WHERE session_id=$1::uuid", fork_id)
+        assert [str(row["id"]) for row in rows] == [historical["message_id"]]
+        assert await conn.fetchval("SELECT count(*) FROM agent_turns WHERE session_id=$1::uuid", fork_id) == 0
+
+
+async def test_tool_result_role_case_turn_pair_and_details_are_persisted(db_pool):
+    session_id = uuid4()
+    call_id = f"call_{uuid4().hex}"
+    async with db_pool.acquire() as conn:
+        turn_id = await conn.fetchval(
+            "INSERT INTO agent_turns(mode,session_id,status,phase) "
+            "VALUES('chat',$1,'running','execute') RETURNING id",
+            session_id,
+        )
+        call = _j(await conn.fetchval(
+            "SELECT append_chat_message_blocks($1,'assistant','',$2::jsonb,$3::jsonb,$4,TRUE)",
+            session_id,
+            json.dumps([{"type": "toolCall", "id": call_id, "name": "read_file", "arguments": {"path": "README.md"}}]),
+            json.dumps({"agent_turn_id": str(turn_id)}),
+            f"tool:{turn_id}:{call_id}:call",
+        ))
+        metadata = {
+            "agent_turn_id": str(turn_id),
+            "tool_result": {
+                "toolCallId": call_id,
+                "toolName": "read_file",
+                "isError": False,
+                "details": ["README.md", "LICENSE"],
+            },
+        }
+        result = _j(await conn.fetchval(
+            "SELECT append_chat_message_blocks($1,'toolResult',$2,$3::jsonb,$4::jsonb,$5,TRUE)",
+            session_id,
+            "README.md",
+            json.dumps([{"type": "text", "text": "README.md"}]),
+            json.dumps(metadata),
+            f"tool:{turn_id}:{call_id}:result",
+        ))
+        repeated = _j(await conn.fetchval(
+            "SELECT append_chat_message_blocks($1,'toolResult',$2,$3::jsonb,$4::jsonb,$5,TRUE)",
+            session_id,
+            "README.md",
+            json.dumps([{"type": "text", "text": "README.md"}]),
+            json.dumps(metadata),
+            f"tool:{turn_id}:{call_id}:result",
+        ))
+
+    assert call["role"] == "assistant"
+    assert call["content"] == ""
+    assert result["role"] == "toolResult"
+    assert repeated["message_id"] == result["message_id"]
+    assert result["metadata"]["tool_result"]["details"] == ["README.md", "LICENSE"]
+
+    async with db_pool.acquire() as conn:
+        with pytest.raises(Exception, match="tool_result"):
+            await conn.fetchval(
+                "SELECT append_chat_message_blocks($1,'toolResult','x',$2::jsonb,$3::jsonb,$4,TRUE)",
+                session_id,
+                json.dumps([{"type": "text", "text": "x"}]),
+                json.dumps({"agent_turn_id": str(turn_id), "tool_result": {
+                    "toolCallId": "other-call", "toolName": "read_file", "isError": "false", "details": "not allowed"
+                }}),
+                f"tool:{turn_id}:other-call:result",
+            )
 
 
 async def test_recording_a_user_turn_marks_user_contact(db_pool):
@@ -524,10 +787,14 @@ async def test_continuity_packet_includes_recent_heartbeat_failures(db_pool):
     session_id = str(uuid4())
 
     async with db_pool.acquire() as conn:
+        original_heartbeat_limit = await conn.fetchval("SELECT get_config_int('chat.continuity_heartbeat_limit')")
         tr = conn.transaction()
         await tr.start()
         try:
             await _stub_get_embedding(conn)
+            # Clone fixtures retain the user's disabled heartbeat projection;
+            # this rendering case explicitly enables it only until rollback.
+            await conn.execute("SELECT set_config('chat.continuity_heartbeat_limit', '3'::jsonb)")
             await conn.fetchval(
                 """
                 SELECT create_episodic_memory(
@@ -580,6 +847,7 @@ async def test_continuity_packet_includes_recent_heartbeat_failures(db_pool):
             )
         finally:
             await tr.rollback()
+        assert await conn.fetchval("SELECT get_config_int('chat.continuity_heartbeat_limit')") == original_heartbeat_limit
 
     assert "### Recent Autonomous Heartbeats" in continuity
     assert "Heartbeat #999" in continuity
