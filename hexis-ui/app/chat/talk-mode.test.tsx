@@ -19,13 +19,15 @@ const captureMocks = vi.hoisted(() => ({
   })),
   resume: vi.fn().mockResolvedValue(undefined),
   onBargeIn: undefined as ((target?: { response_id: string; playback_id: string; output_epoch: number }) => void) | undefined,
+  resolveBargeInTarget: undefined as (() => { response_id: string; playback_id: string; output_epoch: number } | null) | undefined,
   captureInstanceId: "capture-1",
   id: "capture-1",
 }));
 
 vi.mock("@/lib/voice-realtime/capture", () => ({
-  AudioCaptureController: vi.fn().mockImplementation((_client, id, _onError, onBargeIn) => {
+  AudioCaptureController: vi.fn().mockImplementation((_client, id, _onError, onBargeIn, resolveBargeInTarget) => {
     captureMocks.onBargeIn = onBargeIn;
+    captureMocks.resolveBargeInTarget = resolveBargeInTarget;
     captureMocks.captureInstanceId = id;
     captureMocks.id = id;
     captureMocks.pause.mockImplementation(() => ({
@@ -144,6 +146,7 @@ describe("TalkMode", () => {
     captureMocks.pause.mockClear();
     captureMocks.resume.mockReset().mockResolvedValue(undefined);
     captureMocks.onBargeIn = undefined;
+    captureMocks.resolveBargeInTarget = undefined;
     vi.unstubAllGlobals();
     FakeWebSocket.instances = [];
     FakeWebSocket.nextServerSequence = 1;
@@ -805,6 +808,48 @@ describe("TalkMode", () => {
     act(() => sendOutput("response-1", 1, btoa("\0\0")));
     expect(PlaybackContext.instances).toHaveLength(1);
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Stop Talk mode" })));
+  });
+
+  it("从voice_model_call_started取得未播放目标，并在无chunk时generation终态清除", async () => {
+    await startPlaybackTalk();
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.onmessage?.({ data: JSON.stringify({
+      schema_version: 1,
+      type: "event",
+      session_id: "session-1",
+      media_session_id: "media-1",
+      producer_seq: 1,
+      event: {
+        event_id: "event-model-started",
+        schema_version: 1,
+        event_type: "voice_model_call_started",
+        stream_id: "voice-realtime-session",
+        seq: 1,
+        session_id: "session-1",
+        source: "server",
+        producer_id: "hexis.voice-realtime",
+        producer_seq: 1,
+        channel: "voice",
+        response_id: "response-before-audio",
+        media_session_id: "media-1",
+        output_epoch: 7,
+        payload: {
+          response_id: "response-before-audio",
+          playback_id: "playback-before-audio",
+          output_epoch: 7,
+          state: "started",
+        },
+      },
+    }) }));
+
+    expect(captureMocks.resolveBargeInTarget?.()).toEqual({
+      response_id: "response-before-audio",
+      playback_id: "playback-before-audio",
+      output_epoch: 7,
+    });
+    act(() => sendGeneration("response-before-audio", "done"));
+    expect(captureMocks.resolveBargeInTarget?.()).toBeNull();
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Stop Talk mode" })));
   });
 

@@ -1,6 +1,9 @@
 "use client";
 
-import { StreamingVad, type VadEvent } from "./vad";
+import { SpeechDetector, type DetectorWorkerPort, type ReleasedPcmPrefix, type SpeechDetectorOptions, type PcmTarget } from "./speech-detector";
+import { SpeechGate, type SpeechFrame, type SpeechGateEvent } from "./vad";
+import { BargeInGate } from "./barge-in-gate";
+import config from "./speech-detection-config.json";
 
 export class StreamingPcmResampler {
   private input = new Float32Array(0);
@@ -141,6 +144,9 @@ export function monoBlockFromWorklet(data: unknown): AudioWorkletBlock {
 }
 
 type CaptureTransport = {
+  activeSessionId?: string | null;
+  activeMediaSessionId?: string | null;
+  activeBargeInCapability?: { supported: boolean } | null;
   sendControl?(action: "barge_in", reason: string): void;
   openCapture(captureInstanceId: string): void;
   suspendCapture(captureInstanceId: string): Promise<void>;
@@ -179,6 +185,8 @@ export type BargeInTarget = {
   output_epoch: number;
 };
 
+type CapturedAudioBlock = AudioWorkletBlock & { captureGeneration: number; target: PcmTarget | null };
+
 export class AudioCaptureController {
   private context: AudioContext | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
@@ -187,12 +195,15 @@ export class AudioCaptureController {
   private scriptProcessor: ScriptProcessorNode | null = null;
   private silenceGain: GainNode | null = null;
   private resampler: StreamingPcmResampler | null = null;
-  private vad: StreamingVad | null = null;
+  private detector: SpeechDetector | null = null;
+  private readonly speechGate = new SpeechGate();
+  private readonly bargeInGate = new BargeInGate();
   private closed = false;
   private paused = false;
   private failed = false;
   private pauseToken: CapturePauseToken | null = null;
   private outputFrame = 0;
+  private detectorFrameId = 0;
   private utteranceParts: Uint8Array[] = [];
   private utteranceByteLength = 0;
   private pendingSamples: number[] = [];
@@ -200,20 +211,23 @@ export class AudioCaptureController {
   private pendingStartMs = 0;
   private pendingEndMs = 0;
   private utteranceStartMs: number | null = null;
+  private utteranceStartSample: number | null = null;
   private utteranceEndMs: number | null = null;
   private outboundChain: Promise<void> = Promise.resolve();
   private workletStarted = false;
   private fallbackActive = false;
   private fallbackFrame = 0;
   private fallbackTimer: ReturnType<typeof setTimeout> | null = null;
-  private readonly fallbackQueue = new BoundedAudioQueue<AudioWorkletBlock>(12);
-  private readonly workletQueue = new BoundedAudioQueue<AudioWorkletBlock>(16);
+  private readonly fallbackQueue = new BoundedAudioQueue<CapturedAudioBlock>(12);
+  private readonly workletQueue = new BoundedAudioQueue<CapturedAudioBlock>(16);
 
   constructor(
     private readonly transport: CaptureTransport,
     private readonly captureInstanceId: string,
     private readonly onFailure: (message: string) => void,
     private readonly onSpeechStart?: (target?: BargeInTarget) => void,
+    private readonly resolveBargeInTarget?: () => BargeInTarget | null,
+    private readonly workerFactory?: () => DetectorWorkerPort,
   ) {}
 
   get deviceSettings(): MediaTrackSettings | undefined {
@@ -241,7 +255,33 @@ export class AudioCaptureController {
       await context.audioWorklet.addModule("/voice-realtime/capture-worklet.js");
       if (this.closed) return;
       this.resampler = new StreamingPcmResampler(context.sampleRate, 16_000);
-      this.vad = new StreamingVad({ sampleRate: 16_000 });
+      const sessionId = this.transport.activeSessionId;
+      const mediaSessionId = this.transport.activeMediaSessionId;
+      const capability = this.transport.activeBargeInCapability;
+      if (!sessionId || !mediaSessionId || !capability?.supported) {
+        throw new Error("Talk session identity or confirmed interruption capability is unavailable.");
+      }
+      const detectorOptions: SpeechDetectorOptions = {
+        sessionId,
+        mediaSessionId,
+        captureInstanceId: this.captureInstanceId,
+        ...(this.workerFactory ? { workerFactory: this.workerFactory } : {}),
+        onReleasedPcm: (prefix) => this.handleReleasedPcm(prefix),
+      };
+      const detector = new SpeechDetector(detectorOptions);
+      this.detector = detector;
+      detector.start();
+      detector.noteServerReady({
+        sessionId,
+        mediaSessionId,
+        captureInstanceId: this.captureInstanceId,
+        generation: detector.generation,
+        bargeInSupported: capability.supported,
+      });
+      await detector.waitUntilReady();
+      if (this.closed) return;
+      this.speechGate.reset();
+      this.bargeInGate.reset();
       this.transport.openCapture(this.captureInstanceId);
       const source = context.createMediaStreamSource(stream);
       const worklet = new AudioWorkletNode(context, "hexis-voice-capture", {
@@ -268,8 +308,9 @@ export class AudioCaptureController {
         output.fill(0);
         if (this.workletStarted || this.closed || this.paused || this.failed) return;
         try {
-          if (this.fallbackActive) this.consumeBlock(block);
-          else this.fallbackQueue.push(block);
+          const captured = this.snapshotBlock(block);
+          if (this.fallbackActive) this.consumeBlock(captured);
+          else this.fallbackQueue.push(captured);
         } catch (error) {
           this.fail(error);
         }
@@ -290,7 +331,7 @@ export class AudioCaptureController {
           if (this.fallbackTimer !== null) clearTimeout(this.fallbackTimer);
           this.fallbackTimer = null;
           this.fallbackQueue.clear();
-          this.workletQueue.push(monoBlockFromWorklet(event.data));
+          this.workletQueue.push(this.snapshotBlock(monoBlockFromWorklet(event.data)));
           this.drainWorkletQueue();
         } catch (error) {
           this.fail(error);
@@ -331,7 +372,10 @@ export class AudioCaptureController {
       this.scriptProcessor.disconnect();
     }
     this.silenceGain?.disconnect();
-    this.vad?.reset();
+    this.detector?.close();
+    this.detector = null;
+    this.speechGate.reset();
+    this.bargeInGate.reset();
     this.resampler?.close();
     await this.outboundChain.catch(() => undefined);
     const context = this.context;
@@ -371,16 +415,24 @@ export class AudioCaptureController {
     this.utteranceParts = [];
     this.utteranceByteLength = 0;
     this.utteranceStartMs = null;
+    this.utteranceStartSample = null;
     this.utteranceEndMs = null;
-    this.vad?.reset();
+    const detector = this.detector;
+    const nextGeneration = detector ? detector.generation + 1 : 1;
+    const workerReset = detector
+      ? detector.reset(nextGeneration, crypto.randomUUID())
+      : Promise.resolve();
+    this.speechGate.reset();
+    this.bargeInGate.reset();
     this.resampler?.close();
     this.resampler = new StreamingPcmResampler(this.context.sampleRate, 16_000);
-    token.ready = this.outboundChain.then(async () => {
+    const serverSuspend = this.outboundChain.then(async () => {
       if (this.closed || this.pauseToken !== token) {
         throw new Error("Talk capture changed before suspension completed.");
       }
       await this.transport.suspendCapture(this.captureInstanceId);
     });
+    token.ready = Promise.all([serverSuspend, workerReset]).then(() => undefined);
     return token;
   }
 
@@ -401,7 +453,23 @@ export class AudioCaptureController {
     if (this.closed || this.pauseToken !== token || !this.audioTrack) {
       throw new Error("Talk capture closed before it could resume.");
     }
-    this.vad?.reset();
+    const detector = this.detector;
+    const sessionId = this.transport.activeSessionId;
+    const mediaSessionId = this.transport.activeMediaSessionId;
+    const capability = this.transport.activeBargeInCapability;
+    if (!detector || !sessionId || !mediaSessionId || !capability?.supported) {
+      throw new Error("Talk could not verify the resumed capture identity and barge-in capability.");
+    }
+    detector.noteServerReady({
+      sessionId,
+      mediaSessionId,
+      captureInstanceId: this.captureInstanceId,
+      generation: detector.generation,
+      bargeInSupported: capability.supported,
+    });
+    await detector.waitUntilReady();
+    this.speechGate.reset();
+    this.bargeInGate.reset();
     this.audioTrack.enabled = true;
     this.pauseToken = null;
     this.paused = false;
@@ -413,47 +481,78 @@ export class AudioCaptureController {
     }
   }
 
-  private consumeBlock(block: AudioWorkletBlock): void {
+  private snapshotBlock(block: AudioWorkletBlock): CapturedAudioBlock {
+    const captureGeneration = this.detector?.generation ?? 0;
+    const target = this.resolveBargeInTarget?.() ?? null;
+    return { ...block, captureGeneration, target: target ? Object.freeze({ ...target, captureGeneration }) : null };
+  }
+
+  private consumeBlock(block: CapturedAudioBlock): void {
     if (this.paused || this.closed || this.failed) return;
     const resampler = this.resampler;
-    const vad = this.vad;
-    if (!resampler || !vad) return;
+    const detector = this.detector;
+    if (!resampler || !detector) return;
+    if (block.captureGeneration !== detector.generation) return;
     const pcm = resampler.push(block.samples);
     if (pcm.length === 0) return;
     const endMs = block.observedAtMs;
     const durationMs = (pcm.length / 16_000) * 1_000;
     const startMs = Math.max(0, endMs - durationMs);
-    const events = vad.push(pcm, this.outputFrame, startMs, endMs);
+    detector.appendPcm(pcm, this.outputFrame, startMs, endMs, block.target);
     this.outputFrame += pcm.length;
-    for (const event of events) this.handleVadEvent(event);
   }
 
-  private handleVadEvent(event: VadEvent): void {
+  private handleReleasedPcm(prefix: ReleasedPcmPrefix): void {
+    const frameSamples = config.audio.model_frame_samples;
+    if (prefix.samples.length !== prefix.probabilities.length * frameSamples) {
+      this.fail(new Error("Speech detector returned a probability/PCM frame count mismatch."));
+      return;
+    }
+    for (let index = 0; index < prefix.probabilities.length; index += 1) {
+      if (this.closed || this.paused || this.failed) return;
+      const startSample = prefix.startSample + index * frameSamples;
+      const startMonotonicMs = prefix.startMonotonicMs + (index * frameSamples * 1000) / config.audio.sample_rate;
+      const frame: SpeechFrame = {
+        generation: prefix.generation,
+        frameId: this.detectorFrameId++,
+        startSample,
+        endSample: startSample + frameSamples,
+        startMonotonicMs,
+        endMonotonicMs: startMonotonicMs + (frameSamples * 1000) / config.audio.sample_rate,
+        samples: prefix.samples.slice(index * frameSamples, (index + 1) * frameSamples),
+        probability: prefix.probabilities[index],
+      };
+      const target = this.resolveBargeInTarget?.();
+      this.bargeInGate.setTarget(target ? { ...target, captureGeneration: this.detector?.generation ?? prefix.generation } : null);
+      const confirmed = this.bargeInGate.observe(frame.probability, prefix.generation, prefix.target ?? null);
+      if (confirmed) this.onSpeechStart?.(confirmed);
+      for (const event of this.speechGate.consume(frame)) this.handleSpeechGateEvent(event);
+    }
+  }
+
+  private handleSpeechGateEvent(event: SpeechGateEvent): void {
     if (this.paused || this.closed || this.failed) return;
-    if (event.type === "speech_start") {
-      this.onSpeechStart?.();
-      this.utteranceParts = [];
-      this.utteranceByteLength = 0;
-      this.utteranceStartMs = null;
-      this.utteranceEndMs = null;
-      this.appendAudio(event);
+    if (event.type === "input_start" || event.type === "input_audio") {
+      this.appendAudio(event.frame);
       return;
     }
-    if (event.type === "audio") {
-      this.appendAudio(event);
-      return;
-    }
+    if (event.type === "candidate_rejected") return;
+    if (event.type === "input_end") this.finishUtterance(event.startSample, event.endSample, event.endMonotonicMs);
+  }
+
+  private finishUtterance(startSample: number, endSample: number, endMonotonicMs: number): void {
     this.flushAudio();
     const bytes = concatBytes(this.utteranceParts);
     const receipt = {
-      startFrame: event.startFrame,
-      endFrame: event.endFrame,
-      startMonotonicMs: this.utteranceStartMs ?? Math.round(event.startMonotonicMs),
-      endMonotonicMs: this.utteranceEndMs ?? Math.round(event.endMonotonicMs),
+      startFrame: this.utteranceStartSample ?? startSample,
+      endFrame: endSample,
+      startMonotonicMs: this.utteranceStartMs ?? 0,
+      endMonotonicMs: this.utteranceEndMs ?? Math.round(endMonotonicMs),
     };
     this.utteranceParts = [];
     this.utteranceByteLength = 0;
     this.utteranceStartMs = null;
+    this.utteranceStartSample = null;
     this.utteranceEndMs = null;
     this.outboundChain = this.outboundChain.then(async () => {
       if (this.closed || this.failed) return;
@@ -465,7 +564,7 @@ export class AudioCaptureController {
     }).catch((error: unknown) => this.fail(error));
   }
 
-  private appendAudio(event: Extract<VadEvent, { samples: Int16Array }>): void {
+  private appendAudio(event: Omit<SpeechFrame, "generation" | "frameId" | "probability">): void {
     if (event.samples.length === 0) return;
     const bytes = new Uint8Array(event.samples.length * 2);
     const view = new DataView(bytes.buffer);
@@ -478,9 +577,10 @@ export class AudioCaptureController {
     this.utteranceParts.push(bytes);
     this.utteranceByteLength += bytes.length;
     if (this.pendingSamples.length === 0) {
-      this.pendingStartFrame = event.startFrame;
+      this.pendingStartFrame = event.startSample;
       this.pendingStartMs = event.startMonotonicMs;
     }
+    this.utteranceStartSample ??= event.startSample;
     this.pendingSamples.push(...event.samples);
     this.pendingEndMs = event.endMonotonicMs;
     if (this.pendingSamples.length >= 1_600) this.flushAudio();

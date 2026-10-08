@@ -3263,8 +3263,7 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
         on_input_authorized=on_input_authorized,
         barge_in_capability=build_barge_in_capability(
             playback_coordination_config,
-            # Enable only after the complete target-confirmation path is wired.
-            supported=False,
+            supported=True,
         ),
         playback_coordination_config=playback_coordination_config,
     )

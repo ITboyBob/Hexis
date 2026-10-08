@@ -24,6 +24,11 @@ export type VadOptions = {
   absoluteThreshold?: number;
 };
 
+// New Talk capture uses these probability-gated states; StreamingVad below is
+// retained for older consumers and is not the product capture path.
+export { SpeechGate } from "./speech-gate";
+export type { SpeechFrame, SpeechGateEvent } from "./speech-gate";
+
 type AudioBlock = {
   samples: Int16Array;
   startFrame: number;
@@ -31,6 +36,7 @@ type AudioBlock = {
   endMonotonicMs: number;
 };
 
+/** @deprecated Product Talk uses SpeechGate and Worker probabilities. */
 export class StreamingVad {
   private readonly preRollFrames: number;
   private readonly hangoverFrames: number;

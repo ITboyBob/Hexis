@@ -126,7 +126,7 @@ async def test_api_start_succeeds_with_the_selected_deadline(scenario):
     assert session._ready is True
     assert result["barge_in_capability"] == session.barge_in_capability.model_dump(mode="json")
     assert result["barge_in_capability"] == {
-        "supported": False,
+        "supported": True,
         "configuration_id": "voice-barge-in-playback-initial-v1",
         "maximum_receipt_prefix_items": 256,
     }

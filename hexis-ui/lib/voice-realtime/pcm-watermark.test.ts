@@ -1,6 +1,34 @@
 import { PcmWatermark } from "./speech-detector";
 
 describe("PcmWatermark", () => {
+  it("keeps sampled target snapshots when delayed results release across a response change", () => {
+    const watermark = new PcmWatermark({ sampleRate: 16000, frameSamples: 512, maxBufferedMs: 256 });
+    const targetA = { response_id: "response-a", playback_id: "play-a", output_epoch: 1, captureGeneration: 0 };
+    const expectedA = { ...targetA };
+    const targetB = { response_id: "response-b", playback_id: "play-b", output_epoch: 2, captureGeneration: 0 };
+    const first = watermark.append(new Int16Array(512), 0, 0, 32, targetA)[0];
+    targetA.response_id = "mutated-after-sampling";
+    const second = watermark.append(new Int16Array(512), 512, 32, 64, targetB)[0];
+    expect(watermark.resolve(second.frameId, 0, 0.99)).toEqual([]);
+    const released = watermark.resolve(first.frameId, 0, 0.99);
+    expect(released.map((prefix) => prefix.target)).toEqual([expectedA, targetB]);
+    expect(released.map((prefix) => [prefix.startSample, prefix.endSample])).toEqual([[0, 512], [512, 1024]]);
+  });
+
+  it("does not assign a mixed partial frame to the new response", () => {
+    const watermark = new PcmWatermark({ sampleRate: 16000, frameSamples: 512, maxBufferedMs: 256 });
+    const targetA = { response_id: "response-a", playback_id: "play-a", output_epoch: 1, captureGeneration: 0 };
+    const targetB = { response_id: "response-b", playback_id: "play-b", output_epoch: 2, captureGeneration: 0 };
+    watermark.append(new Int16Array(300).fill(11), 0, 0, 18.75, targetA);
+    const frames = watermark.append(new Int16Array(724).fill(22), 300, 18.75, 64, targetB);
+    watermark.resolve(frames[1].frameId, 0, 0.99);
+    const released = watermark.resolve(frames[0].frameId, 0, 0.99);
+    expect(released.map((prefix) => prefix.target)).toEqual([null, targetB]);
+    expect(Int16Array.from(released.flatMap((prefix) => [...prefix.samples]))).toEqual(
+      new Int16Array([...new Array(300).fill(11), ...new Array(724).fill(22)]),
+    );
+  });
+
   it("retains partial frames and emits raw PCM only after a contiguous result prefix", () => {
     const watermark = new PcmWatermark({ sampleRate: 16000, frameSamples: 512, maxBufferedMs: 256 });
     expect(watermark.append(new Int16Array(300).fill(11), 0, 0, 18.75)).toEqual([]);

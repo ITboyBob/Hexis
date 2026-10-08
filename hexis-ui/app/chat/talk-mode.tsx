@@ -84,6 +84,7 @@ export function TalkMode({
   const captureRef = useRef<AudioCaptureController | null>(null);
   const outputsRef = useRef(new Map<string, TalkOutput>());
   const invalidatedResponsesRef = useRef(new Set<string>());
+  const activeBargeTargetRef = useRef<BargeInTarget | null>(null);
   const activeRef = useRef(false);
   const mountedRef = useRef(true);
   const sessionIdRef = useRef(sessionId);
@@ -111,6 +112,7 @@ export function TalkMode({
     const failure = cause instanceof Error ? cause : new Error("Voice output failed. Retry Talk to continue.");
     invalidateResponse(responseId);
     outputsRef.current.delete(responseId);
+    if (activeBargeTargetRef.current?.response_id === responseId) activeBargeTargetRef.current = null;
     refreshSpeaking();
     output.queue.fail(failure);
     output.player.stop("error");
@@ -124,6 +126,7 @@ export function TalkMode({
   const stopOutputs = useCallback(async () => {
     const outputs = [...outputsRef.current.values()];
     outputsRef.current.clear();
+    activeBargeTargetRef.current = null;
     refreshSpeaking();
     for (const output of outputs) {
       output.player.stop();
@@ -135,6 +138,7 @@ export function TalkMode({
   const stopTalk = useCallback(async (message?: string) => {
     activeRef.current = false;
     selectionPauseRef.current = null;
+    activeBargeTargetRef.current = null;
     if (mountedRef.current) setPhase("closing");
     const capture = captureRef.current;
     captureRef.current = null;
@@ -165,6 +169,7 @@ export function TalkMode({
 
       const localPlaybackState = output?.player.hasStarted ? "started" : "not_started";
       invalidateResponse(target.response_id);
+      activeBargeTargetRef.current = null;
       outputsRef.current.delete(target.response_id);
       refreshSpeaking();
       if (output) {
@@ -204,6 +209,7 @@ export function TalkMode({
     refreshSpeaking();
     for (const [responseId, output] of outputs) {
       invalidateResponse(responseId);
+      if (activeBargeTargetRef.current?.response_id === responseId) activeBargeTargetRef.current = null;
       output.player.stop("barge_in");
       void output.queue[Symbol.asyncIterator]().return?.();
       void output.player.destroy().catch(() => undefined);
@@ -369,6 +375,23 @@ export function TalkMode({
           }
           if (message.type === "event") {
             if (message.media_session_id !== clientRef.current?.activeMediaSessionId) return;
+            if (message.event.event_type === "voice_model_call_started") {
+              const payload = message.event.payload;
+              const responseId = payload.response_id;
+              const playbackId = payload.playback_id;
+              const outputEpoch = payload.output_epoch;
+              if (
+                typeof responseId === "string" &&
+                typeof playbackId === "string" &&
+                typeof outputEpoch === "number" && Number.isSafeInteger(outputEpoch)
+              ) {
+                activeBargeTargetRef.current = {
+                  response_id: responseId,
+                  playback_id: playbackId,
+                  output_epoch: outputEpoch,
+                };
+              }
+            }
             setAvatarState((current) => {
               const sessionState = current.session_id === message.session_id
                 ? current
@@ -382,6 +405,11 @@ export function TalkMode({
           }
           if (message.type === "audio_chunk") {
             if (invalidatedResponsesRef.current.has(message.response_id)) return;
+            activeBargeTargetRef.current = {
+              response_id: message.response_id,
+              playback_id: message.playback_id,
+              output_epoch: message.output_epoch,
+            };
             let output = outputsRef.current.get(message.response_id);
             if (!output) {
               setError(null);
@@ -412,6 +440,9 @@ export function TalkMode({
                   }
                   if (event.action === "end" || event.action === "interrupt") {
                     invalidateResponse(message.response_id);
+                    if (activeBargeTargetRef.current?.response_id === message.response_id) {
+                      activeBargeTargetRef.current = null;
+                    }
                     outputsRef.current.delete(message.response_id);
                     refreshSpeaking();
                     void queue[Symbol.asyncIterator]().return?.();
@@ -451,7 +482,12 @@ export function TalkMode({
           if (message.type === "generation") {
             if (invalidatedResponsesRef.current.has(message.response_id)) return;
             const output = outputsRef.current.get(message.response_id);
-            if (!output) return;
+            if (!output) {
+              if (activeBargeTargetRef.current?.response_id === message.response_id) {
+                activeBargeTargetRef.current = null;
+              }
+              return;
+            }
             if (message.kind === "done") output.queue.close();
             if (message.kind === "failed") {
               failOutput(message.response_id, output, new Error(message.reason || "Voice generation failed."));
@@ -483,6 +519,7 @@ export function TalkMode({
         crypto.randomUUID(),
         (message) => void stopTalk(message),
         stopOutputsForBargeIn,
+        () => activeBargeTargetRef.current,
       );
       captureRef.current = capture;
       await capture.start(stream);

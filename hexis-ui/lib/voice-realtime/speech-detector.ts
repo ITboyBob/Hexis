@@ -77,6 +77,13 @@ export type WorkerReadyIdentity = {
   bargeInSupported: boolean;
 };
 
+export type PcmTarget = Readonly<{
+  response_id: string;
+  playback_id: string;
+  output_epoch: number;
+  captureGeneration: number;
+}>;
+
 export type PcmFrame = {
   frameId: number;
   generation: number;
@@ -85,17 +92,27 @@ export type PcmFrame = {
   startMonotonicMs: number;
   endMonotonicMs: number;
   samples: Int16Array;
+  target?: PcmTarget | null;
 };
 
 export type ReleasedPcmPrefix = {
   generation: number;
   startSample: number;
   endSample: number;
+  startMonotonicMs: number;
+  endMonotonicMs: number;
   samples: Int16Array;
   probabilities: number[];
+  target?: PcmTarget | null;
 };
 
 type PendingFrame = PcmFrame & { probability?: number };
+
+function samePcmTarget(left: PcmTarget | null, right: PcmTarget | null): boolean {
+  return left === null || right === null ? left === right :
+    left.response_id === right.response_id && left.playback_id === right.playback_id &&
+    left.output_epoch === right.output_epoch && left.captureGeneration === right.captureGeneration;
+}
 
 export class PcmWatermark {
   private readonly budgetSamples: number;
@@ -103,6 +120,7 @@ export class PcmWatermark {
   private tail = new Int16Array(0);
   private tailStartSample: number | null = null;
   private tailStartMonotonicMs: number | null = null;
+  private tailTarget: PcmTarget | null = null;
   private expectedNextSample: number | null = null;
   private frameId = 0;
   private readonly completed = new Set<number>();
@@ -128,6 +146,7 @@ export class PcmWatermark {
     startSample: number,
     startMonotonicMs: number,
     endMonotonicMs: number,
+    target: PcmTarget | null = null,
   ): PcmFrame[] {
     if (!(samples instanceof Int16Array) || samples.length === 0) return [];
     if (!Number.isSafeInteger(startSample) || startSample < 0) throw new Error("sample positions must be non-negative safe integers");
@@ -140,6 +159,10 @@ export class PcmWatermark {
     if (this.pendingSampleCount + samples.length > this.budgetSamples) {
       throw new Error(`PCM backlog exceeds ${this.options.maxBufferedMs}ms budget`);
     }
+    if (target && target.captureGeneration !== this.generation) throw new Error("PCM target capture generation is stale");
+    const sampledTarget = target ? Object.freeze({ ...target }) : null;
+    const oldTailLength = this.tail.length;
+    const oldTailTarget = this.tailTarget;
 
     let combined: Int16Array;
     let combinedStart: number;
@@ -171,12 +194,14 @@ export class PcmWatermark {
         startMonotonicMs: startMs,
         endMonotonicMs: startMs + frameDurationMs,
         samples: frameSamples,
+        target: offset >= oldTailLength || samePcmTarget(oldTailTarget, sampledTarget) ? sampledTarget : null,
       };
       frames.push(frame);
       this.pending.push(frame);
       offset += this.options.frameSamples;
     }
     this.tail = combined.slice(offset);
+    this.tailTarget = this.tail.length > 0 && (offset >= oldTailLength || samePcmTarget(oldTailTarget, sampledTarget)) ? sampledTarget : null;
     this.tailStartSample = this.tail.length > 0 ? combinedStart + offset : null;
     this.tailStartMonotonicMs = this.tail.length > 0
       ? combinedStartMs + (offset * 1000) / this.options.sampleRate
@@ -199,7 +224,10 @@ export class PcmWatermark {
     const released: ReleasedPcmPrefix[] = [];
     while (this.pending[0]?.probability !== undefined) {
       const prefixFrames: PendingFrame[] = [];
-      while (this.pending[0]?.probability !== undefined) prefixFrames.push(this.pending.shift()!);
+      const prefixTarget = this.pending[0].target ?? null;
+      while (this.pending[0]?.probability !== undefined && samePcmTarget(this.pending[0].target ?? null, prefixTarget)) {
+        prefixFrames.push(this.pending.shift()!);
+      }
       for (let index = 1; index < prefixFrames.length; index += 1) {
         if (prefixFrames[index - 1].endSample !== prefixFrames[index].startSample) {
           throw new Error("resolved PCM prefix is not contiguous");
@@ -217,8 +245,11 @@ export class PcmWatermark {
         generation: this.generation,
         startSample: prefixFrames[0].startSample,
         endSample: prefixFrames[prefixFrames.length - 1].endSample,
+        startMonotonicMs: prefixFrames[0].startMonotonicMs,
+        endMonotonicMs: prefixFrames[prefixFrames.length - 1].endMonotonicMs,
         samples: pcm,
         probabilities: prefixFrames.map((item) => item.probability!),
+        target: prefixTarget,
       });
     }
     return released;
@@ -233,6 +264,7 @@ export class PcmWatermark {
     this.tail = new Int16Array(0);
     this.tailStartSample = null;
     this.tailStartMonotonicMs = null;
+    this.tailTarget = null;
     this.expectedNextSample = null;
     this.completed.clear();
   }
@@ -254,6 +286,7 @@ export class SpeechDetector {
   private currentGeneration = 0;
   private pendingReset: { generation: number; controlId: string; resolve: () => void; reject: (error: Error) => void } | null = null;
   private failureValue: DetectorFailure | null = null;
+  private readinessWaiters = new Set<{ resolve: () => void; reject: (error: Error) => void }>();
   private readonly waterline = new PcmWatermark({
     sampleRate: config.audio.sample_rate,
     frameSamples: config.audio.model_frame_samples,
@@ -271,6 +304,15 @@ export class SpeechDetector {
       && this.serverReadyGeneration === this.currentGeneration;
   }
   get pendingSampleCount(): number { return this.waterline.pendingSampleCount; }
+
+  waitUntilReady(): Promise<void> {
+    if (this.canOpenCapture) return Promise.resolve();
+    if (this.state === "failed") return Promise.reject(new Error(this.failureValue?.message ?? "Speech detector failed."));
+    if (this.state === "closed") return Promise.reject(new Error("Speech detector closed before ready."));
+    return new Promise<void>((resolve, reject) => {
+      this.readinessWaiters.add({ resolve, reject });
+    });
+  }
 
   start(): void {
     if (this.state !== "idle") throw new Error(`cannot start detector from ${this.state}`);
@@ -307,6 +349,7 @@ export class SpeechDetector {
       return false;
     }
     this.serverReadyGeneration = identity.generation;
+    this.resolveReadinessIfReady();
     return true;
   }
 
@@ -325,11 +368,11 @@ export class SpeechDetector {
     });
   }
 
-  appendPcm(samples: Int16Array, startSample: number, startMonotonicMs: number, endMonotonicMs: number): PcmFrame[] {
+  appendPcm(samples: Int16Array, startSample: number, startMonotonicMs: number, endMonotonicMs: number, target: PcmTarget | null = null): PcmFrame[] {
     if (this.state !== "ready" || this.workerReadyGeneration !== this.currentGeneration || !this.worker) {
       throw new Error("speech Worker is not ready to receive PCM");
     }
-    const frames = this.waterline.append(samples, startSample, startMonotonicMs, endMonotonicMs);
+    const frames = this.waterline.append(samples, startSample, startMonotonicMs, endMonotonicMs, target);
     for (const frame of frames) {
       const transferableSamples = frame.samples.slice();
       this.worker.postMessage({
@@ -354,6 +397,7 @@ export class SpeechDetector {
     this.workerReadyGeneration = null;
     this.pendingReset?.reject(new Error("detector closed while waiting for reset"));
     this.pendingReset = null;
+    this.rejectReadiness(new Error("Speech detector closed before ready."));
     this.worker?.postMessage({ type: "close", captureInstanceId: this.options.captureInstanceId, generation: this.currentGeneration });
     this.worker?.terminate();
     this.worker = null;
@@ -377,6 +421,7 @@ export class SpeechDetector {
       }
       this.workerReadyGeneration = message.generation;
       this.state = "ready";
+      this.resolveReadinessIfReady();
       return;
     }
     if (message.type === "reset_ack") {
@@ -391,9 +436,11 @@ export class SpeechDetector {
       this.workerReadyGeneration = message.generation;
       this.state = "ready";
       reset.resolve();
+      this.resolveReadinessIfReady();
       return;
     }
     if (message.type === "frame_result") {
+      if (message.generation < this.currentGeneration) return;
       try {
         const released = this.waterline.resolve(message.frameId, message.generation, message.probability);
         for (const prefix of released) this.options.onReleasedPcm?.(prefix);
@@ -411,7 +458,19 @@ export class SpeechDetector {
     this.workerReadyGeneration = null;
     this.pendingReset?.reject(new Error(message));
     this.pendingReset = null;
+    this.rejectReadiness(new Error(message));
     this.worker?.terminate();
     this.worker = null;
+  }
+
+  private resolveReadinessIfReady(): void {
+    if (!this.canOpenCapture) return;
+    for (const waiter of this.readinessWaiters) waiter.resolve();
+    this.readinessWaiters.clear();
+  }
+
+  private rejectReadiness(error: Error): void {
+    for (const waiter of this.readinessWaiters) waiter.reject(error);
+    this.readinessWaiters.clear();
   }
 }
