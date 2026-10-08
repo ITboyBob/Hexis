@@ -14,6 +14,32 @@ from services import behavior_events, qwen_realtime_client
 from services.voice_realtime_session import VoiceRealtimeSessionRegistry
 
 
+# 此模块只使用替身连接、替身 WebSocket；禁止全局 fixture 开真实数据库。
+@pytest.fixture(scope="module", autouse=True)
+def temp_test_db():
+    yield
+
+
+@pytest.fixture(scope="module", autouse=True)
+def sync_test_embedding_dimension_from_db():
+    yield
+
+
+@pytest.fixture(scope="module", autouse=True)
+def configure_agent_for_tests():
+    yield
+
+
+@pytest.fixture(scope="module", autouse=True)
+def apply_repo_migrations():
+    yield
+
+
+@pytest.fixture(autouse=True)
+def setup_db():
+    yield
+
+
 @pytest.mark.parametrize("value", [True, False, 0, -1, float("inf"), float("-inf"), float("nan"), "30", None, 10**400])
 def test_start_timeout_rejects_non_numeric_non_finite_or_non_positive_values(value):
     with pytest.raises((TypeError, ValueError), match="finite positive number of seconds"):
@@ -29,7 +55,9 @@ def test_start_timeout_preserves_the_selected_seconds(value):
 async def scenario(monkeypatch):
     state = SimpleNamespace(
         config={"endpoint": "wss://unit.invalid/realtime", "model": "unit-model", "voice": "Tina", "api_key_env": "UNIT_KEY", "timeout": 0.01},
-        ready=True, block_connect=False, close_error=False, clients=[], sockets=[], queries=[],
+        ready=True, block_connect=False, close_error=False, fail_ready_event=False, block_ready_event=False,
+        ready_event_started=asyncio.Event(),
+        clients=[], sockets=[], queries=[], row_statuses={},
         registry=VoiceRealtimeSessionRegistry(),
         request=hexis_api.VoiceRealtimeSessionRequest(session_id=uuid4()),
     )
@@ -40,6 +68,13 @@ async def scenario(monkeypatch):
 
         async def execute(self, sql, *args):
             state.queries.append(sql)
+            if "INSERT INTO voice_realtime_sessions" in sql:
+                state.row_statuses[(args[0], args[1])] = "active"
+            if "SET status='failed'" in sql:
+                assert "qwen_session_id=$2" in sql and "status='active'" in sql
+                identity = (args[0], args[1])
+                if state.row_statuses.get(identity) == "active":
+                    state.row_statuses[identity] = "failed"
 
     class Acquisition:
         async def __aenter__(self):
@@ -56,8 +91,10 @@ async def scenario(monkeypatch):
         def __init__(self):
             self.messages = asyncio.Queue()
             self.closed = False
+            self.sent = []
 
         async def send(self, message):
+            self.sent.append(json.loads(message))
             if state.ready:
                 self.messages.put_nowait(json.dumps({"type": "session.updated", "session": {"id": "unit-cloud-session"}}))
 
@@ -84,12 +121,18 @@ async def scenario(monkeypatch):
         return client
 
     async def record_event(*args, **kwargs):
+        if state.block_ready_event and args[1].event_type == "voice_session_ready":
+            state.ready_event_started.set()
+            await asyncio.Future()
+        if state.fail_ready_event and args[1].event_type == "voice_session_ready":
+            raise RuntimeError("controlled ready-event persistence failure")
         return {"seq": 1}
 
     monkeypatch.setattr(hexis_api, "_pool", Pool())
     monkeypatch.setattr(hexis_api, "_voice_realtime_registry", state.registry)
     monkeypatch.delenv("HEXIS_REALTIME_CONFIG", raising=False)
     monkeypatch.delenv("HEXIS_M5_ACCEPTANCE_RUN", raising=False)
+    monkeypatch.delenv("HEXIS_VOICE_BARGE_IN_ENV", raising=False)
     monkeypatch.setenv("HEXIS_BROWSER_API_URL", "http://127.0.0.1:43817")
     monkeypatch.setenv("HEXIS_M4_VOICE_CONFIG", "/unit/m4-runtime.json")
     monkeypatch.setattr(voice_m4_probe, "load_selected_config", lambda: state.config)
@@ -180,3 +223,109 @@ async def test_api_rejects_a_missing_c7_config_before_provider_construction(scen
     assert "C7 playback coordination configuration" in error.value.detail
     assert not scenario.clients
     assert not scenario.registry._sessions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("browser_url", [None, "", "https://unselected.example", "ws://127.0.0.1:43817"])
+async def test_api_rejects_invalid_browser_url_before_provider_or_session_persistence(scenario, monkeypatch, browser_url):
+    if browser_url is None:
+        monkeypatch.delenv("HEXIS_BROWSER_API_URL", raising=False)
+    else:
+        monkeypatch.setenv("HEXIS_BROWSER_API_URL", browser_url)
+    with pytest.raises(HTTPException) as error:
+        await hexis_api.create_voice_realtime_session(scenario.request)
+    assert error.value.status_code == 503
+    assert "HEXIS_BROWSER_API_URL" in error.value.detail
+    assert not scenario.clients and not scenario.sockets
+    assert not scenario.queries and not scenario.row_statuses and not scenario.registry._sessions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_error", [False, True])
+async def test_post_connect_failure_closes_client_registry_and_only_exact_active_row(scenario, close_error):
+    unrelated = (uuid4(), "unrelated-cloud-session")
+    scenario.row_statuses[unrelated] = "active"
+    scenario.fail_ready_event = True
+    scenario.close_error = close_error
+    with pytest.raises(RuntimeError, match="controlled ready-event persistence failure"):
+        await hexis_api.create_voice_realtime_session(scenario.request)
+    assert scenario.row_statuses[(scenario.request.session_id, "unit-cloud-session")] == "failed"
+    assert scenario.row_statuses[unrelated] == "active"
+    assert scenario.sockets[0].closed
+    assert scenario.clients[0]._receive_task.done()
+    assert not scenario.registry._sessions and not scenario.registry._by_media_session_id
+
+
+@pytest.mark.asyncio
+async def test_post_connect_cancellation_marks_exact_row_failed_and_releases_cloud_client(scenario):
+    scenario.block_ready_event = True
+    creating = asyncio.create_task(hexis_api.create_voice_realtime_session(scenario.request))
+    await asyncio.wait_for(scenario.ready_event_started.wait(), timeout=0.2)
+    creating.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await creating
+    assert scenario.row_statuses[(scenario.request.session_id, "unit-cloud-session")] == "failed"
+    assert scenario.sockets[0].closed and scenario.clients[0]._receive_task.done()
+    assert not scenario.registry._sessions and not scenario.registry._by_media_session_id
+
+
+@pytest.mark.asyncio
+async def test_normal_api_keeps_m5_worker_readiness_requirement(scenario, monkeypatch):
+    monkeypatch.setattr(hexis_api, "_m5_task_worker", None)
+    scenario.request.tool_surface = "m5"
+    with pytest.raises(HTTPException) as error:
+        await hexis_api.create_voice_realtime_session(scenario.request)
+    assert error.value.status_code == 503
+    assert "task worker is not ready" in error.value.detail
+    assert not scenario.clients and not scenario.sockets
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registered,key_selected", [(True, True), (False, True), (True, False)])
+async def test_m6_registered_session_reaches_only_selected_c5_ready_without_m5_workers(scenario, monkeypatch, registered, key_selected):
+    import hashlib
+    from pathlib import Path
+    from apps.voice_barge_in_environment import M6_SESSION_EXECUTION_POLICY, load_profile
+
+    policy = dict(M6_SESSION_EXECUTION_POLICY)
+    profile = load_profile()
+    root = Path(hexis_api.__file__).resolve().parents[1]
+    c5 = json.loads((root / profile["realtime_config"]).read_text())
+    if key_selected:
+        monkeypatch.setenv("HEXIS_VOICE_BARGE_IN_PROVIDER_KEY_ENV", c5["api_key_env"])
+    else:
+        monkeypatch.delenv("HEXIS_VOICE_BARGE_IN_PROVIDER_KEY_ENV", raising=False)
+    monkeypatch.setattr(hexis_api, "_selected_m6_session_policy", lambda: policy)
+    monkeypatch.setattr(hexis_api, "_m5_task_worker", None)
+    monkeypatch.setattr(hexis_api, "_m5_lightweight_executor", None)
+    monkeypatch.setattr(hexis_api, "_m6_registered_chat_sessions", {scenario.request.session_id} if registered else set())
+    monkeypatch.setattr(hexis_api, "_voice_barge_in_start_record", {
+        "acceptance_session_id": str(scenario.request.session_id),
+        "credential_env_names": [c5["api_key_env"]],
+        "config_fingerprints": {
+            key: hashlib.sha256((root / profile[path]).read_bytes()).hexdigest()
+            for key, path in (("C4", "runtime_config"), ("C5", "realtime_config"))
+        },
+    })
+    scenario.request.tool_surface = "m5"
+    runtime_policies = []
+    def build_runtime(*args, **kwargs):
+        runtime_policies.append(kwargs["session_execution_policy"])
+        return SimpleNamespace(), {}
+    monkeypatch.setattr(voice_realtime_harness, "_build_runtime", build_runtime)
+    if not registered or not key_selected:
+        with pytest.raises(HTTPException) as error:
+            await hexis_api.create_voice_realtime_session(scenario.request)
+        assert error.value.status_code == (403 if not registered else 503)
+        assert not scenario.clients and not runtime_policies
+        return
+    result = await hexis_api.create_voice_realtime_session(scenario.request)
+    session = scenario.registry.get(scenario.request.session_id)
+    assert result["session_id"] == str(scenario.request.session_id)
+    assert session._ready and session.session_execution_policy == policy
+    assert runtime_policies == [policy]
+    assert scenario.clients[0].model == c5["model"]
+    update = next(message for message in scenario.sockets[0].sent if message["type"] == "session.update")
+    assert {tool["name"] for tool in update["session"]["tools"]} == {"submit", "pend_message", "remember", "add_evidence", "voice_recall"}
+    assert hexis_api._m5_task_worker is None and hexis_api._m5_lightweight_executor is None
+    assert not any("m5_" in sql or "embed" in sql or "http" in sql for sql in scenario.queries)

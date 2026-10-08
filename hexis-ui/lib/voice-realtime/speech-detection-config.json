@@ -1,7 +1,12 @@
 {
   "schema_version": 1,
-  "configuration_id": "voice-barge-in-initial-v2",
-  "validation_status": "unvalidated",
+  "configuration_id": "voice-barge-in-d1-20261008-a",
+  "validation_status": "frozen_synthetic_tuning_only",
+  "calibration": {
+    "dataset_id": "d1-20261008-a",
+    "scope": "synthetic_tts_and_deterministic_noise",
+    "acoustic_validation": "not_claimed"
+  },
   "model": "v6",
   "audio": {
     "sample_rate": 16000,

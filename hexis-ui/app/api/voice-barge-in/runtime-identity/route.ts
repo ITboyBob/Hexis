@@ -9,7 +9,8 @@ export const dynamic = "force-dynamic";
 type EnvironmentRecord = {
   env_id?: string;
   status?: string;
-  owned_resources?: { talk_host_port?: number };
+  repository_root?: string;
+  owned_resources?: { talk_host_port?: number; api_process?: { start_id?: string } };
   db_identity?: { talk?: { database?: string; server_port?: number } };
 };
 
@@ -82,13 +83,42 @@ export async function GET() {
 
     const healthUrl = new URL("/health", apiUrl);
     const healthResponse = await fetch(healthUrl, { cache: "no-store", signal: AbortSignal.timeout(5000) });
-    const health = await healthResponse.json().catch(() => null) as { status?: string; checks?: { db?: boolean } } | null;
+    const health = await healthResponse.json().catch(() => null) as {
+      status?: string; checks?: { db?: boolean };
+      voice_barge_in?: {
+        environment_id?: string; start_id?: string; database?: string;
+        session_execution_policy?: Record<string, unknown>;
+        acceptance_session_id?: string; acceptance_session_registered?: boolean;
+        migration_verification?: { status?: string; mode?: string; [key: string]: unknown };
+        browser_api_url?: string;
+        ui_origin?: string;
+      };
+    } | null;
     if (!healthResponse.ok || health?.status !== "ok" || health.checks?.db !== true) {
       return NextResponse.json({ error: "The selected API upstream is not healthy or has no database connection." }, { status: 503 });
+    }
+    if (!record.repository_root || !path.isAbsolute(record.repository_root)) throw new Error("E1 has no repository root for C6 verification.");
+    const profile = JSON.parse(await readFile(path.join(record.repository_root, "config/voice-barge-in/run-profile.json"), "utf8")) as { session_execution_policy?: Record<string, unknown>; api_url?: string };
+    const policy = profile.session_execution_policy;
+    const selected = health.voice_barge_in;
+    if (!policy || policy.policy_id !== "m6-c5-realtime-only-v1" || !selected
+      || selected.environment_id !== record.env_id || selected.database !== actualDatabase.database
+      || !selected.start_id || selected.start_id !== record.owned_resources?.api_process?.start_id
+      || selected.acceptance_session_registered !== true || !selected.acceptance_session_id
+      || selected.migration_verification?.status !== "verified_read_only" || selected.migration_verification.mode !== "committed_applied_only"
+      || selected.browser_api_url !== profile.api_url?.replace(/\/$/, "")
+      || process.env.HEXIS_BROWSER_API_URL !== selected.browser_api_url
+      || !selected.ui_origin || process.env.HEXIS_UI_ORIGIN !== selected.ui_origin
+      || !selected.session_execution_policy
+      || Object.keys(policy).length !== Object.keys(selected.session_execution_policy).length
+      || Object.entries(policy).some(([key, value]) => selected.session_execution_policy?.[key] !== value)) {
+      return NextResponse.json({ error: "The selected API acceptance policy or registered session does not match E1/C6." }, { status: 409 });
     }
 
     return NextResponse.json({
       env_id: record.env_id,
+      browser_api_url: process.env.HEXIS_BROWSER_API_URL,
+      ui_origin: process.env.HEXIS_UI_ORIGIN,
       database: {
         database: actualDatabase.database,
         server_port: Number(actualDatabase.port),
@@ -102,6 +132,13 @@ export async function GET() {
         checks: health.checks,
         url_host: apiUrl.hostname,
         url_port: Number(apiUrl.port || (apiUrl.protocol === "https:" ? 443 : 80)),
+        start_id: selected.start_id,
+        session_execution_policy: selected.session_execution_policy,
+        acceptance_session_id: selected.acceptance_session_id,
+        acceptance_session_registered: selected.acceptance_session_registered,
+        migration_verification: selected.migration_verification,
+        browser_api_url: selected.browser_api_url,
+        ui_origin: selected.ui_origin,
       },
     });
   } catch (error) {

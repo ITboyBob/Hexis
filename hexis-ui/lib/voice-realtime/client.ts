@@ -108,9 +108,12 @@ export class VoiceRealtimeClient {
       });
       const responsePayload: unknown = await response.json().catch(() => ({}));
       if (!response.ok) {
-        const errorPayload = responsePayload as { error?: unknown };
+        const errorPayload = responsePayload && typeof responsePayload === "object"
+          ? responsePayload as { error?: unknown; detail?: unknown }
+          : {};
         throw new Error(
           (typeof errorPayload.error === "string" && errorPayload.error) ||
+            (typeof errorPayload.detail === "string" && errorPayload.detail) ||
             "Could not start the realtime voice service.",
         );
       }

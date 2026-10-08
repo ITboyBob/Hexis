@@ -38,6 +38,7 @@ class VoiceEmotionCoordinator:
         evaluator: Callable[[str, Any], Awaitable[Any]],
         hydrator: Callable[[Identity, str], Awaitable[Any]],
         emotion_timeout_ms: float,
+        evaluation_enabled: bool = True,
         window_host: EmotionWindowHost | None = None,
         on_visual_window: Callable[[dict[str, Any], dict[str, Any], str | None], Awaitable[Any]] | None = None,
     ) -> None:
@@ -47,6 +48,7 @@ class VoiceEmotionCoordinator:
         self._evaluator = evaluator
         self._hydrator = hydrator
         self._emotion_timeout_ms = emotion_timeout_ms
+        self._evaluation_enabled = evaluation_enabled
         self.window_host = window_host or EmotionWindowHost()
         self._on_visual_window = on_visual_window
         self.last_evaluation_task: asyncio.Task[Any] | None = None
@@ -63,6 +65,9 @@ class VoiceEmotionCoordinator:
 
         if self.window_host.current(identity) is not None:
             raise RuntimeError("identity already has an evaluation window")
+
+        if not self._evaluation_enabled:
+            return await self._run_disabled(identity, message)
 
         loop = asyncio.get_running_loop()
         started = loop.time()
@@ -175,6 +180,44 @@ class VoiceEmotionCoordinator:
             visual_window=self.window_host.current(identity),
             metrics=metrics,
             late_diagnostics=self.window_host.late_diagnostics,
+        )
+
+    async def _run_disabled(
+        self, identity: Identity, message: str
+    ) -> VoiceEmotionGateResult:
+        """Honor policy without evaluation tasks, visual windows, or model calls."""
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        hydration_error_type: str | None = None
+        try:
+            hydration = await self._hydrator(identity, message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            hydration = None
+            hydration_error_type = type(exc).__name__
+        elapsed_ms = (loop.time() - started) * 1000
+        metrics = {
+            "eval_ms": 0,
+            "hydrate_ms": elapsed_ms,
+            "gate_wait_ms": elapsed_ms,
+            "release_reason": "disabled_by_policy",
+        }
+        if hydration_error_type is not None:
+            metrics["hydration_error_type"] = hydration_error_type
+        return VoiceEmotionGateResult(
+            identity=dict(identity),
+            released=True,
+            context_ready=hydration is not None,
+            evaluation={
+                "status": "disabled_by_policy",
+                "logical_call_count": 0,
+                "transport_attempts": 0,
+            },
+            hydration=hydration,
+            visual_window=None,
+            metrics=metrics,
+            late_diagnostics=(),
         )
 
     def _recover_cancelled_children(

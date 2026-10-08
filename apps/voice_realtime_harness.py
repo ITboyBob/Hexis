@@ -528,8 +528,16 @@ def _build_runtime(
     pool: Any,
     session_id: UUID,
     stable_instructions: str,
+    session_execution_policy: dict[str, Any] | None = None,
 ) -> tuple[VoiceEmotionCoordinator, dict[str, Any]]:
-    emotion_config = _emotion_runtime_config(config)
+    restricted = session_execution_policy is not None
+    if restricted:
+        from apps.voice_barge_in_environment import session_execution_policy as validate_policy
+
+        validate_policy({"session_execution_policy": session_execution_policy})
+        emotion_config = None
+    else:
+        emotion_config = _emotion_runtime_config(config)
     memory_limit = config.get("memory_limit", 10)
     if (
         isinstance(memory_limit, bool)
@@ -541,12 +549,16 @@ def _build_runtime(
     stable_instructions_hash = _sha256_hex(stable_instructions)
 
     async def context_reader(_identity: Mapping[str, Any]) -> Any:
+        if restricted:
+            return None
         async with pool.acquire() as conn:
             from services.avatar_emotion import read_db_context
 
             return await read_db_context(conn)
 
     async def evaluator(message: str, context: Any) -> Any:
+        if restricted:
+            raise PermissionError("M6 C5-only acceptance policy denies emotion model requests")
         return await evaluate_emotion(message, context, emotion_config)
 
     async def hydrator(identity: Mapping[str, Any], message: str) -> Any:
@@ -556,6 +568,7 @@ def _build_runtime(
             message=message,
             stable_instructions_hash=stable_instructions_hash,
             memory_limit=memory_limit,
+            database_only_no_recall=restricted,
         )
 
     coordinator = VoiceEmotionCoordinator(
@@ -563,18 +576,20 @@ def _build_runtime(
         evaluator=evaluator,
         hydrator=hydrator,
         emotion_timeout_ms=config["emotion"]["timeout_ms"],
+        evaluation_enabled=not restricted,
     )
     runtime_summary = {
         "db_source": config.get("db_dsn_env") or "hexis-env",
         "memory_limit": memory_limit,
         "emotion": {
-            "provider": emotion_config["provider"],
-            "model": emotion_config["model"],
-            "endpoint": emotion_config["endpoint"],
+            "provider": config["emotion"]["provider"],
+            "model": config["emotion"]["model"],
+            "endpoint": config["emotion"]["endpoint"],
             "api_key_env": config["emotion"]["api_key_env"],
             "timeout_ms": config["emotion"]["timeout_ms"],
         },
         "stable_instructions_hash": stable_instructions_hash,
+        **({"session_execution_policy": dict(session_execution_policy), "emotion_execution": "disabled_by_policy"} if restricted else {}),
     }
     return coordinator, runtime_summary
 

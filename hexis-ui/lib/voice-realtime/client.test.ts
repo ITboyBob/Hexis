@@ -425,6 +425,29 @@ describe("VoiceRealtimeClient", () => {
     expect(client.state).toBe("failed");
   });
 
+  it.each([
+    [{ detail: "M5 realtime tools are unavailable because the task worker is not ready." }, "M5 realtime tools are unavailable because the task worker is not ready."],
+    [{ error: "Selected error", detail: "Other detail" }, "Selected error"],
+    [{ detail: { message: "Not a user-facing string" } }, "Could not start the realtime voice service."],
+    [null, "Could not start the realtime voice service."],
+  ])("preserves the session startup error and releases capture: %j", async (payload, message) => {
+    const track = new FakeTrack();
+    Object.defineProperty(navigator, "mediaDevices", {
+      value: { getUserMedia: vi.fn().mockResolvedValue(new FakeStream([track])) },
+      configurable: true,
+    });
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(payload), { status: 503 }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const client = new VoiceRealtimeClient({ toolSurface: "m5" });
+
+    await expect(client.open("session-1")).rejects.toThrow(message);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(track.stop).toHaveBeenCalledOnce();
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    expect(client.state).toBe("failed");
+  });
+
   it("selects M5 tools and waits for matching suspend/resume acknowledgements", async () => {
     const track = new FakeTrack();
     Object.defineProperty(navigator, "mediaDevices", {

@@ -26,6 +26,16 @@
     "ui_api_url_env": "HEXIS_API_URL"
   },
   "credentials_policy": "values_only_in_environment",
+  "session_execution_policy": {
+    "policy_id": "m6-c5-realtime-only-v1",
+    "background_workers": "disabled",
+    "business_tools": "permission_denied",
+    "voice_recall": "permission_denied",
+    "hydration": "database_only_no_recall",
+    "emotion": "permission_denied",
+    "external_requests": "selected_c5_realtime_only",
+    "schema_migrations": "verify_committed_applied_only"
+  },
   "record_outputs": {
     "base": "hexis_cache_directory",
     "environment_record": "voice-barge-in/environments/<env-id>/environment.json",

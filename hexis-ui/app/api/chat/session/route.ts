@@ -19,6 +19,18 @@ function errorMessage(error: unknown): string {
 
 export async function POST(): Promise<Response> {
   try {
+    if (process.env.HEXIS_VOICE_BARGE_IN_ENV) {
+      if (!process.env.HEXIS_API_URL) throw new Error("The owned M6 API upstream was not explicitly selected.");
+      const response = await fetch(new URL("/api/voice-barge-in/chat-session", process.env.HEXIS_API_URL), {
+        method: "POST", cache: "no-store", signal: AbortSignal.timeout(5000),
+      });
+      const payload = asRecord(await response.json());
+      if (!response.ok) return NextResponse.json({ error: payload.detail || payload.error || "Could not register the owned M6 acceptance session." }, { status: response.status });
+      if (typeof payload.session_id !== "string" || typeof payload.api_start_id !== "string") {
+        throw new Error("The selected M6 API returned no registered session identity.");
+      }
+      return NextResponse.json(payload);
+    }
     const rows = await prisma.$queryRawUnsafe<Row[]>(
       "SELECT get_or_create_chat_session(NULL::uuid, $1::text, NULL::text, $2::jsonb) AS session",
       "web",

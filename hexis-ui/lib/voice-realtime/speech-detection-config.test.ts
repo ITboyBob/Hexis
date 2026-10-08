@@ -17,8 +17,14 @@ describe("speech detection configuration", () => {
     });
   });
 
-  it("keeps initial thresholds labeled as unvalidated", () => {
-    expect(config.validation_status).toBe("unvalidated");
+  it("freezes initial thresholds only for the selected synthetic tuning set", () => {
+    expect(config.validation_status).toBe("frozen_synthetic_tuning_only");
+    expect(config.configuration_id).toBe("voice-barge-in-d1-20261008-a");
+    expect(config.calibration).toMatchObject({
+      dataset_id: "d1-20261008-a",
+      scope: "synthetic_tts_and_deterministic_noise",
+      acoustic_validation: "not_claimed",
+    });
     expect(config.capture).toMatchObject({ pre_roll_ms: 240, silence_threshold_ms: 520, candidate_buffer_limit_ms: 1000 });
     expect(config.input_gate).toMatchObject({ probability_threshold: 0.6, window_frames: 3, minimum_positive_frames: 2 });
     expect(config.barge_in_gate.normal).toMatchObject({ probability_threshold: 0.8, window_frames: 6, minimum_positive_frames: 5 });
@@ -26,7 +32,7 @@ describe("speech detection configuration", () => {
   });
 
   it("keeps the server-ready and Worker initialization budgets separate", () => {
-    expect(config.configuration_id).toBe("voice-barge-in-initial-v2");
+    expect(config.configuration_id).toBe("voice-barge-in-d1-20261008-a");
     expect(config.readiness.server_ready_timeout_ms).toBe(30000);
     expect(config.worker.initialization_timeout_ms).toBe(30000);
   });
