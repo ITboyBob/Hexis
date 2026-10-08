@@ -212,6 +212,20 @@ async def test_api_invalid_timeout_is_rejected_before_provider_construction(scen
 
 
 @pytest.mark.asyncio
+async def test_api_missing_input_gate_config_creates_no_provider_or_active_session(scenario, monkeypatch):
+    monkeypatch.delenv("HEXIS_M4_VOICE_CONFIG", raising=False)
+    with pytest.raises(HTTPException) as error:
+        await hexis_api.create_voice_realtime_session(scenario.request)
+    assert error.value.status_code == 503
+    assert "HEXIS_M4_VOICE_CONFIG is not selected" in error.value.detail
+    assert not scenario.clients
+    assert not scenario.sockets
+    assert not scenario.registry._sessions
+    assert not scenario.row_statuses
+    assert not any("INSERT INTO voice_realtime_sessions" in sql for sql in scenario.queries)
+
+
+@pytest.mark.asyncio
 async def test_api_rejects_a_missing_c7_config_before_provider_construction(scenario, monkeypatch):
     def missing_config():
         raise FileNotFoundError("controlled missing C7 config")

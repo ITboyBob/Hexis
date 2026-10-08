@@ -266,6 +266,8 @@ services:
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
       HEXIS_CORS_ORIGINS: ${HEXIS_CORS_ORIGINS:-http://localhost:3477,http://localhost:3000}
       HEXIS_TTS_URL: ${HEXIS_TTS_URL:-http://host.docker.internal:42667}
+      # 宿主进程使用的 HEXIS_M4_VOICE_CONFIG 可能是容器不可达的绝对路径。
+      HEXIS_M4_VOICE_CONFIG: ${HEXIS_M4_VOICE_CONFIG_CONTAINER:-/app/config/m4-voice-runtime.json}
       RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-hexis}
       RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-hexis_password}
@@ -281,6 +283,8 @@ services:
       # writes back, so this is read-write; the store's .lock files serialize
       # host/container access. Also exposes user skills (~/.hexis/skills).
       - ~/.hexis:/root/.hexis
+      # Talk 的输入门禁复用仓库配置，路径与上面的容器环境项一致。
+      - ./config:/app/config:ro
     networks:
       - private
       - public

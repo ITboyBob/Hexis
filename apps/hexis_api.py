@@ -312,12 +312,17 @@ async def _verify_m6_migration_ledger(conn: Any, source_manifest: dict[str, Any]
 async def _close_owned_voice_session(session: Any, reason: str) -> None:
     """结束精确的本进程媒体对象与持久行，不扫其它聊天或云 session。"""
     cloud_session_id = session.cloud_session_id
+    session._behavior_event_dispatch = None
     try:
         await session.close(reason)
     except Exception:
         logger.exception("Could not close the owned realtime client")
     finally:
-        pending = tuple(task for task in session._background_tasks if task is not asyncio.current_task())
+        receipt_tasks = getattr(session, "_tool_receipt_tasks", set())
+        pending = tuple(
+            task for task in session._background_tasks
+            if task is not asyncio.current_task() and task not in receipt_tasks
+        )
         for task in pending:
             task.cancel()
         if pending:
@@ -3358,6 +3363,84 @@ def _browser_realtime_websocket_url(media_session_id: str) -> str:
     )
 
 
+async def _emit_voice_tool_activity(
+    session: Any,
+    *,
+    event_type: str,
+    call_id: str,
+    response_id: str,
+    input_turn_id: str,
+    stimulus_revision: int,
+    tool_name: str,
+    arguments: dict[str, Any],
+    success: bool | None = None,
+    output: dict[str, Any] | None = None,
+    error: str | None = None,
+    state: str | None = None,
+) -> None:
+    """Persist voice tool request/result through the session event sink."""
+    if event_type not in {"TOOL_START", "TOOL_RESULT"}:
+        raise ValueError("voice tool Activity supports only TOOL_START/TOOL_RESULT")
+    payload: dict[str, Any] = {
+        "call_id": call_id,
+        "tool_name": tool_name,
+        "arguments": arguments,
+        "response_id": response_id,
+    }
+    if event_type == "TOOL_RESULT":
+        if not isinstance(success, bool):
+            raise ValueError("voice tool result requires its actual success value")
+        payload.update(
+            success=success,
+            output=output,
+            display_output=None,
+            error=error,
+        )
+        if state is not None:
+            payload["state"] = state
+    await session.emit_event(
+        event_type,
+        payload,
+        input_turn_id=input_turn_id,
+        stimulus_revision=stimulus_revision,
+    )
+
+
+def _bind_voice_behavior_event_sink(session: Any, pool: Any) -> None:
+    """Bind persisted behavior-event writes to one owned realtime media session."""
+    from services.behavior_events import record_behavior_event
+    from services.voice_avatar_events import build_voice_behavior_event, voice_behavior_envelope
+
+    if pool is None:
+        raise RuntimeError("database is unavailable for voice behavior events")
+
+    async def write_voice_event(
+        event_type: str,
+        payload: dict[str, Any],
+        producer_seq: int,
+        input_turn_id: str | None,
+        stimulus_revision: int | None,
+    ) -> None:
+        event = build_voice_behavior_event(
+            session_id=session.session_id,
+            media_session_id=session.media_session_id,
+            producer_seq=producer_seq,
+            event_type=event_type,
+            payload=payload,
+            input_turn_id=input_turn_id,
+            stimulus_revision=stimulus_revision,
+            response_id=payload.get("response_id"),
+            output_epoch=payload.get("output_epoch"),
+            call_id=payload.get("call_id"),
+        )
+        receipt = await record_behavior_event(pool, event)
+        dispatch = session._behavior_event_dispatch
+        if dispatch is not None:
+            await dispatch(voice_behavior_envelope(event, database_seq=receipt.get("seq")))
+
+    session._event_sink = write_voice_event
+
+
 @app.post("/api/voice-barge-in/chat-session")
 async def register_m6_acceptance_chat_session():
     """显式登记服务器生成的新验收会话；不接受客户端指定的旧会话 ID。"""
@@ -3646,35 +3729,8 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
     session._response_dispatch = None
     session._input_error_dispatch = None
     from services.behavior_events import BehaviorEvent, record_behavior_event
-    from services.voice_avatar_events import build_voice_behavior_event, voice_behavior_envelope
 
-    async def write_voice_event(
-        event_type: str,
-        payload: dict[str, Any],
-        producer_seq: int,
-        input_turn_id: str | None,
-        stimulus_revision: int | None,
-    ) -> None:
-        if _pool is None:
-            raise RuntimeError("database is unavailable for voice behavior events")
-        event = build_voice_behavior_event(
-            session_id=req.session_id,
-            media_session_id=media_session_id,
-            producer_seq=producer_seq,
-            event_type=event_type,
-            payload=payload,
-            input_turn_id=input_turn_id,
-            stimulus_revision=stimulus_revision,
-            response_id=payload.get("response_id"),
-            output_epoch=payload.get("output_epoch"),
-            call_id=payload.get("call_id"),
-        )
-        receipt = await record_behavior_event(_pool, event)
-        dispatch = session._behavior_event_dispatch
-        if dispatch is not None:
-            await dispatch(voice_behavior_envelope(event, database_seq=receipt.get("seq")))
-
-    session._event_sink = write_voice_event
+    _bind_voice_behavior_event_sink(session, _pool)
     registry.register(req.session_id, session)
     receiver: asyncio.Task[None] | None = None
     cloud_session_id: str | None = None
@@ -4144,6 +4200,8 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                             )
 
                         for bound_call in pending_voice_calls.values():
+                            if not session.ready:
+                                return
                             session.validate_voice_tool_call(bound_call)
                             if session.session_execution_policy is not None:
                                 tool_output = await _execute_restricted_voice_tool(
@@ -4170,6 +4228,8 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                                 raise RuntimeError(
                                     "voice tool arguments must be a JSON object before execution"
                                 )
+                            if bound_call.name in {"voice_recall", "remember", "add_evidence"}:
+                                session._tool_receipt_tasks.add(asyncio.current_task())
                             call_state = await voice_history.register_tool_call(
                                 turn_id=voice_turn["turn_id"],
                                 call_id=bound_call.actual_call_id,
@@ -4183,6 +4243,7 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                                         "persisted voice tool result has no reusable provider output"
                                     )
                                 tool_outputs.append((bound_call.actual_call_id, saved_output))
+                                session._tool_receipt_tasks.discard(asyncio.current_task())
                                 continue
                             if call_state.get("status") != "registered":
                                 raise RuntimeError(
@@ -4204,6 +4265,16 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                                     "output_epoch": output.get("output_epoch"),
                                     "turn_id": output.get("turn_id"),
                                 }
+                                await _emit_voice_tool_activity(
+                                    session,
+                                    event_type="TOOL_START",
+                                    call_id=bound_call.actual_call_id,
+                                    response_id=response_id,
+                                    input_turn_id=bound_call.input_turn_id,
+                                    stimulus_revision=bound_call.stimulus_revision,
+                                    tool_name=bound_call.name,
+                                    arguments=tool_arguments,
+                                )
                                 await session.emit_event(
                                     "voice_recall_started",
                                     {**recall_activity, "state": "started"},
@@ -4246,6 +4317,26 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                                     output=tool_result,
                                     output_text=tool_output,
                                     success=recall_status not in {"error", "failed"},
+                                )
+                                error_payload = tool_result.get("error")
+                                error_message = (
+                                    error_payload.get("message")
+                                    if isinstance(error_payload, dict)
+                                    and isinstance(error_payload.get("message"), str)
+                                    else None
+                                )
+                                await _emit_voice_tool_activity(
+                                    session,
+                                    event_type="TOOL_RESULT",
+                                    call_id=bound_call.actual_call_id,
+                                    response_id=response_id,
+                                    input_turn_id=bound_call.input_turn_id,
+                                    stimulus_revision=bound_call.stimulus_revision,
+                                    tool_name=bound_call.name,
+                                    arguments=tool_arguments,
+                                    success=recall_status not in {"error", "failed"},
+                                    output=tool_result,
+                                    error=error_message,
                                 )
                                 await session.emit_event(
                                     "voice_recall_executed",
@@ -4303,9 +4394,38 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                                     output_text=tool_output,
                                     success=tool_result["ok"],
                                 )
+                                if (
+                                    bound_call.name in {"remember", "add_evidence"}
+                                    and tool_result.get("state") == "accepted"
+                                ):
+                                    error_payload = tool_result.get("error")
+                                    accepted_error = (
+                                        error_payload.get("message")
+                                        if isinstance(error_payload, dict)
+                                        and isinstance(error_payload.get("message"), str)
+                                        else None
+                                    )
+                                    await _emit_voice_tool_activity(
+                                        session,
+                                        event_type="TOOL_RESULT",
+                                        call_id=bound_call.actual_call_id,
+                                        response_id=response_id,
+                                        input_turn_id=bound_call.input_turn_id,
+                                        stimulus_revision=bound_call.stimulus_revision,
+                                        tool_name=bound_call.name,
+                                        arguments=tool_arguments,
+                                        success=tool_result["ok"],
+                                        output=tool_result,
+                                        error=accepted_error,
+                                        state="accepted",
+                                    )
                             tool_outputs.append(
                                 (bound_call.actual_call_id, tool_output)
                             )
+                            session._tool_receipt_tasks.discard(asyncio.current_task())
+
+                        if not session.ready:
+                            return
 
                         input_turn_ids = {
                             call.input_turn_id for call in pending_voice_calls.values()
@@ -4389,6 +4509,8 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                 )
             except Exception:
                 logger.debug("Could not send output error to disconnected client", exc_info=True)
+        finally:
+            session._tool_receipt_tasks.discard(asyncio.current_task())
 
     async def dispatch_response(output: dict[str, Any]) -> None:
         task = asyncio.create_task(stream_response(output))

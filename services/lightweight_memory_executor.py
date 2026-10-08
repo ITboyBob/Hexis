@@ -293,6 +293,7 @@ class LightweightMemoryExecutor:
                         "TOOL_RESULT",
                         {
                             "arguments": _json(action.get("arguments")) or {},
+                            "state": receipt["state"],
                             "success": False,
                             "output": None,
                             "display_output": None,
@@ -508,6 +509,7 @@ class LightweightMemoryExecutor:
                 "TOOL_RESULT",
                 {
                     "arguments": _json(action.get("arguments")) or {},
+                    "state": receipt["state"],
                     "success": bool(receipt.get("ok")),
                     "output": output,
                     "display_output": tool_result.display_output if tool_result else None,

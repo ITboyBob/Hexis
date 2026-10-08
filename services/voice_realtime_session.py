@@ -108,6 +108,8 @@ class VoiceRealtimeSession:
         self._voice_turns: dict[str, dict[str, Any]] = {}
         self._turn_completion_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        # 已派发的轻量工具必须完成持久回执，媒体关闭不取消这一段执行。
+        self._tool_receipt_tasks: set[asyncio.Task[Any]] = set()
         self._input_authorization = InputAuthorizationService()
         self._input_lock = asyncio.Lock()
         self._input_order = 0

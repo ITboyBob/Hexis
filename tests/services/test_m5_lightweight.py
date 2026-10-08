@@ -48,6 +48,7 @@ async def _origin_session(db_pool):
 
 
 async def test_lightweight_acceptance_is_durable_idempotent_and_creates_no_task(db_pool):
+    from services.behavior_events import query_behavior_events
     from services.lightweight_memory_executor import LightweightMemoryExecutor
 
     origin = await _origin_session(db_pool)
@@ -72,6 +73,14 @@ async def test_lightweight_acceptance_is_durable_idempotent_and_creates_no_task(
     assert replay["ok"] is True
     assert replay["state"] == "accepted"
     assert replay["operation_id"] == str(command_id)
+    events = await query_behavior_events(
+        db_pool,
+        session_id=origin,
+        event_type="TOOL_RESULT",
+        call_id=call.actual_call_id,
+        limit=10,
+    )
+    assert events["events"] == []
 
     async with db_pool.acquire() as conn:
         action = await conn.fetchrow(
@@ -225,7 +234,63 @@ async def test_claimed_action_recovery_marks_unknown_and_never_reclaims(db_pool)
     assert event["payload"]["execution_lane"] == "lightweight"
     assert event["payload"]["command_id"] == str(command_id)
     assert event["payload"]["success"] is False
+    assert event["payload"]["state"] == "unknown"
     assert event["payload"]["error"] == result["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    ("tool_result", "expected_state"),
+    [
+        ("done", "done"),
+        ("failed", "failed"),
+        ("unknown", "unknown"),
+    ],
+)
+async def test_terminal_event_preserves_the_authoritative_receipt_state(db_pool, monkeypatch, tool_result, expected_state):
+    from core.tools import create_default_registry
+    from core.tools.base import ToolErrorType, ToolResult
+    from services.behavior_events import query_behavior_events
+    from services.lightweight_memory_executor import LightweightMemoryExecutor
+
+    origin = await _origin_session(db_pool)
+    arguments = {"content": f"受控终态状态 {uuid4()}", "type": "semantic"}
+    call = _call(origin, arguments=arguments, call_id=f"state-{expected_state}-{uuid4()}")
+    registry = create_default_registry(db_pool)
+    handler = registry.get("remember")
+    assert handler is not None
+    if tool_result == "done":
+        result = ToolResult.success_result({"memory_id": str(uuid4()), "reused": False}, "记忆已保存")
+    elif tool_result == "failed":
+        result = ToolResult.error_result("受控失败原因", error_type=ToolErrorType.INVALID_PARAMS)
+    else:
+        result = ToolResult.error_result("受控未确认原因", error_type=ToolErrorType.EXECUTION_FAILED)
+
+    async def execute(_arguments, _context):
+        return result
+
+    monkeypatch.setattr(handler, "execute", execute)
+    executor = LightweightMemoryExecutor(db_pool, registry=registry)
+    accepted = await executor.submit_lightweight(call, arguments)
+    assert accepted["state"] == "accepted"
+    assert await executor.process_one() is True
+
+    events = await query_behavior_events(
+        db_pool,
+        session_id=origin,
+        event_type="TOOL_RESULT",
+        call_id=call.actual_call_id,
+        limit=10,
+    )
+    assert len(events["events"]) == 1
+    payload = events["events"][0]["payload"]
+    assert payload["state"] == expected_state
+    assert payload["success"] is (expected_state == "done")
+    assert payload["error"] == result.error
+    async with db_pool.acquire() as conn:
+        receipt = await conn.fetchval(
+            "SELECT result FROM public.m5_actions WHERE command_id=$1", call.command_id
+        )
+    assert payload["state"] == json.loads(receipt)["state"]
 
 
 async def test_lightweight_handler_builder_only_exposes_approved_memory_tools():

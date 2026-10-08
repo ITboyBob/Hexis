@@ -82,3 +82,13 @@ def test_api_can_reach_loopback_voice_sidecar_on_every_supported_docker_host():
             "HEXIS_TTS_URL: "
             "${HEXIS_TTS_URL:-http://host.docker.internal:42667}" in block
         )
+
+
+def test_source_api_selects_a_mounted_existing_voice_input_gate_config():
+    block = _service_block("docker-compose.yml", "api")
+    assert (
+        "HEXIS_M4_VOICE_CONFIG: "
+        "${HEXIS_M4_VOICE_CONFIG_CONTAINER:-/app/config/m4-voice-runtime.json}" in block
+    )
+    assert "- ./config:/app/config:ro" in block
+    assert (ROOT / "config/m4-voice-runtime.json").is_file()
