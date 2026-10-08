@@ -1,10 +1,12 @@
 "use client";
 
 import type {
+  BargeInCapability,
   RealtimeClientMessage,
   RealtimeServerMessage,
-  RealtimeSessionResponse,
 } from "./contracts";
+import { parseRealtimeServerMessage, parseRealtimeSessionResponse } from "./contracts";
+import config from "./speech-detection-config.json";
 
 export type VoiceRealtimeState =
   | "idle"
@@ -19,6 +21,12 @@ type Options = {
   toolSurface?: "m4" | "m5";
 };
 
+function sameBargeInCapability(left: BargeInCapability, right: BargeInCapability): boolean {
+  return left.supported === right.supported
+    && left.configuration_id === right.configuration_id
+    && left.maximum_receipt_prefix_items === right.maximum_receipt_prefix_items;
+}
+
 export class VoiceRealtimeClient {
   private generation = 0;
   private stream: MediaStream | null = null;
@@ -27,8 +35,10 @@ export class VoiceRealtimeClient {
   private pendingClose: Promise<void> = Promise.resolve();
   private sessionId: string | null = null;
   private mediaSessionId: string | null = null;
+  private expectedBargeInCapability: BargeInCapability | null = null;
   private playbackEndpoint: string | null = null;
   private producerSequence = 0;
+  private lastServerProducerSequence = 0;
   private pendingCaptureControls = new Map<
     string,
     {
@@ -53,6 +63,8 @@ export class VoiceRealtimeClient {
     await this.pendingClose;
     if (this.currentState === "connecting" || this.currentState === "ready") return;
     const generation = ++this.generation;
+    this.expectedBargeInCapability = null;
+    this.lastServerProducerSequence = 0;
     this.setState("connecting");
 
     try {
@@ -94,14 +106,17 @@ export class VoiceRealtimeClient {
           tool_surface: this.options.toolSurface ?? "m4",
         }),
       });
-      const payload = (await response.json().catch(() => ({}))) as
-        | RealtimeSessionResponse
-        | { error?: string };
-      if (!response.ok || !("websocket_url" in payload)) {
+      const responsePayload: unknown = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const errorPayload = responsePayload as { error?: unknown };
         throw new Error(
-          ("error" in payload && payload.error) ||
+          (typeof errorPayload.error === "string" && errorPayload.error) ||
             "Could not start the realtime voice service.",
         );
+      }
+      const payload = parseRealtimeSessionResponse(responsePayload);
+      if (payload.session_id !== effectiveSessionId) {
+        throw new Error("The realtime service returned a different chat session.");
       }
       if (generation !== this.generation) {
         this.stopStream();
@@ -109,25 +124,43 @@ export class VoiceRealtimeClient {
       }
       this.sessionId = payload.session_id;
       this.mediaSessionId = payload.media_session_id;
+      this.expectedBargeInCapability = payload.barge_in_capability;
       this.playbackEndpoint = "/api/voice/playback";
       this.producerSequence = 0;
+      this.lastServerProducerSequence = 0;
 
       const socket = new WebSocket(payload.websocket_url);
-      await new Promise<void>((resolve, reject) => {
-        socket.onopen = () => resolve();
-        socket.onerror = () => reject(new Error("The realtime voice connection failed."));
-      });
-      if (generation !== this.generation) {
-        socket.close();
-        this.stopStream();
-        return;
-      }
-
       this.socket = socket;
-      socket.onmessage = (event) => {
-        if (generation !== this.generation) return;
-        try {
-          const message = JSON.parse(String(event.data)) as RealtimeServerMessage;
+      await new Promise<void>((resolve, reject) => {
+        let socketOpened = false;
+        let readyMessage: Extract<RealtimeServerMessage, { type: "ready" }> | null = null;
+        let settled = false;
+        const timeoutId = setTimeout(() => {
+          rejectHandshake(new Error(
+            `The voice service did not become ready within ${config.readiness.server_ready_timeout_ms}ms. Check the local API service, then retry Talk.`,
+          ));
+        }, config.readiness.server_ready_timeout_ms);
+
+        const resolveHandshake = () => {
+          if (settled || !socketOpened || !readyMessage) return;
+          settled = true;
+          clearTimeout(timeoutId);
+          resolve();
+        };
+        const rejectHandshake = (error: Error) => {
+          if (settled) {
+            if (generation === this.generation) this.fail(error.message);
+            return;
+          }
+          settled = true;
+          clearTimeout(timeoutId);
+          reject(error);
+        };
+        const handlePostReadyMessage = (message: RealtimeServerMessage) => {
+          if (message.producer_seq <= this.lastServerProducerSequence) {
+            throw new Error("The voice service message sequence did not increase.");
+          }
+          this.lastServerProducerSequence = message.producer_seq;
           if (message.type === "capture_suspended" || message.type === "capture_resumed") {
             const pending = this.pendingCaptureControls.get(message.control_id);
             if (pending) {
@@ -138,8 +171,9 @@ export class VoiceRealtimeClient {
                 : "capture_resumed";
               if (
                 message.type !== expectedType ||
-                message.capture_instance_id !== pending.captureInstanceId ||
-                message.media_session_id !== this.mediaSessionId
+                message.session_id !== this.sessionId ||
+                message.media_session_id !== this.mediaSessionId ||
+                message.capture_instance_id !== pending.captureInstanceId
               ) {
                 pending.reject(new Error("The voice service acknowledged a different capture identity."));
               } else pending.resolve();
@@ -147,14 +181,66 @@ export class VoiceRealtimeClient {
             return;
           }
           this.options.onMessage?.(message);
-        } catch {
-          this.fail("The voice service sent an invalid message.");
-        }
-      };
-      socket.onclose = () => {
-        if (generation !== this.generation || this.currentState !== "ready") return;
-        this.fail("The voice connection closed unexpectedly.");
-      };
+        };
+
+        socket.onopen = () => {
+          socketOpened = true;
+          resolveHandshake();
+        };
+        socket.onerror = () => rejectHandshake(new Error("The realtime voice connection failed."));
+        socket.onclose = () => {
+          if (!settled) {
+            rejectHandshake(new Error("The realtime voice connection closed before ready."));
+          } else if (generation === this.generation && this.currentState === "ready") {
+            this.fail("The voice connection closed unexpectedly.");
+          }
+        };
+        socket.onmessage = (event) => {
+          if (generation !== this.generation) return;
+          try {
+            const message = parseRealtimeServerMessage(JSON.parse(String(event.data)));
+            if (message.type === "ready") {
+              const expectedCapability = this.expectedBargeInCapability;
+              if (
+                message.session_id !== this.sessionId
+                || message.media_session_id !== this.mediaSessionId
+                || !expectedCapability
+                || !sameBargeInCapability(message.barge_in_capability, expectedCapability)
+              ) {
+                throw new Error("The realtime service ready identity or capability does not match its session description.");
+              }
+              if (!message.barge_in_capability.supported) {
+                throw new Error("The selected realtime service does not support confirmed voice barge-in.");
+              }
+              if (readyMessage) {
+                if (
+                  message.session_id !== readyMessage.session_id
+                  || message.media_session_id !== readyMessage.media_session_id
+                  || message.producer_seq !== readyMessage.producer_seq
+                  || message.cloud_session_id !== readyMessage.cloud_session_id
+                  || message.instructions_hash !== readyMessage.instructions_hash
+                  || !sameBargeInCapability(message.barge_in_capability, readyMessage.barge_in_capability)
+                ) {
+                  throw new Error("The realtime service repeated a different ready message.");
+                }
+                return;
+              }
+              readyMessage = message;
+              this.lastServerProducerSequence = message.producer_seq;
+              resolveHandshake();
+              return;
+            }
+            if (!readyMessage) throw new Error("The voice service sent data before its ready message.");
+            handlePostReadyMessage(message);
+          } catch (error) {
+            rejectHandshake(error instanceof Error ? error : new Error("The voice service sent an invalid message."));
+          }
+        };
+      });
+      if (generation !== this.generation) {
+        this.stopStream();
+        return;
+      }
       this.setState("ready");
     } catch (error) {
       if (generation !== this.generation) {
@@ -164,6 +250,7 @@ export class VoiceRealtimeClient {
       this.stopStream();
       this.socket?.close();
       this.socket = null;
+      this.expectedBargeInCapability = null;
       this.setState("failed");
       throw error instanceof Error ? error : new Error("Talk could not start.");
     }
@@ -175,6 +262,7 @@ export class VoiceRealtimeClient {
     const socket = this.socket;
     this.socket = null;
     this.stopStream();
+    this.expectedBargeInCapability = null;
     this.playbackEndpoint = null;
     this.setState("closed");
     if (socket && socket.readyState <= WebSocket.OPEN) {
@@ -301,6 +389,10 @@ export class VoiceRealtimeClient {
     return this.playbackEndpoint;
   }
 
+  get activeBargeInCapability(): BargeInCapability | null {
+    return this.currentState === "ready" ? this.expectedBargeInCapability : null;
+  }
+
   openCapture(captureInstanceId: string): void {
     this.send({
       schema_version: 1,
@@ -376,6 +468,7 @@ export class VoiceRealtimeClient {
     this.socket?.close();
     this.socket = null;
     this.stopStream();
+    this.expectedBargeInCapability = null;
     this.setState("failed");
     this.options.onMessage?.({
       schema_version: 1,

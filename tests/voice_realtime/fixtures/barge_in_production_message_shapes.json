@@ -1,0 +1,217 @@
+{
+  "schema_version": 1,
+  "comparison_status": "read_only_s3_1_complete",
+  "baseline": {
+    "head": "2710de6379c8f2b8d32fab575aa9264e7ac9b670",
+    "source_fingerprints": {
+      "services/voice_realtime_transport.py": "503ce53081ad1637620c4b62371e006796885b659c39c3744897d919c58a1744",
+      "apps/hexis_api.py": "ed75a4289c8d90c00752291e0b67fc02fab3c10ebd4352252653f80ba197c9ca",
+      "hexis-ui/lib/voice-realtime/contracts.ts": "9c36b68b21d0317051e2f48889e30c0939659efae3a5e8eb314be7b816a5be98",
+      "hexis-ui/lib/voice-realtime/client.ts": "54a7d5aaafb202088814441ec29678bcce0405af639ecfc4e18ff83610995ad0"
+    }
+  },
+  "production_messages": [
+    {
+      "type": "ready",
+      "source": "apps/hexis_api.py::voice_realtime_media",
+      "fields": [
+        "schema_version",
+        "type",
+        "session_id",
+        "media_session_id",
+        "producer_seq",
+        "cloud_session_id",
+        "instructions_hash"
+      ],
+      "sequence": "first websocket message uses producer_seq=0",
+      "pydantic_status": "matches ServerReady",
+      "typescript_status": "matches RealtimeServerMessage.ready"
+    },
+    {
+      "type": "audio_chunk",
+      "source": "apps/hexis_api.py::send_server_message in voice_realtime_media",
+      "fields": [
+        "schema_version",
+        "type",
+        "session_id",
+        "media_session_id",
+        "producer_seq",
+        "response_id",
+        "playback_id",
+        "turn_id",
+        "output_epoch",
+        "segment_id",
+        "segment_index",
+        "chunk_seq",
+        "pcm_base64"
+      ],
+      "nullable_fields": {
+        "turn_id": "The current sender always includes the key and obtains its value with output.get('turn_id'), so null is representable."
+      },
+      "pydantic_status": "ServerAudioChunk is missing playback_id and turn_id; the documented existing mismatch",
+      "typescript_status": "playback_id is required; turn_id is optional string but does not admit the production null value",
+      "compatibility_scope": "Add the production fields to the strict Pydantic model and accurately model nullable turn_id in TypeScript."
+    },
+    {
+      "type": "generation",
+      "source": "apps/hexis_api.py::send_server_message in voice_realtime_media",
+      "fields": [
+        "schema_version",
+        "type",
+        "session_id",
+        "media_session_id",
+        "producer_seq",
+        "response_id",
+        "playback_id",
+        "turn_id",
+        "output_epoch",
+        "kind",
+        "text",
+        "reason"
+      ],
+      "variants": [
+        {
+          "kind": "text_delta | audio_transcript_delta",
+          "fields": ["text"],
+          "nullable_fields": ["turn_id", "text"]
+        },
+        {
+          "kind": "done",
+          "fields": ["reason"],
+          "nullable_fields": ["turn_id", "reason"]
+        },
+        {
+          "kind": "done",
+          "source_variant": "M5 voice-recall response before S3.2 normalization",
+          "fields": [],
+          "nullable_fields": ["turn_id"]
+        },
+        {
+          "kind": "failed",
+          "fields": ["reason"],
+          "nullable_fields": ["turn_id", "reason"]
+        }
+      ],
+      "nullable_fields": {
+        "turn_id": "The current sender always includes the key and obtains its value with output.get('turn_id'), so null is representable.",
+        "text": "The current sender uses event.text or raw.get('delta'); the resulting value can be absent/null for malformed provider events and is accepted as nullable by Pydantic.",
+        "reason": "The regular terminal sender includes reason (null for done); the M5 voice-recall done sender initially omits it and is normalized to reason:null in S3.2; failed may carry a missing provider error message."
+      },
+      "pydantic_status": "ServerGeneration is missing playback_id and turn_id",
+      "typescript_status": "playback_id is required; turn_id is optional string, text and reason are optional strings, none admit the production null value",
+      "compatibility_scope": "Add the production fields to the strict Pydantic model, normalize M5 done to reason:null, and accurately model nullable turn_id/text/reason in TypeScript."
+    },
+    {
+      "type": "m5_selection_opened",
+      "source": "apps/hexis_api.py::open_pend_selection in voice_realtime_media",
+      "fields": [
+        "schema_version",
+        "type",
+        "session_id",
+        "media_session_id",
+        "producer_seq",
+        "selection.selection_id",
+        "selection.version",
+        "selection.message",
+        "selection.state",
+        "selection.origin_session_id"
+      ],
+      "pydantic_status": "No discriminated ServerMessage model; generic ServerEvent expects type=event and event={...}",
+      "typescript_status": "RealtimeServerMessage.m5_selection_opened matches the top-level production shape",
+      "compatibility_scope": "Add a strict top-level production model; do not wrap or rewrite the production envelope."
+    },
+    {
+      "type": "capture_suspended",
+      "source": "apps/hexis_api.py::voice_realtime_media capture_suspend branch",
+      "fields": [
+        "schema_version",
+        "type",
+        "session_id",
+        "media_session_id",
+        "producer_seq",
+        "capture_instance_id",
+        "control_id",
+        "discarded_range"
+      ],
+      "nullable_fields": {
+        "discarded_range": "The sender uses transport_result.get('discarded_range'); null is representable."
+      },
+      "pydantic_status": "No discriminated ServerMessage model",
+      "typescript_status": "RealtimeServerMessage.capture_suspended matches the sender shape",
+      "consumer": "VoiceRealtimeClient resolves the pending suspend by control_id and validates type, capture_instance_id, and media_session_id."
+    },
+    {
+      "type": "capture_resumed",
+      "source": "apps/hexis_api.py::voice_realtime_media capture_resume branch",
+      "fields": [
+        "schema_version",
+        "type",
+        "session_id",
+        "media_session_id",
+        "producer_seq",
+        "capture_instance_id",
+        "control_id"
+      ],
+      "pydantic_status": "No discriminated ServerMessage model",
+      "typescript_status": "RealtimeServerMessage.capture_resumed matches the sender shape",
+      "consumer": "VoiceRealtimeClient resolves the pending resume by control_id and validates type, capture_instance_id, and media_session_id."
+    }
+  ],
+  "design_additions": [
+    {
+      "type": "barge_in_confirmed",
+      "source": "架构设计.md §5.5、§5.9、附录A；执行计划 Task 3.2",
+      "minimum_identity_fields": [
+        "command_id",
+        "capture_instance_id",
+        "response_id",
+        "output_epoch"
+      ],
+      "additional_fields": [
+        "playback_id",
+        "local_playback_state",
+        "receipt_prefix"
+      ],
+      "status": "Architect-reviewed and adopted for S3.2; Pydantic and TypeScript contracts are implemented, runtime handling follows S3.3-S3.5."
+    },
+    {
+      "type": "ready capability declaration",
+      "source": "架构设计.md §5.5、§5.6、§5.9、附录A；执行计划 Task 3.2；C7",
+      "known_requirements": [
+        "Explicitly state whether target-confirmed barge-in is supported.",
+        "Expose C7 configuration_id and maximum_receipt_prefix_items without duplicating their values."
+      ],
+      "adopted_shape": {
+        "barge_in_capability": {
+          "supported": "boolean",
+          "configuration_id": "C7 configuration_id",
+          "maximum_receipt_prefix_items": "C7 maximum_receipt_prefix_items"
+        }
+      },
+      "status": "Architect-reviewed and adopted for S3.2; REST and ready use the immutable per-media-session C7 snapshot."
+    },
+    {
+      "type": "barge_in_result",
+      "source": "架构设计.md §5.5、§5.9、附录A；执行计划 Task 3.2",
+      "known_requirements": [
+        "Return a result associated with the confirmed command and target.",
+        "Represent accepted as command-handled (not provider-terminal), plus playback_only, stale_target, and unknown outcomes described by the reviewed Sprint baseline and design."
+      ],
+      "adopted_fields": [
+        "schema_version",
+        "type=barge_in_result",
+        "session_id",
+        "media_session_id",
+        "producer_seq",
+        "command_id",
+        "capture_instance_id",
+        "response_id",
+        "output_epoch",
+        "playback_id",
+        "status=accepted|playback_only|stale_target|unknown"
+      ],
+      "status": "Architect-reviewed and adopted for S3.2; Pydantic and TypeScript contracts are implemented, runtime handling follows S3.3-S3.5."
+    }
+  ],
+  "stop_gate": "Resolved by Architect review requested on 2026-10-08; exact capability/result fields are recorded above. Implementation evidence is limited to the S3 tasks and must not be presented as full runtime barge-in completion."
+}

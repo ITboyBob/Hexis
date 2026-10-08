@@ -18,14 +18,16 @@ const captureMocks = vi.hoisted(() => ({
     ready: Promise.resolve(),
   })),
   resume: vi.fn().mockResolvedValue(undefined),
-  onBargeIn: undefined as (() => void) | undefined,
+  onBargeIn: undefined as ((target?: { response_id: string; playback_id: string; output_epoch: number }) => void) | undefined,
   captureInstanceId: "capture-1",
+  id: "capture-1",
 }));
 
 vi.mock("@/lib/voice-realtime/capture", () => ({
   AudioCaptureController: vi.fn().mockImplementation((_client, id, _onError, onBargeIn) => {
     captureMocks.onBargeIn = onBargeIn;
     captureMocks.captureInstanceId = id;
+    captureMocks.id = id;
     captureMocks.pause.mockImplementation(() => ({
       captureInstanceId: id,
       trackId: "track-1",
@@ -52,16 +54,44 @@ class FakeStream {
 class FakeWebSocket {
   static readonly OPEN = 1;
   static instances: FakeWebSocket[] = [];
+  static nextServerSequence = 1;
   readyState = 0;
   sent: string[] = [];
   onopen: (() => void) | null = null;
   onclose: (() => void) | null = null;
-  onmessage: ((event: { data: string }) => void) | null = null;
+  private messageHandler: ((event: { data: string }) => void) | null = null;
+  set onmessage(handler: ((event: { data: string }) => void) | null) {
+    this.messageHandler = handler && ((event) => {
+      const message = JSON.parse(event.data) as { type?: string; producer_seq?: number };
+      if (message.type !== "ready") message.producer_seq = FakeWebSocket.nextServerSequence++;
+      handler({ data: JSON.stringify(message) });
+    });
+  }
+  get onmessage() {
+    return this.messageHandler;
+  }
   private listeners: Record<string, Array<() => void>> = {};
 
   constructor(readonly url: string) {
     FakeWebSocket.instances.push(this);
-    queueMicrotask(() => this.open());
+    queueMicrotask(() => {
+      this.open();
+      const mediaSessionId = new URL(this.url).pathname.split("/").at(-1) ?? "media-1";
+      this.messageHandler?.({ data: JSON.stringify({
+        schema_version: 1,
+        type: "ready",
+        session_id: "session-1",
+        media_session_id: mediaSessionId,
+        producer_seq: 0,
+        cloud_session_id: "qwen-session",
+        instructions_hash: "a".repeat(64),
+        barge_in_capability: {
+          supported: true,
+          configuration_id: "voice-barge-in-playback-initial-v1",
+          maximum_receipt_prefix_items: 256,
+        },
+      }) });
+    });
   }
 
   open() {
@@ -92,6 +122,7 @@ function configureSelectionMedia() {
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
     session_id: "session-1", media_session_id: "media-1",
     websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1",
+    barge_in_capability: { supported: true, configuration_id: "voice-barge-in-playback-initial-v1", maximum_receipt_prefix_items: 256 },
   }), { status: 200 })));
   vi.stubGlobal("WebSocket", FakeWebSocket);
   return getUserMedia;
@@ -115,6 +146,7 @@ describe("TalkMode", () => {
     captureMocks.onBargeIn = undefined;
     vi.unstubAllGlobals();
     FakeWebSocket.instances = [];
+    FakeWebSocket.nextServerSequence = 1;
     Object.defineProperty(window, "isSecureContext", {
       value: true,
       configurable: true,
@@ -177,6 +209,7 @@ describe("TalkMode", () => {
           session_id: "session-1",
           media_session_id: "media-1",
           websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1",
+          barge_in_capability: { supported: true, configuration_id: "voice-barge-in-playback-initial-v1", maximum_receipt_prefix_items: 256 },
         }),
         { status: 200 },
       );
@@ -216,6 +249,7 @@ describe("TalkMode", () => {
         session_id: "session-1",
         media_session_id: "media-1",
         websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1",
+        barge_in_capability: { supported: true, configuration_id: "voice-barge-in-playback-initial-v1", maximum_receipt_prefix_items: 256 },
       }),
       { status: 200 },
     )));
@@ -299,6 +333,7 @@ describe("TalkMode", () => {
         session_id: "session-1",
         media_session_id: "media-1",
         websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1",
+        barge_in_capability: { supported: true, configuration_id: "voice-barge-in-playback-initial-v1", maximum_receipt_prefix_items: 256 },
       }),
       { status: 200 },
     )));
@@ -329,6 +364,7 @@ describe("TalkMode", () => {
         session_id: "session-1",
         media_session_id: "media-1",
         websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1",
+        barge_in_capability: { supported: true, configuration_id: "voice-barge-in-playback-initial-v1", maximum_receipt_prefix_items: 256 },
       }),
       { status: 200 },
     )));
@@ -420,7 +456,8 @@ describe("TalkMode", () => {
       JSON.stringify({
         session_id: "session-1",
         media_session_id: `media-${FakeWebSocket.instances.length + 1}`,
-        websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media",
+        websocket_url: `ws://127.0.0.1:43817/api/voice/realtime/media-${FakeWebSocket.instances.length + 1}`,
+        barge_in_capability: { supported: true, configuration_id: "voice-barge-in-playback-initial-v1", maximum_receipt_prefix_items: 256 },
       }),
       { status: 200 },
     )));
@@ -471,6 +508,7 @@ describe("TalkMode", () => {
         session_id: "session-1",
         media_session_id: `media-${FakeWebSocket.instances.length + 1}`,
         websocket_url: `ws://127.0.0.1:43817/api/voice/realtime/media-${FakeWebSocket.instances.length + 1}`,
+        barge_in_capability: { supported: true, configuration_id: "voice-barge-in-playback-initial-v1", maximum_receipt_prefix_items: 256 },
       }),
       { status: 200 },
     )));
@@ -507,6 +545,7 @@ describe("TalkMode", () => {
         session_id: "session-1",
         media_session_id: "media-1",
         websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1",
+        barge_in_capability: { supported: true, configuration_id: "voice-barge-in-playback-initial-v1", maximum_receipt_prefix_items: 256 },
       }),
       { status: 200 },
     )));
@@ -566,6 +605,85 @@ describe("TalkMode", () => {
     expect(PlaybackContext.instances[0].close).toHaveBeenCalled();
     expect(PlaybackContext.instances[1].sources).toHaveLength(1);
     expect(await screen.findByText("Speaking")).toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Stop Talk mode" })));
+  });
+
+  it("先停止匹配播放器，再把真实未ACK回执原样带入目标确认", async () => {
+    await startPlaybackTalk();
+    const socket = FakeWebSocket.instances[0];
+    const order: string[] = [];
+    const pendingReceipts: Array<(response: Response) => void> = [];
+    vi.mocked(fetch).mockImplementation(async (url, options) => {
+      if (url === "/api/voice/playback") {
+        const body = JSON.parse(String(options?.body)) as { action: string };
+        order.push(`receipt:${body.action}`);
+        return new Promise<Response>((resolve) => pendingReceipts.push(resolve));
+      }
+      throw new Error(`unexpected fetch ${String(url)}`);
+    });
+    const originalSend = socket.send.bind(socket);
+    socket.send = vi.fn((data: string) => {
+      order.push("websocket-confirm");
+      originalSend(data);
+    });
+    await act(async () => sendOutput("response-1", 0, btoa("\0".repeat(4800))));
+    await waitFor(() => expect(PlaybackContext.instances[0]?.sources).toHaveLength(1));
+    PlaybackContext.instances[0].sources[0].stop.mockImplementation(() => order.push("local-stop"));
+
+    act(() => captureMocks.onBargeIn?.({
+      response_id: "response-1",
+      playback_id: "play-response-1",
+      output_epoch: 1,
+    }));
+
+    const confirmation = JSON.parse(socket.sent.at(-1) || "{}") as {
+      type: string;
+      capture_instance_id: string;
+      response_id: string;
+      playback_id: string;
+      output_epoch: number;
+      local_playback_state: string;
+      receipt_prefix: Array<Record<string, unknown>>;
+    };
+    expect(confirmation).toMatchObject({
+      type: "barge_in_confirmed",
+      session_id: "session-1",
+      media_session_id: "media-1",
+      capture_instance_id: captureMocks.id,
+      response_id: "response-1",
+      playback_id: "play-response-1",
+      output_epoch: 1,
+      local_playback_state: "started",
+    });
+    expect(confirmation.receipt_prefix.map((receipt) => receipt.action)).toEqual(["open", "interrupt"]);
+    expect(order.indexOf("local-stop")).toBeLessThan(order.indexOf("websocket-confirm"));
+    expect(JSON.parse(socket.sent.at(-1) || "{}").producer_seq).toBe(0);
+    for (const resolve of pendingReceipts) resolve(new Response("{}", { status: 200 }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Stop Talk mode" })));
+  });
+
+  it("无播放器目标使用空prefix并先隔离迟到音频", async () => {
+    await startPlaybackTalk();
+    const socket = FakeWebSocket.instances[0];
+
+    act(() => captureMocks.onBargeIn?.({
+      response_id: "response-1",
+      playback_id: "play-response-1",
+      output_epoch: 1,
+    }));
+
+    const confirmation = JSON.parse(socket.sent.at(-1) || "{}") as {
+      type: string;
+      local_playback_state: string;
+      receipt_prefix: unknown[];
+    };
+    expect(confirmation).toMatchObject({
+      type: "barge_in_confirmed",
+      local_playback_state: "not_started",
+      receipt_prefix: [],
+    });
+    act(() => sendOutput("response-1", 0, btoa("\0\0")));
+    expect(PlaybackContext.instances).toHaveLength(0);
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Stop Talk mode" })));
   });
 
@@ -753,7 +871,7 @@ async function startPlaybackTalk() {
       receipts.push(JSON.parse(String(options?.body)));
       return new Response("{}", { status: 200 });
     }
-    return new Response(JSON.stringify({ session_id: "session-1", media_session_id: "media-1", websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1" }), { status: 200 });
+    return new Response(JSON.stringify({ session_id: "session-1", media_session_id: "media-1", websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1", barge_in_capability: { supported: true, configuration_id: "voice-barge-in-playback-initial-v1", maximum_receipt_prefix_items: 256 } }), { status: 200 });
   }));
   vi.stubGlobal("WebSocket", FakeWebSocket);
   render(<TalkMode sessionId="session-1" />);
@@ -762,10 +880,10 @@ async function startPlaybackTalk() {
   return receipts;
 }
 
-function sendOutput(response_id: string, chunk_seq: number, pcm_base64: string) {
-  FakeWebSocket.instances[0].onmessage?.({ data: JSON.stringify({ schema_version: 1, type: "audio_chunk", session_id: "session-1", media_session_id: "media-1", producer_seq: chunk_seq + 1, response_id, playback_id: `play-${response_id}`, output_epoch: 1, segment_id: "segment-1", segment_index: 0, chunk_seq, pcm_base64 }) });
+function sendOutput(response_id: string, chunk_index: number, pcm_base64: string) {
+  FakeWebSocket.instances[0].onmessage?.({ data: JSON.stringify({ schema_version: 1, type: "audio_chunk", session_id: "session-1", media_session_id: "media-1", producer_seq: chunk_index + 1, response_id, playback_id: `play-${response_id}`, turn_id: null, output_epoch: 1, segment_id: "segment-1", segment_index: 0, chunk_seq: chunk_index + 1, pcm_base64 }) });
 }
 
 function sendGeneration(response_id: string, kind: "done" | "failed") {
-  FakeWebSocket.instances[0].onmessage?.({ data: JSON.stringify({ schema_version: 1, type: "generation", session_id: "session-1", media_session_id: "media-1", producer_seq: 100, response_id, playback_id: `play-${response_id}`, output_epoch: 1, kind }) });
+  FakeWebSocket.instances[0].onmessage?.({ data: JSON.stringify({ schema_version: 1, type: "generation", session_id: "session-1", media_session_id: "media-1", producer_seq: 100, response_id, playback_id: `play-${response_id}`, turn_id: null, output_epoch: 1, kind, reason: null }) });
 }

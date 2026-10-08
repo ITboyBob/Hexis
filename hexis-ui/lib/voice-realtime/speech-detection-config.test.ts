@@ -24,4 +24,10 @@ describe("speech detection configuration", () => {
     expect(config.barge_in_gate.normal).toMatchObject({ probability_threshold: 0.8, window_frames: 6, minimum_positive_frames: 5 });
     expect(config.barge_in_gate.fast).toMatchObject({ probability_threshold: 0.95, window_frames: 4, minimum_positive_frames: 3 });
   });
+
+  it("keeps the server-ready and Worker initialization budgets separate", () => {
+    expect(config.configuration_id).toBe("voice-barge-in-initial-v2");
+    expect(config.readiness.server_ready_timeout_ms).toBe(30000);
+    expect(config.worker.initialization_timeout_ms).toBe(30000);
+  });
 });

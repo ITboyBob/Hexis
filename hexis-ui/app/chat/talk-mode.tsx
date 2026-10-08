@@ -2,7 +2,7 @@
 
 import { Radio, Square, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { AudioCaptureController, type CapturePauseToken } from "@/lib/voice-realtime/capture";
+import { AudioCaptureController, type BargeInTarget, type CapturePauseToken } from "@/lib/voice-realtime/capture";
 import { VoiceRealtimeClient } from "@/lib/voice-realtime/client";
 import type { RealtimeServerMessage } from "@/lib/voice-realtime/contracts";
 import type { M5TaskSelection } from "@/lib/m5-tasks";
@@ -21,7 +21,13 @@ import {
 import { VoiceAvatar } from "./voice-avatar";
 
 type TalkPhase = "idle" | "connecting" | "listening" | "suspended" | "failed" | "closing";
-type TalkOutput = { queue: NativeOutputQueue; player: NativeOutputPlayer; failed: boolean; speaking: boolean };
+type TalkOutput = {
+  queue: NativeOutputQueue;
+  player: NativeOutputPlayer;
+  failed: boolean;
+  speaking: boolean;
+  identity: { playback_id: string; output_epoch: number; response_id: string; media_session_id: string };
+};
 type SelectionPause = {
   client: VoiceRealtimeClient;
   capture: AudioCaptureController;
@@ -126,18 +132,6 @@ export function TalkMode({
     }
   }, [refreshSpeaking]);
 
-  const stopOutputsForBargeIn = useCallback(() => {
-    const outputs = [...outputsRef.current.entries()];
-    outputsRef.current.clear();
-    refreshSpeaking();
-    for (const [responseId, output] of outputs) {
-      invalidateResponse(responseId);
-      output.player.stop("barge_in");
-      void output.queue[Symbol.asyncIterator]().return?.();
-      void output.player.destroy().catch(() => undefined);
-    }
-  }, [invalidateResponse, refreshSpeaking]);
-
   const stopTalk = useCallback(async (message?: string) => {
     activeRef.current = false;
     selectionPauseRef.current = null;
@@ -152,6 +146,69 @@ export function TalkMode({
     setError(message ?? null);
     setRetryAvailable(Boolean(message));
   }, [stopOutputs]);
+
+  const stopOutputsForBargeIn = useCallback((target?: BargeInTarget) => {
+    if (target) {
+      const client = clientRef.current;
+      const capture = captureRef.current;
+      const capability = client?.activeBargeInCapability;
+      const output = outputsRef.current.get(target.response_id);
+      if (invalidatedResponsesRef.current.has(target.response_id)) return;
+      if (
+        output &&
+        (output.identity.playback_id !== target.playback_id || output.identity.output_epoch !== target.output_epoch)
+      ) return;
+      if (!client || !capture || !capability?.supported) {
+        void stopTalk("Confirmed voice interruption is unavailable. Stop Talk, then retry after the realtime service is ready.");
+        return;
+      }
+
+      const localPlaybackState = output?.player.hasStarted ? "started" : "not_started";
+      invalidateResponse(target.response_id);
+      outputsRef.current.delete(target.response_id);
+      refreshSpeaking();
+      if (output) {
+        output.player.stop("barge_in");
+        void output.queue[Symbol.asyncIterator]().return?.();
+        void output.player.destroy().catch(() => undefined);
+      }
+      try {
+        const receiptPrefix = localPlaybackState === "started"
+          ? output?.player.unacknowledgedReceipts(capability.maximum_receipt_prefix_items) ?? []
+          : [];
+        client.send({
+          schema_version: 1,
+          type: "barge_in_confirmed",
+          session_id: "",
+          media_session_id: "",
+          producer_seq: 0,
+          command_id: crypto.randomUUID(),
+          capture_instance_id: capture.id,
+          response_id: target.response_id,
+          output_epoch: target.output_epoch,
+          playback_id: target.playback_id,
+          local_playback_state: localPlaybackState,
+          receipt_prefix: receiptPrefix,
+        });
+      } catch (confirmationError) {
+        const message = confirmationError instanceof Error
+          ? confirmationError.message
+          : "Talk could not confirm the interrupted response.";
+        void stopTalk(`Talk stopped because the interruption could not be confirmed: ${message}`);
+      }
+      return;
+    }
+
+    const outputs = [...outputsRef.current.entries()];
+    outputsRef.current.clear();
+    refreshSpeaking();
+    for (const [responseId, output] of outputs) {
+      invalidateResponse(responseId);
+      output.player.stop("barge_in");
+      void output.queue[Symbol.asyncIterator]().return?.();
+      void output.player.destroy().catch(() => undefined);
+    }
+  }, [invalidateResponse, refreshSpeaking, stopTalk]);
 
   const pauseForSelection = useCallback(() => {
     if (selectionPauseRef.current) return;
@@ -330,14 +387,17 @@ export function TalkMode({
               setError(null);
               setRetryAvailable(false);
               const queue = new NativeOutputQueue();
-              let receiptChain = Promise.resolve();
+              const receiptChain = { current: Promise.resolve() };
+              const identity = {
+                playback_id: message.playback_id,
+                output_epoch: message.output_epoch,
+                response_id: message.response_id,
+                media_session_id: message.media_session_id,
+              };
               const player = new NativeOutputPlayer({
                 identity: {
-                  playback_id: message.playback_id,
-                  output_epoch: message.output_epoch,
-                  response_id: message.response_id,
-                  media_session_id: message.media_session_id,
-                  turn_id: message.turn_id,
+                  ...identity,
+                  turn_id: message.turn_id ?? undefined,
                 },
                 session_id: message.session_id,
                 onVisualFeedback: (value) => {
@@ -357,7 +417,10 @@ export function TalkMode({
                     void queue[Symbol.asyncIterator]().return?.();
                     void player.destroy().catch(() => undefined);
                   }
-                  receiptChain = receiptChain.then(() => postPlaybackReceipt(endpoint, event)).catch((receiptError: unknown) => {
+                  receiptChain.current = receiptChain.current.then(async () => {
+                    await postPlaybackReceipt(endpoint, event);
+                    player.acknowledgeReceipt(event.producer_seq);
+                  }).catch((receiptError: unknown) => {
                     if (mountedRef.current && !output?.failed) {
                       setError(receiptError instanceof Error ? receiptError.message : "Playback receipt could not be saved.");
                       setRetryAvailable(true);
@@ -366,7 +429,7 @@ export function TalkMode({
                 },
               });
               player.attach({ epoch: message.output_epoch, source: "real" });
-              output = { queue, player, failed: false, speaking: false };
+              output = { queue, player, failed: false, speaking: false, identity };
               outputsRef.current.set(message.response_id, output);
               const source: NativePcmSource = { sample_rate: REALTIME_OUTPUT_SAMPLE_RATE, channels: 1, chunks: queue };
               void player.start(source, Math.round(performance.now())).catch((playbackError: unknown) => {

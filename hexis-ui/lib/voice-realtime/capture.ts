@@ -173,6 +173,12 @@ export type CapturePauseToken = {
   ready: Promise<void>;
 };
 
+export type BargeInTarget = {
+  response_id: string;
+  playback_id: string;
+  output_epoch: number;
+};
+
 export class AudioCaptureController {
   private context: AudioContext | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
@@ -207,11 +213,15 @@ export class AudioCaptureController {
     private readonly transport: CaptureTransport,
     private readonly captureInstanceId: string,
     private readonly onFailure: (message: string) => void,
-    private readonly onSpeechStart?: () => void,
+    private readonly onSpeechStart?: (target?: BargeInTarget) => void,
   ) {}
 
   get deviceSettings(): MediaTrackSettings | undefined {
     return this.audioTrack?.getSettings();
+  }
+
+  get id(): string {
+    return this.captureInstanceId;
   }
 
   async start(stream: MediaStream): Promise<void> {
@@ -422,7 +432,6 @@ export class AudioCaptureController {
     if (this.paused || this.closed || this.failed) return;
     if (event.type === "speech_start") {
       this.onSpeechStart?.();
-      this.transport.sendControl?.("barge_in", "speech_start");
       this.utteranceParts = [];
       this.utteranceByteLength = 0;
       this.utteranceStartMs = null;

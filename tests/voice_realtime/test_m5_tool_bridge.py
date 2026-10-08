@@ -114,7 +114,7 @@ async def test_tool_audio_uses_playback_barrier_without_completing_voice_turn():
         action="end", session_id=session.session_id, response_id=response_id,
         playback_id="tool-audio-playback", producer_seq=2, output_epoch=1,
         media_session_id=session.media_session_id, turn_id=turn["turn_id"],
-        played_ms=100, scope="complete", model_dump=lambda mode="json": {},
+        played_ms=100, scope="complete", model_dump=lambda mode="json", **_kwargs: {},
     )
     assert session.accept_playback_receipt(receipt)
     session.record_playback_terminal(input_id, response_id, "tool-audio-playback", "complete", 100, 1)

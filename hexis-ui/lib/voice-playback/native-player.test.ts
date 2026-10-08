@@ -130,6 +130,48 @@ describe("NativeOutputPlayer", () => {
     await player.destroy();
   });
 
+  it("保留原始未ACK回执前缀并由持久化ACK水位截断", async () => {
+    const audio = new FakeAudio();
+    const events: NativePlaybackEventRequest[] = [];
+    const player = new NativeOutputPlayer({
+      identity,
+      session_id: "11111111-1111-1111-1111-111111111111",
+      emit: (event) => events.push(event),
+      audio: audio as unknown as HTMLAudioElement,
+      createContext: () => fakeContext() as unknown as AudioContext,
+    });
+
+    player.attach({ epoch: 2, source: "real" });
+    await player.start(new File(["audio"], "clip.wav"), 100);
+    audio.dispatchEvent(new Event("playing"));
+    audio.dispatchEvent(new Event("ended"));
+
+    expect(player.unacknowledgedReceipts(4)).toEqual(events);
+    player.acknowledgeReceipt(1);
+    player.acknowledgeReceipt(2);
+    expect(player.unacknowledgedReceipts(4)).toEqual(events.slice(2));
+    expect(() => player.acknowledgeReceipt(4)).toThrow(/waterline/i);
+    await player.destroy();
+  });
+
+  it("回执前缀超过能力上限时显式失败，不截断事实", async () => {
+    const audio = new FakeAudio();
+    const player = new NativeOutputPlayer({
+      identity,
+      session_id: "11111111-1111-1111-1111-111111111111",
+      emit: vi.fn(),
+      audio: audio as unknown as HTMLAudioElement,
+      createContext: () => fakeContext() as unknown as AudioContext,
+    });
+    player.attach({ epoch: 2, source: "real" });
+    await player.start(new File(["audio"], "clip.wav"), 100);
+    audio.dispatchEvent(new Event("playing"));
+    audio.dispatchEvent(new Event("ended"));
+
+    expect(() => player.unacknowledgedReceipts(2)).toThrow(/limit/i);
+    await player.destroy();
+  });
+
   it("显式停止和播放错误都映射为interrupt", async () => {
     const stoppedAudio = new FakeAudio();
     const stoppedEvents: NativePlaybackEventRequest[] = [];

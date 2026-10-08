@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from uuid import UUID, uuid4
 
 import httpx
@@ -10,6 +11,7 @@ import apps.hexis_api as hexis_api
 from services.behavior_events import query_behavior_events
 from services.playback_history import PlaybackHistory, PlaybackIdentity
 from services.voice_realtime_session import VoiceRealtimeSession, VoiceRealtimeSessionRegistry
+from services.voice_realtime_transport import load_playback_coordination_config
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
 
@@ -40,6 +42,7 @@ def _register_playback_session(monkeypatch, identity: PlaybackIdentity):
         session_id=identity.session_id,
         media_session_id=identity.media_session_id,
         client=Client(),
+        playback_coordination_config=load_playback_coordination_config(),
     )
     session._playback_ids[identity.response_id] = identity.playback_id
     session._playback_state[identity.response_id] = {
@@ -71,7 +74,13 @@ async def client(monkeypatch):
         media_session_id="media-1",
     )
     session = _register_playback_session(monkeypatch, identity)
-    session.accept_playback_receipt = lambda _request: True
+    def accept_for_dispatch(request, *, raw_request):
+        # 分派用例隔离状态校验，同时保留供持久化确认回读的原始回执。
+        state = session._playback_state[request.response_id]
+        state["receipts"][request.producer_seq] = copy.deepcopy(raw_request)
+        return True
+
+    session.accept_playback_receipt = accept_for_dispatch
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=hexis_api.app),
         base_url="http://test",
@@ -146,6 +155,15 @@ async def test_playback_api_dispatches_every_action(client, monkeypatch):
         ("end", "partial", 900, 4),
         ("interrupt", "user-stop", 700, 5),
     ]
+    session = hexis_api._voice_realtime_registry.get(UUID(SESSION_ID))
+    persisted = session._playback_state["resp-1"]["persisted_receipts"]
+    assert persisted == {
+        1: _body("open", producer_seq=1, start_ms=100),
+        2: _body("audible", producer_seq=2, audible_ms=150),
+        3: _body("progress", producer_seq=3, played_ms=500, interval_ms=100, phase="playing"),
+        4: _body("end", producer_seq=4, scope="partial", played_ms=900),
+        5: _body("interrupt", producer_seq=5, reason="user-stop", played_ms=700),
+    }
 
 
 @pytest.mark.parametrize(
@@ -324,6 +342,45 @@ async def test_playback_api_retry_deduplicates_with_stable_event_id(
     assert first.json()["event_id"] == retry.json()["event_id"]
     assert first.json()["deduplicated"] is False
     assert retry.json()["deduplicated"] is True
+
+
+async def test_released_playback_allows_only_exact_persisted_request_readback(db_pool, monkeypatch):
+    identity = PlaybackIdentity(
+        session_id=uuid4(),
+        response_id=f"resp-{uuid4()}",
+        playback_id=f"play-{uuid4()}",
+        output_epoch=1,
+        media_session_id=f"media-{uuid4()}",
+    )
+    monkeypatch.setattr(hexis_api, "_pool", db_pool)
+    session = _register_playback_session(monkeypatch, identity)
+    session._playback_state[identity.response_id]["generation_done"] = True
+    open_body = _body(
+        "open", session_id=str(identity.session_id), response_id=identity.response_id,
+        playback_id=identity.playback_id, output_epoch=identity.output_epoch,
+        media_session_id=identity.media_session_id, start_ms=0,
+    )
+    interrupt_body = _body(
+        "interrupt", producer_seq=2, session_id=str(identity.session_id),
+        response_id=identity.response_id, playback_id=identity.playback_id,
+        output_epoch=identity.output_epoch, media_session_id=identity.media_session_id,
+        reason="barge_in", played_ms=100,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=hexis_api.app),
+        base_url="http://test",
+    ) as http:
+        opened = await http.post("/api/voice/playback", json=open_body)
+        terminal = await http.post("/api/voice/playback", json=interrupt_body)
+        exact_retry = await http.post("/api/voice/playback", json=interrupt_body)
+        altered_retry = await http.post(
+            "/api/voice/playback", json={**interrupt_body, "reason": "different"}
+        )
+
+    assert opened.status_code == terminal.status_code == exact_retry.status_code == 200
+    assert exact_retry.json()["deduplicated"] is True
+    assert altered_retry.status_code == 409
+    assert session.playback_snapshot(identity.response_id) is None
 
 
 async def test_playback_api_concurrent_requests_keep_producer_stream_order(

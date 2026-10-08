@@ -12,6 +12,11 @@ describe("/api/voice/realtime/sessions", () => {
           session_id: "session-1",
           media_session_id: "media-1",
           websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1",
+          barge_in_capability: {
+            supported: true,
+            configuration_id: "voice-barge-in-playback-initial-v1",
+            maximum_receipt_prefix_items: 256,
+          },
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       ),

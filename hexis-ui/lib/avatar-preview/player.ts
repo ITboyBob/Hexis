@@ -38,16 +38,16 @@ export class LocalPlayer {
     }
   }
 
-  private feedback(phase: Playback["phase"]): void {
+  private feedback(phase: Playback["phase"], reason?: string): void {
     if (this.dead || this.closed || !this.current) return;
     this.playing = phase === "playing";
     if (["drained", "cancel", "error"].includes(phase)) this.closed = true;
     cancelAnimationFrame(this.raf);
-    this.emitFeedback(this.current, phase, 0);
+    this.emitFeedback(this.current, phase, 0, reason);
     if (this.playing) this.frame();
   }
 
-  private emitFeedback(identity: Identity, phase: Playback["phase"], amplitude: number): void {
+  private emitFeedback(identity: Identity, phase: Playback["phase"], amplitude: number, reason?: string): void {
     const now = performance.now();
     const interval_ms = this.lastFeedbackAt ? Math.max(0, now - this.lastFeedbackAt) : 0;
     this.lastFeedbackAt = now;
@@ -63,6 +63,7 @@ export class LocalPlayer {
       interval_ms,
       amplitude,
       source: "real",
+      ...(phase === "cancel" && reason ? { reason } : {}),
     });
   }
 
@@ -129,14 +130,14 @@ export class LocalPlayer {
     if (this.playing) { cancelAnimationFrame(this.raf); this.frame(); }
   }
 
-  stop(): void {
+  stop(reason = "player-stop"): void {
     const previous = this.current;
     this.current = undefined;
     this.closed = true;
     this.playing = false;
     cancelAnimationFrame(this.raf);
     this.audio.pause();
-    if (previous) this.emitFeedback(previous, "cancel", 0);
+    if (previous) this.emitFeedback(previous, "cancel", 0, reason);
     if (this.url) URL.revokeObjectURL(this.url);
     this.url = undefined;
   }

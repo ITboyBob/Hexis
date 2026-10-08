@@ -266,8 +266,14 @@ export class NativeOutputPlayer {
   private producerSeq = 0;
   private audibleEmitted = false;
   private lastProgressReceiptAtMs = Number.NEGATIVE_INFINITY;
+  private receiptRequests = new Map<number, NativePlaybackEventRequest>();
+  private acknowledgedReceiptSequence = 0;
 
   constructor(private readonly options: NativeOutputPlayerOptions) {}
+
+  get hasStarted(): boolean {
+    return this.started;
+  }
 
   accepts(input: { epoch: number; source: string }): boolean {
     return (
@@ -332,7 +338,7 @@ export class NativeOutputPlayer {
 
   stop(reason = "player-stop"): void {
     if (this.player instanceof NativePcmPlayer) this.player.stop(reason);
-    else this.player?.stop();
+    else this.player?.stop(reason);
   }
 
   async destroy(): Promise<void> {
@@ -342,6 +348,31 @@ export class NativeOutputPlayer {
 
   close(): void {
     this.closed = true;
+  }
+
+  acknowledgeReceipt(producerSeq: number): void {
+    if (!Number.isSafeInteger(producerSeq) || producerSeq <= 0) {
+      throw new Error("Playback receipt ACK must use a positive producer sequence.");
+    }
+    if (producerSeq <= this.acknowledgedReceiptSequence) return;
+    if (producerSeq !== this.acknowledgedReceiptSequence + 1 || !this.receiptRequests.has(producerSeq)) {
+      throw new Error("Playback receipt ACK cannot advance past a missing waterline item.");
+    }
+    this.receiptRequests.delete(producerSeq);
+    this.acknowledgedReceiptSequence = producerSeq;
+  }
+
+  unacknowledgedReceipts(maximumItems: number): NativePlaybackEventRequest[] {
+    if (!Number.isSafeInteger(maximumItems) || maximumItems <= 0) {
+      throw new Error("Playback receipt prefix limit must be a positive integer.");
+    }
+    const pending = [...this.receiptRequests.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([, request]) => ({ ...request }));
+    if (pending.length > maximumItems) {
+      throw new Error(`Playback receipt prefix exceeds the negotiated limit of ${maximumItems} items.`);
+    }
+    return pending;
   }
 
   private handleFeedback(feedback: Playback): void {
@@ -449,6 +480,7 @@ export class NativeOutputPlayer {
       ...(this.options.identity.turn_id ? { turn_id: this.options.identity.turn_id } : {}),
       ...event,
     };
+    this.receiptRequests.set(producer_seq, request);
     this.options.emit(request);
   }
 }

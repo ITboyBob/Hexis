@@ -100,7 +100,7 @@ describe("AudioCaptureController transport ordering", () => {
     );
   });
 
-  it("stops local output before signaling barge-in and keeps capture active", () => {
+  it("signals the local candidate callback without sending an unscoped barge-in command", () => {
     const actions: string[] = [];
     const controller = new AudioCaptureController(
       {
@@ -128,7 +128,7 @@ describe("AudioCaptureController transport ordering", () => {
       endMonotonicMs: 1,
     });
 
-    expect(actions).toEqual(["local_stop", "barge_in:speech_start"]);
+    expect(actions).toEqual(["local_stop"]);
     expect((controller as unknown as { closed: boolean }).closed).toBe(false);
   });
 

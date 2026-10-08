@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -275,6 +277,8 @@ def test_transport_rejects_oversized_base64_and_wrong_identity():
 
 def test_parses_server_ready_audio_generation_event_and_error():
     session_id = uuid4()
+    capture_instance_id = uuid4()
+    control_id = uuid4()
     ready = parse_server_message(
         {
             "schema_version": 1,
@@ -284,6 +288,11 @@ def test_parses_server_ready_audio_generation_event_and_error():
             "producer_seq": 0,
             "cloud_session_id": "qwen-1",
             "instructions_hash": "a" * 64,
+            "barge_in_capability": {
+                "supported": True,
+                "configuration_id": "voice-barge-in-playback-initial-v1",
+                "maximum_receipt_prefix_items": 256,
+            },
         }
     )
     audio = parse_server_message(
@@ -294,6 +303,8 @@ def test_parses_server_ready_audio_generation_event_and_error():
             "media_session_id": "media-1",
             "producer_seq": 1,
             "response_id": "resp-1",
+            "playback_id": "playback-1",
+            "turn_id": None,
             "output_epoch": 1,
             "segment_id": "segment-1",
             "segment_index": 0,
@@ -309,9 +320,65 @@ def test_parses_server_ready_audio_generation_event_and_error():
             "media_session_id": "media-1",
             "producer_seq": 2,
             "response_id": "resp-1",
+            "playback_id": "playback-1",
+            "turn_id": None,
             "output_epoch": 1,
             "kind": "text_delta",
             "text": "你好",
+        }
+    )
+    generation_done = parse_server_message(
+        {
+            "schema_version": 1,
+            "type": "generation",
+            "session_id": str(session_id),
+            "media_session_id": "media-1",
+            "producer_seq": 3,
+            "response_id": "resp-1",
+            "playback_id": "playback-1",
+            "turn_id": str(uuid4()),
+            "output_epoch": 1,
+            "kind": "done",
+            "reason": None,
+        }
+    )
+    selection = parse_server_message(
+        {
+            "schema_version": 1,
+            "type": "m5_selection_opened",
+            "session_id": str(session_id),
+            "media_session_id": "media-1",
+            "producer_seq": 4,
+            "selection": {
+                "selection_id": "selection-1",
+                "version": 2,
+                "message": "请选择下一步",
+                "state": "open",
+                "origin_session_id": str(session_id),
+            },
+        }
+    )
+    suspended = parse_server_message(
+        {
+            "schema_version": 1,
+            "type": "capture_suspended",
+            "session_id": str(session_id),
+            "media_session_id": "media-1",
+            "producer_seq": 5,
+            "capture_instance_id": str(capture_instance_id),
+            "control_id": str(control_id),
+            "discarded_range": {"start_frame": 256, "end_frame": 512},
+        }
+    )
+    resumed = parse_server_message(
+        {
+            "schema_version": 1,
+            "type": "capture_resumed",
+            "session_id": str(session_id),
+            "media_session_id": "media-1",
+            "producer_seq": 6,
+            "capture_instance_id": str(capture_instance_id),
+            "control_id": str(uuid4()),
         }
     )
     error = parse_server_message(
@@ -320,7 +387,7 @@ def test_parses_server_ready_audio_generation_event_and_error():
             "type": "error",
             "session_id": str(session_id),
             "media_session_id": "media-1",
-            "producer_seq": 3,
+            "producer_seq": 7,
             "stage": "cloud",
             "code": "unavailable",
             "message": "Cloud unavailable",
@@ -330,5 +397,90 @@ def test_parses_server_ready_audio_generation_event_and_error():
 
     assert ready.type == "ready"
     assert audio.type == "audio_chunk"
+    assert audio.playback_id == "playback-1"
+    assert audio.turn_id is None
     assert generation.type == "generation"
+    assert generation.turn_id is None
+    assert generation_done.reason is None
+    assert selection.type == "m5_selection_opened"
+    assert selection.selection.version == 2
+    assert suspended.type == "capture_suspended"
+    assert suspended.discarded_range.start_frame == 256
+    assert resumed.type == "capture_resumed"
     assert error.type == "error"
+
+
+def test_server_media_messages_reject_unknown_fields():
+    with pytest.raises(ValidationError):
+        parse_server_message(
+            {
+                "schema_version": 1,
+                "type": "capture_resumed",
+                "session_id": str(uuid4()),
+                "media_session_id": "media-1",
+                "producer_seq": 1,
+                "capture_instance_id": str(uuid4()),
+                "control_id": str(uuid4()),
+                "unsupported": True,
+            }
+        )
+
+
+def test_server_generation_variants_require_their_production_fields_and_reject_mixed_shapes():
+    base = {
+        "schema_version": 1,
+        "type": "generation",
+        "session_id": str(uuid4()),
+        "media_session_id": "media-1",
+        "producer_seq": 1,
+        "response_id": "response-1",
+        "playback_id": "playback-1",
+        "turn_id": None,
+        "output_epoch": 1,
+    }
+    with pytest.raises(ValidationError):
+        parse_server_message({**base, "kind": "text_delta"})
+    with pytest.raises(ValidationError):
+        parse_server_message({**base, "kind": "done"})
+    with pytest.raises(ValidationError):
+        parse_server_message({**base, "kind": "done", "reason": None, "text": "unexpected"})
+    with pytest.raises(ValidationError):
+        parse_server_message({**base, "kind": "text_delta", "text": "你好", "reason": None})
+
+
+def test_m5_recall_done_production_shape_uses_explicit_null_reason():
+    source = Path(__file__).resolve().parents[2] / "apps/hexis_api.py"
+    done_senders = []
+    for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
+        if not isinstance(node, ast.Dict):
+            continue
+        literals = {
+            key.value: value.value
+            for key, value in zip(node.keys, node.values)
+            if isinstance(key, ast.Constant) and isinstance(value, ast.Constant)
+        }
+        if literals.get("type") == "generation" and literals.get("kind") == "done":
+            done_senders.append(node)
+    assert len(done_senders) == 1
+    bindings = envelope(
+        "generation", 1, response_id="m5-response", playback_id="m5-playback",
+        turn_id=None, output_epoch=1,
+    )
+    fixture = {
+        key.value: value.value if isinstance(value, ast.Constant) else bindings[key.value]
+        for key, value in zip(done_senders[0].keys, done_senders[0].values)
+    }
+    message = parse_server_message(fixture)
+    assert message.kind == "done"
+    assert message.reason is None
+    assert "reason" in message.model_fields_set
+
+
+def test_failed_generation_preserves_the_explicit_provider_reason():
+    fixture = envelope(
+        "generation", 1, response_id="response-1", playback_id="playback-1",
+        turn_id=None, output_epoch=1, kind="failed", reason="provider unavailable",
+    )
+    assert parse_server_message(fixture).reason == "provider unavailable"
+    with pytest.raises(ValidationError):
+        parse_server_message({key: value for key, value in fixture.items() if key != "reason"})

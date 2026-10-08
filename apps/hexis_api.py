@@ -24,6 +24,7 @@ import hmac
 import html
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -59,6 +60,11 @@ from core.gateway import EventSource, Gateway
 from core.rabbitmq_bridge import RabbitMQBridge
 from core.tools import create_default_registry, create_full_registry
 from services.chat import resolve_prompt_addenda, stream_chat_events
+from services.voice_realtime_transport import (
+    PlaybackEventRequest,
+    build_barge_in_capability,
+    load_playback_coordination_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -450,28 +456,6 @@ class SpeechSynthesisRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     text: str = Field(min_length=1, max_length=20_000)
-
-
-class PlaybackEventRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    action: Literal["open", "audible", "progress", "end", "interrupt"]
-    session_id: uuid.UUID
-    response_id: str = Field(min_length=1, max_length=200)
-    playback_id: str = Field(min_length=1, max_length=200)
-    producer_seq: int = Field(ge=0, strict=True)
-    output_epoch: int = Field(ge=0)
-    media_session_id: str = Field(min_length=1, max_length=200)
-    turn_id: uuid.UUID | None = None
-    start_ms: int | None = Field(default=None, ge=0)
-    audible_ms: int | None = Field(default=None, ge=0)
-    played_ms: int | None = Field(default=None, ge=0)
-    interval_ms: int | None = Field(default=None, ge=0)
-    phase: str | None = Field(default=None, min_length=1, max_length=40)
-    scope: str | None = Field(
-        default=None, pattern="^(complete|partial|unplayed|unknown)$"
-    )
-    reason: str | None = Field(default=None, min_length=1, max_length=120)
 
 
 class VoiceRealtimeSessionRequest(BaseModel):
@@ -3010,6 +2994,19 @@ async def transcribe_pwa_voice(
     }
 
 
+def _voice_realtime_start_timeout(config: dict[str, Any]) -> float:
+    value = config.get("timeout")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("C5 timeout must be a finite positive number of seconds")
+    try:
+        timeout = float(value)
+    except OverflowError as exc:
+        raise ValueError("C5 timeout must be a finite positive number of seconds") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("C5 timeout must be a finite positive number of seconds")
+    return timeout
+
+
 def _voice_realtime_session_registry():
     global _voice_realtime_registry
     if _voice_realtime_registry is None:
@@ -3056,6 +3053,14 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
 
     if _pool is None:
         raise HTTPException(status_code=503, detail="database not ready")
+
+    try:
+        playback_coordination_config = load_playback_coordination_config()
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="The selected C7 playback coordination configuration is unavailable or invalid.",
+        ) from exc
 
     from apps.voice_m4_probe import (
         load_m4_stable_instructions,
@@ -3111,6 +3116,10 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
             raise HTTPException(status_code=503, detail="The explicitly selected realtime configuration is unavailable or incomplete.") from exc
     else:
         config = load_selected_config()
+    try:
+        start_timeout = _voice_realtime_start_timeout(config)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     api_key = selected_env_value(config["api_key_env"])
     if not api_key:
         raise HTTPException(
@@ -3252,6 +3261,12 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
         media_session_id=media_session_id,
         client=client,
         on_input_authorized=on_input_authorized,
+        barge_in_capability=build_barge_in_capability(
+            playback_coordination_config,
+            # Enable only after the complete target-confirmation path is wired.
+            supported=False,
+        ),
+        playback_coordination_config=playback_coordination_config,
     )
     session._response_dispatch = None
     session._input_error_dispatch = None
@@ -3286,10 +3301,18 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
 
     session._event_sink = write_voice_event
     registry.register(req.session_id, session)
+    receiver: asyncio.Task[None] | None = None
     try:
-        cloud_session_id = await session.start(
-            instructions, tool_surface=tool_surface
-        )
+        try:
+            async with asyncio.timeout(start_timeout):
+                cloud_session_id = await session.start(
+                    instructions, tool_surface=tool_surface
+                )
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Qwen Realtime provider session startup timed out after {start_timeout:g}s (C5 timeout). Check the provider connection and retry Talk.",
+            ) from exc
         receiver = asyncio.create_task(session.run_receiver())
         session.register_background_task(receiver)
         instructions_hash = hashlib.sha256(instructions.encode("utf-8")).hexdigest()
@@ -3337,15 +3360,25 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
                 req.session_id,
             )
     except Exception:
-        await session.close("error")
-        registry.remove(req.session_id, session)
+        try:
+            await session.close("error")
+        except Exception:
+            logger.exception("Could not close the failed realtime session")
+        finally:
+            if receiver is not None:
+                receiver.cancel()
+                await asyncio.gather(receiver, return_exceptions=True)
+            registry.remove(req.session_id, session)
         raise
 
-    return {
-        "session_id": str(req.session_id),
-        "media_session_id": media_session_id,
-        "websocket_url": _browser_realtime_websocket_url(media_session_id),
-    }
+    from services.voice_realtime_transport import RealtimeSessionResponse
+
+    return RealtimeSessionResponse(
+        session_id=req.session_id,
+        media_session_id=media_session_id,
+        websocket_url=_browser_realtime_websocket_url(media_session_id),
+        barge_in_capability=session.barge_in_capability,
+    ).model_dump(mode="json")
 
 
 @app.websocket("/api/voice/realtime/{media_session_id}")
@@ -3360,31 +3393,39 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
         await websocket.close(code=1008, reason="realtime session or origin is invalid")
         return
 
+    from services.voice_realtime_session import VoiceRealtimeSessionError
     from services.voice_realtime_transport import (
         ClientTransportError,
         VoiceClientTransport,
         parse_client_message,
+        parse_server_message,
     )
     from services.qwen_realtime_output import OutputMappingError, QwenRealtimeOutputAdapter
 
     transport = VoiceClientTransport(
         session_id=session.session_id,
         media_session_id=session.media_session_id,
+        max_receipt_prefix_items=(
+            session.barge_in_capability.maximum_receipt_prefix_items
+            if session.barge_in_capability is not None
+            else None
+        ),
     )
     instructions_hash = hashlib.sha256(
         session.stable_instructions.encode("utf-8")
     ).hexdigest()
-    await websocket.send_json(
-        {
-            "schema_version": 1,
-            "type": "ready",
-            "session_id": str(session.session_id),
-            "media_session_id": session.media_session_id,
-            "producer_seq": 0,
-            "cloud_session_id": session.cloud_session_id,
-            "instructions_hash": instructions_hash,
-        }
-    )
+    ready_message = {
+        "schema_version": 1,
+        "type": "ready",
+        "session_id": str(session.session_id),
+        "media_session_id": session.media_session_id,
+        "producer_seq": 0,
+        "cloud_session_id": session.cloud_session_id,
+        "instructions_hash": instructions_hash,
+        "barge_in_capability": session.barge_in_capability.model_dump(mode="json"),
+    }
+    parse_server_message(ready_message)
+    await websocket.send_json(ready_message)
 
     close_reason = "manual"
     speech_open = False
@@ -3397,6 +3438,7 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
         async with websocket_send_lock:
             value["producer_seq"] = websocket_producer_seq
             websocket_producer_seq += 1
+            parse_server_message(value)
             await websocket.send_json(value)
 
     async def send_input_error(stage: str, code: str, message: str) -> None:
@@ -3612,6 +3654,7 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                                     "turn_id": output.get("turn_id"),
                                     "output_epoch": output["output_epoch"],
                                     "kind": "done",
+                                    "reason": None,
                                 }
                             )
                             await session.mark_generation_done(
@@ -3905,7 +3948,7 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
             try:
                 value = json.loads(raw)
                 message = parse_client_message(value)
-                transport_result = transport.accept(message)
+                transport_result = transport.accept(message, raw_message=value)
             except (json.JSONDecodeError, ValidationError, ClientTransportError) as exc:
                 await send_server_message(
                     {
@@ -3923,7 +3966,75 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                 close_reason = "error"
                 break
 
-            if message.type == "capture_suspend":
+            if message.type == "barge_in_confirmed":
+                try:
+                    result, error_message = await _confirm_voice_barge_in(
+                        session, transport, message, value
+                    )
+                except (ClientTransportError, VoiceRealtimeSessionError, HTTPException) as exc:
+                    await send_server_message(
+                        {
+                            "schema_version": 1,
+                            "type": "error",
+                            "session_id": str(session.session_id),
+                            "media_session_id": session.media_session_id,
+                            "producer_seq": 0,
+                            "stage": "barge_in",
+                            "code": "invalid_confirmation",
+                            "message": str(getattr(exc, "detail", exc)),
+                            "recoverable": False,
+                        }
+                    )
+                    close_reason = "error"
+                    break
+                await send_server_message(result)
+                if error_message is not None:
+                    await send_server_message(
+                        {
+                            "schema_version": 1,
+                            "type": "error",
+                            "session_id": str(session.session_id),
+                            "media_session_id": session.media_session_id,
+                            "producer_seq": 0,
+                            "stage": "barge_in",
+                            "code": "settlement_unknown",
+                            "message": error_message,
+                            "recoverable": False,
+                        }
+                    )
+                    close_reason = "error"
+                    await websocket.close(code=1011, reason="confirmed barge-in outcome is unknown")
+                    break
+                if result["status"] == "accepted":
+                    async def monitor_barge_in_settlement(response_id: str) -> None:
+                        nonlocal close_reason
+                        try:
+                            await asyncio.wait_for(
+                                session.wait_for_generation_done(response_id),
+                                timeout=session._playback_coordination_config.settlement_timeout_ms / 1000,
+                            )
+                        except (TimeoutError, Exception):
+                            await send_server_message(
+                                {
+                                    "schema_version": 1,
+                                    "type": "error",
+                                    "session_id": str(session.session_id),
+                                    "media_session_id": session.media_session_id,
+                                    "producer_seq": 0,
+                                    "stage": "barge_in",
+                                    "code": "settlement_unknown",
+                                    "message": "The provider did not confirm interruption within the configured recovery window. Close and reopen Talk.",
+                                    "recoverable": False,
+                                }
+                            )
+                            close_reason = "error"
+                            await websocket.close(code=1011, reason="confirmed barge-in settlement timed out")
+
+                    settlement_task = asyncio.create_task(
+                        monitor_barge_in_settlement(message.response_id)
+                    )
+                    session.register_background_task(settlement_task)
+            elif message.type == "capture_suspend":
                 try:
                     await session.client.clear_uncommitted_audio()
                 except Exception as exc:
@@ -4172,7 +4283,7 @@ async def _complete_ready_voice_turn(session: Any, input_turn_id: str) -> dict[s
 
 
 @app.post("/api/voice/playback")
-async def record_voice_playback(req: PlaybackEventRequest):
+async def record_voice_playback(req: PlaybackEventRequest, request: Request):
     """Record one real native playback event through the shared history service."""
 
     if _pool is None:
@@ -4182,24 +4293,31 @@ async def record_voice_playback(req: PlaybackEventRequest):
     )
     if session is None:
         raise HTTPException(status_code=409, detail="The realtime voice response is unknown or its playback receipt window expired.")
+    raw_request = await request.json()
+    if not isinstance(raw_request, dict):
+        raise HTTPException(status_code=422, detail="Playback receipt must be a JSON object.")
+    async with session.playback_receipt_lock:
+        return await _record_voice_playback_for_session(session, req, raw_request)
+
+
+async def _record_voice_playback_for_session(
+    session: Any,
+    req: PlaybackEventRequest,
+    raw_request: dict[str, Any],
+) -> dict[str, Any]:
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
     if req.action == "open" and req.start_ms is None:
         raise HTTPException(status_code=422, detail="start_ms is required")
     if req.action == "audible" and req.audible_ms is None:
         raise HTTPException(status_code=422, detail="audible_ms is required")
-    if req.action == "progress" and (
-        req.played_ms is None or req.interval_ms is None or req.phase is None
-    ):
+    if req.action == "progress" and (req.played_ms is None or req.interval_ms is None or req.phase is None):
         raise HTTPException(status_code=422, detail="played_ms, interval_ms and phase are required")
     if req.action == "end" and (req.scope is None or req.played_ms is None):
         raise HTTPException(status_code=422, detail="scope and played_ms are required")
     if req.action == "interrupt" and (req.played_ms is None or req.reason is None):
         raise HTTPException(status_code=422, detail="played_ms and reason are required")
-    from services.voice_realtime_session import VoiceRealtimeSessionError
 
-    try:
-        is_new_receipt = session.accept_playback_receipt(req)
-    except VoiceRealtimeSessionError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
     from services.playback_history import PlaybackHistory, PlaybackIdentity
     from services.voice_playback_watchdog import PlaybackWatchIdentity
 
@@ -4220,13 +4338,41 @@ async def record_voice_playback(req: PlaybackEventRequest):
         output_epoch=req.output_epoch,
     )
     watchdog = _voice_realtime_playback_watchdog()
+
+    if session.playback_snapshot(req.response_id) is None:
+        recent = session.recent_playback_receipts(req.response_id)
+        stored = recent.get("receipts", {}).get(req.producer_seq) if recent else None
+        expected_identity = {
+            "session_id": req.session_id,
+            "media_session_id": req.media_session_id,
+            "response_id": req.response_id,
+            "playback_id": req.playback_id,
+            "output_epoch": req.output_epoch,
+        }
+        if recent is None or recent.get("identity") != expected_identity or stored != raw_request:
+            raise HTTPException(status_code=409, detail="The realtime voice response is unknown or its playback receipt window expired.")
+        if req.action == "open":
+            return await history.open(start_ms=req.start_ms, producer_seq=req.producer_seq)
+        if req.action == "audible":
+            return await history.audible(audible_ms=req.audible_ms, producer_seq=req.producer_seq)
+        if req.action == "progress":
+            return await history.progress(played_ms=req.played_ms, interval_ms=req.interval_ms, phase=req.phase, producer_seq=req.producer_seq)
+        if req.action == "end":
+            return await history.end(scope=req.scope, played_ms=req.played_ms, producer_seq=req.producer_seq)
+        return await history.interrupt(reason=req.reason, played_ms=req.played_ms, producer_seq=req.producer_seq)
+
+    from services.voice_realtime_session import VoiceRealtimeSessionError
+
+    try:
+        is_new_receipt = session.accept_playback_receipt(req, raw_request=raw_request)
+    except VoiceRealtimeSessionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     if req.action == "open":
-        result = await history.open(
-            start_ms=req.start_ms, producer_seq=req.producer_seq
-        )
-        async def on_timeout(
-            timed_identity: Any, _watch_seq: int
-        ) -> None:
+        result = await history.open(start_ms=req.start_ms, producer_seq=req.producer_seq)
+        session.note_playback_receipt_persisted(req, raw_request)
+
+        async def on_timeout(timed_identity: Any, _watch_seq: int) -> None:
             snapshot = session.playback_snapshot(timed_identity.response_id)
             producer_seq = session.next_playback_producer_seq(timed_identity.response_id)
             if snapshot is None or producer_seq is None or _pool is None:
@@ -4242,8 +4388,9 @@ async def record_voice_playback(req: PlaybackEventRequest):
                 scope="unknown",
                 played_ms=snapshot["played_ms"],
             )
+            raw_terminal = terminal.model_dump(mode="json", exclude_unset=True)
             try:
-                session.accept_playback_receipt(terminal)
+                session.accept_playback_receipt(terminal, raw_request=raw_terminal)
                 input_turn_id = session._response_input_ids.get(timed_identity.response_id)
                 timed_history = PlaybackHistory(
                     _pool,
@@ -4256,90 +4403,221 @@ async def record_voice_playback(req: PlaybackEventRequest):
                         turn_id=req.turn_id,
                     ),
                 )
-                await timed_history.end(
-                    scope="unknown",
-                    played_ms=snapshot["played_ms"],
-                    producer_seq=producer_seq,
-                )
+                await timed_history.end(scope="unknown", played_ms=snapshot["played_ms"], producer_seq=producer_seq)
+                session.note_playback_receipt_persisted(terminal, raw_terminal)
                 if input_turn_id is not None:
-                    session.record_playback_terminal(
-                        input_turn_id,
-                        timed_identity.response_id,
-                        timed_identity.playback_id,
-                        "unknown",
-                        snapshot["played_ms"],
-                        timed_identity.output_epoch,
-                    )
+                    session.record_playback_terminal(input_turn_id, timed_identity.response_id, timed_identity.playback_id, "unknown", snapshot["played_ms"], timed_identity.output_epoch)
                 await session.finish_response_playback(timed_identity.response_id)
                 if input_turn_id is not None:
                     await _complete_ready_voice_turn(session, input_turn_id)
             except Exception:
                 logger.exception("Playback watchdog could not close response %s", timed_identity.response_id)
 
-        watchdog.open(
-            watch_identity,
-            producer_seq=req.producer_seq,
-            on_timeout=on_timeout,
-        )
+        watchdog.open(watch_identity, producer_seq=req.producer_seq, on_timeout=on_timeout)
         return result
+
     if req.action == "audible":
-        return await history.audible(
-            audible_ms=req.audible_ms, producer_seq=req.producer_seq
-        )
+        result = await history.audible(audible_ms=req.audible_ms, producer_seq=req.producer_seq)
+        session.note_playback_receipt_persisted(req, raw_request)
+        return result
     if req.action == "progress":
-        result = await history.progress(
-            played_ms=req.played_ms,
-            interval_ms=req.interval_ms,
-            phase=req.phase,
-            producer_seq=req.producer_seq,
-        )
+        result = await history.progress(played_ms=req.played_ms, interval_ms=req.interval_ms, phase=req.phase, producer_seq=req.producer_seq)
+        session.note_playback_receipt_persisted(req, raw_request)
         if is_new_receipt:
             snapshot = session.playback_snapshot(req.response_id)
-            if snapshot is None or not watchdog.progress(
-                watch_identity,
-                producer_seq=req.producer_seq,
-                played_ms=req.played_ms,
-                scheduled_ms=snapshot["scheduled_ms"],
-            ):
+            if snapshot is None or not watchdog.progress(watch_identity, producer_seq=req.producer_seq, played_ms=req.played_ms, scheduled_ms=snapshot["scheduled_ms"]):
                 raise HTTPException(status_code=409, detail="Playback progress did not renew the trusted watchdog.")
         return result
+
     if req.action == "end":
-        result = await history.end(
-            scope=req.scope, played_ms=req.played_ms, producer_seq=req.producer_seq
-        )
+        result = await history.end(scope=req.scope, played_ms=req.played_ms, producer_seq=req.producer_seq)
+        session.note_playback_receipt_persisted(req, raw_request)
         watchdog.terminal(watch_identity)
         input_turn_id = session._response_input_ids.get(req.response_id)
         if input_turn_id is not None:
-            session.record_playback_terminal(
-                input_turn_id,
-                req.response_id,
-                req.playback_id,
-                req.scope or "unknown",
-                req.played_ms or 0,
-                req.output_epoch,
-            )
+            session.record_playback_terminal(input_turn_id, req.response_id, req.playback_id, req.scope or "unknown", req.played_ms or 0, req.output_epoch)
         await session.finish_response_playback(req.response_id)
         if input_turn_id is not None:
             await _complete_ready_voice_turn(session, input_turn_id)
         return result
-    result = await history.interrupt(
-        reason=req.reason, played_ms=req.played_ms, producer_seq=req.producer_seq
-    )
+
+    result = await history.interrupt(reason=req.reason, played_ms=req.played_ms, producer_seq=req.producer_seq)
+    session.note_playback_receipt_persisted(req, raw_request)
     watchdog.terminal(watch_identity)
     input_turn_id = session._response_input_ids.get(req.response_id)
     if input_turn_id is not None:
-        session.record_playback_terminal(
-            input_turn_id,
-            req.response_id,
-            req.playback_id,
-            "partial",
-            req.played_ms or 0,
-            req.output_epoch,
-        )
+        session.record_playback_terminal(input_turn_id, req.response_id, req.playback_id, "partial", req.played_ms or 0, req.output_epoch)
     await session.finish_response_playback(req.response_id)
     if input_turn_id is not None:
         await _complete_ready_voice_turn(session, input_turn_id)
     return result
+
+
+def _barge_in_result_message(session: Any, message: Any, status: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "type": "barge_in_result",
+        "session_id": str(session.session_id),
+        "media_session_id": session.media_session_id,
+        "producer_seq": 0,
+        "command_id": str(message.command_id),
+        "capture_instance_id": str(message.capture_instance_id),
+        "response_id": message.response_id,
+        "output_epoch": message.output_epoch,
+        "playback_id": message.playback_id,
+        "status": status,
+    }
+
+
+async def _confirm_voice_barge_in(
+    session: Any,
+    transport: Any,
+    message: Any,
+    raw_message: dict[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    from services.voice_realtime_session import VoiceRealtimeSessionError
+    from services.voice_realtime_transport import ClientTransportError, parse_client_message
+
+    config = session._playback_coordination_config
+    if config is None or session.barge_in_capability is None or not session.barge_in_capability.supported:
+        raise ClientTransportError("confirmed voice barge-in is not enabled for this media session")
+
+    async with session._barge_in_command_lock:
+        cached = session.cached_barge_in_result(message, raw_message)
+        if cached is not None:
+            return cached, None
+
+        transport.validate_barge_in_capture(message.capture_instance_id)
+        recent = session.recent_playback_receipts(message.response_id)
+        state = session._playback_state.get(message.response_id)
+        target_identity = {
+            "session_id": message.session_id,
+            "media_session_id": message.media_session_id,
+            "response_id": message.response_id,
+            "playback_id": message.playback_id,
+            "output_epoch": message.output_epoch,
+        }
+
+        if state is None:
+            recent_identity = recent.get("identity") if recent else None
+            recent_requests = recent.get("receipts", {}) if recent else {}
+            exact_prefix = all(
+                recent_requests.get(item.producer_seq) == raw_item
+                for item, raw_item in zip(message.receipt_prefix, raw_message["receipt_prefix"], strict=True)
+            )
+            ordered_recent = sorted(recent_requests.items())
+            recent_terminal = ordered_recent[-1][1].get("action") if ordered_recent else None
+            if (
+                recent_identity == target_identity
+                and recent.get("generation_done")
+                and recent.get("playback_terminal")
+                and message.local_playback_state == "started"
+                and exact_prefix
+                and recent_terminal == "interrupt"
+            ):
+                result = _barge_in_result_message(session, message, "playback_only")
+            else:
+                result = _barge_in_result_message(session, message, "stale_target")
+            session.cache_barge_in_result(message, raw_message, result)
+            return result, None
+
+        active_response_id = session.active_response_id
+        if active_response_id != message.response_id:
+            result = _barge_in_result_message(session, message, "stale_target")
+            session.cache_barge_in_result(message, raw_message, result)
+            return result, None
+        if (
+            state.get("playback_id") != message.playback_id
+            or state.get("output_epoch") != message.output_epoch
+        ):
+            raise ClientTransportError("confirmed barge-in target identity does not match the active response")
+        if state.get("invalidated"):
+            raise ClientTransportError("the active response already has a pending interruption")
+
+        raw_prefix = raw_message["receipt_prefix"]
+        prefix_actions = [item.get("action") for item in raw_prefix]
+        if message.local_playback_state == "not_started":
+            if raw_prefix or state.get("opened"):
+                raise ClientTransportError("not_started confirmation conflicts with an open playback")
+        else:
+            server_opened = state.get("opened") or any(
+                item.get("action") == "open" for item in state.get("receipts", {}).values()
+            )
+            already_interrupted = bool(
+                state.get("terminal")
+                and any(item.get("action") == "interrupt" for item in state.get("receipts", {}).values())
+            )
+            if not server_opened and "open" not in prefix_actions:
+                raise ClientTransportError("started confirmation has no matching open receipt")
+            if not already_interrupted and (not prefix_actions or prefix_actions[-1] != "interrupt"):
+                raise ClientTransportError("started confirmation must end with a terminal interrupt receipt")
+
+        async with session._foreground_command_lock:
+            if session.active_response_id != message.response_id:
+                result = _barge_in_result_message(session, message, "stale_target")
+                session.cache_barge_in_result(message, raw_message, result)
+                return result, None
+            state["invalidated"] = True
+            session._invalidated_response_ids.add(message.response_id)
+            session._barge_in_pending_prefixes[message.response_id] = {
+                item.producer_seq: raw_item
+                for item, raw_item in zip(message.receipt_prefix, raw_prefix, strict=True)
+            }
+            if message.local_playback_state == "not_started":
+                state["terminal"] = True
+                state["playback_finished"] = True
+
+        error_message: str | None = None
+        status: str
+        try:
+            async with asyncio.timeout(config.settlement_timeout_ms / 1000):
+                for receipt_value, raw_item in zip(message.receipt_prefix, raw_prefix, strict=True):
+                    receipt = PlaybackEventRequest.model_validate(receipt_value.model_dump(mode="python"))
+                    async with session.playback_receipt_lock:
+                        await _record_voice_playback_for_session(session, receipt, raw_item)
+
+                async with session._foreground_command_lock:
+                    current_state = session._playback_state.get(message.response_id)
+                    recent_after = session.recent_playback_receipts(message.response_id)
+                    active_after = session.active_response_id == message.response_id
+                    if not active_after or current_state is None:
+                        terminal_action = None
+                        if recent_after is not None:
+                            recent_values = sorted(recent_after["receipts"].items())
+                            terminal_action = recent_values[-1][1].get("action") if recent_values else None
+                        if (
+                            message.local_playback_state == "started"
+                            and recent_after is not None
+                            and recent_after.get("generation_done")
+                            and recent_after.get("playback_terminal")
+                            and terminal_action == "interrupt"
+                        ):
+                            status = "playback_only"
+                        elif message.local_playback_state == "not_started" and recent_after is not None and recent_after.get("generation_done"):
+                            status = "playback_only"
+                        else:
+                            status = "stale_target"
+                    elif current_state.get("generation_done"):
+                        status = "playback_only"
+                    else:
+                        await session.client.cancel_response()
+                        status = "accepted"
+        except HTTPException as exc:
+            if exc.status_code in {409, 422}:
+                raise ClientTransportError(str(exc.detail)) from exc
+            status = "unknown"
+            error_message = "Playback facts could not be persisted within the configured recovery window. Close and reopen Talk."
+        except (TimeoutError, Exception) as exc:
+            status = "unknown"
+            error_message = f"Confirmed interruption outcome is unknown ({type(exc).__name__}). Close and reopen Talk."
+        finally:
+            session._barge_in_pending_prefixes.pop(message.response_id, None)
+
+        result = _barge_in_result_message(session, message, status)
+        session.cache_barge_in_result(message, raw_message, result)
+        if status == "playback_only" and message.local_playback_state == "not_started":
+            await session._finalize_response_if_complete(message.response_id)
+        return result, error_message
 
 
 @app.get("/api/voice/status")

@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
+import json
 import time
+from collections import OrderedDict
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -20,6 +24,10 @@ from services.voice_instructions import eligible_gate_emotion, render_per_turn
 from services.voice_output_arbiter import OutputClaim, VoiceOutputArbiter
 from services.voice_recall import VOICE_RECALL_TOOL
 from services.m5_tool_contracts import realtime_tool_definitions
+from services.voice_realtime_transport import (
+    BargeInCapability,
+    PlaybackCoordinationConfig,
+)
 
 
 class VoiceRealtimeSessionError(RuntimeError):
@@ -46,6 +54,8 @@ class VoiceRealtimeSession:
         queue_limit: int = 1000,
         on_input_authorized: Any | None = None,
         output_arbiter: VoiceOutputArbiter | None = None,
+        barge_in_capability: BargeInCapability | None = None,
+        playback_coordination_config: PlaybackCoordinationConfig | None = None,
     ) -> None:
         if not isinstance(session_id, UUID):
             raise ValueError("session_id must be a UUID")
@@ -56,6 +66,8 @@ class VoiceRealtimeSession:
         self.session_id = session_id
         self.media_session_id = media_session_id
         self.client = client
+        self._barge_in_capability = barge_in_capability
+        self._playback_coordination_config = playback_coordination_config
         self._on_input_authorized = on_input_authorized
         self._input_gate_results: dict[str, Any] = {}
         self._output_arbiter = output_arbiter or VoiceOutputArbiter(session_id=session_id)
@@ -78,6 +90,12 @@ class VoiceRealtimeSession:
         self._responses_idle = asyncio.Event()
         self._responses_idle.set()
         self._instruction_turn_lock = asyncio.Lock()
+        self._foreground_command_lock = asyncio.Lock()
+        self._playback_receipt_lock = asyncio.Lock()
+        self._recent_playback_receipts: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._barge_in_command_lock = asyncio.Lock()
+        self._barge_in_commands: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._barge_in_pending_prefixes: dict[str, dict[int, dict[str, Any]]] = {}
         self._supplier_response_map: dict[str, str] = {}
         self._authorized_input_ids: set[str] = set()
         self._response_input_ids: dict[str, str] = {}
@@ -104,6 +122,16 @@ class VoiceRealtimeSession:
         return self._ready and not self._closed
 
     @property
+    def barge_in_capability(self) -> BargeInCapability | None:
+        """Immutable C7-derived capability snapshot bound to this media session."""
+        return self._barge_in_capability
+
+    @property
+    def playback_receipt_lock(self) -> asyncio.Lock:
+        """Serialize HTTP and WS receipt validation/persistence for this media session."""
+        return self._playback_receipt_lock
+
+    @property
     def active_response_id(self) -> str | None:
         return self._output_arbiter.active_response_id
 
@@ -127,16 +155,19 @@ class VoiceRealtimeSession:
         response_id = self._output_arbiter.active_response_id
         if response_id is None:
             return None
-        state = self._playback_state.get(response_id)
-        if state is None:
-            raise VoiceRealtimeSessionError("foreground output has no playback state")
-        state["invalidated"] = True
-        self._invalidated_response_ids.add(response_id)
-        claim = self._response_claims.pop(response_id, None)
-        if claim is not None:
-            await self._output_arbiter.release(response_id, self.media_session_id)
-        await self.client.cancel_response()
-        return response_id
+        async with self._foreground_command_lock:
+            if self._output_arbiter.active_response_id != response_id:
+                return None
+            state = self._playback_state.get(response_id)
+            if state is None:
+                raise VoiceRealtimeSessionError("foreground output has no playback state")
+            state["invalidated"] = True
+            self._invalidated_response_ids.add(response_id)
+            claim = self._response_claims.pop(response_id, None)
+            if claim is not None:
+                await self._output_arbiter.release(response_id, self.media_session_id)
+            await self.client.cancel_response()
+            return response_id
 
     async def start(self, instructions: str, *, tool_surface: str = "m4") -> str:
         if self._closed:
@@ -248,48 +279,56 @@ class VoiceRealtimeSession:
             await self._responses_idle.wait()
             instructions, facts = self.response_instructions(input_turn_id)
             await self.client.update_session_instructions(instructions)
-            response_id = str(uuid4())
-            claim = await self._output_arbiter.claim(response_id, self.media_session_id)
-            playback_id = str(uuid4())
-            queue = self.subscribe_response(response_id)
-            self._responses_idle.clear()
-            try:
-                await self.client.create_first_response(response_id)
-            except Exception:
-                self._response_queues.pop(response_id, None)
-                if not self._response_queues:
-                    self._responses_idle.set()
-                await self._output_arbiter.release(response_id, self.media_session_id)
-                raise
-            self._response_claims[response_id] = claim
-            self._authorized_input_ids.add(input_turn_id)
-            self._response_input_ids[response_id] = input_turn_id
-            self._voice_tool_call_counts.setdefault(input_turn_id, 0)
-            self._playback_ids[response_id] = playback_id
-            self._playback_state[response_id] = {
-                "output_epoch": claim.output_epoch,
-                "playback_id": playback_id,
-                "scheduled_frames": 0,
-                "scheduled_ms": 0,
-                "opened": False,
-                "terminal": False,
-                "last_seq": 0,
-                "receipts": {},
-                "played_ms": 0,
-                "invalidated": False,
-            }
-            turn = self._voice_turns.get(input_turn_id)
-            if turn is not None:
-                turn["response_ids"].append(response_id)
-            return {
-                "response_id": response_id,
-                "playback_id": playback_id,
-                "output_epoch": claim.output_epoch,
-                "events": queue,
-                "instruction_facts": facts,
-                "input_turn_id": input_turn_id,
-                "turn_id": str(turn["turn_id"]) if turn is not None else None,
-            }
+            async with self._foreground_command_lock:
+                response_id = str(uuid4())
+                claim = await self._output_arbiter.claim(response_id, self.media_session_id)
+                playback_id = str(uuid4())
+                queue = self.subscribe_response(response_id)
+                self._responses_idle.clear()
+                previously_authorized = input_turn_id in self._authorized_input_ids
+                had_tool_count = input_turn_id in self._voice_tool_call_counts
+                self._response_claims[response_id] = claim
+                self._authorized_input_ids.add(input_turn_id)
+                self._response_input_ids[response_id] = input_turn_id
+                self._voice_tool_call_counts.setdefault(input_turn_id, 0)
+                self._playback_ids[response_id] = playback_id
+                self._playback_state[response_id] = {
+                    "output_epoch": claim.output_epoch,
+                    "playback_id": playback_id,
+                    "scheduled_frames": 0,
+                    "scheduled_ms": 0,
+                    "opened": False,
+                    "terminal": False,
+                    "generation_done": False,
+                    "generation_done_event": asyncio.Event(),
+                    "last_seq": 0,
+                    "receipts": {},
+                    "played_ms": 0,
+                    "invalidated": False,
+                }
+                turn = self._voice_turns.get(input_turn_id)
+                if turn is not None:
+                    turn["response_ids"].append(response_id)
+                try:
+                    await self.client.create_first_response(response_id)
+                except (Exception, asyncio.CancelledError):
+                    await self._release_response_locked(response_id)
+                    if turn is not None and response_id in turn["response_ids"]:
+                        turn["response_ids"].remove(response_id)
+                    if not previously_authorized:
+                        self._authorized_input_ids.discard(input_turn_id)
+                    if not had_tool_count:
+                        self._voice_tool_call_counts.pop(input_turn_id, None)
+                    raise
+                return {
+                    "response_id": response_id,
+                    "playback_id": playback_id,
+                    "output_epoch": claim.output_epoch,
+                    "events": queue,
+                    "instruction_facts": facts,
+                    "input_turn_id": input_turn_id,
+                    "turn_id": str(turn["turn_id"]) if turn is not None else None,
+                }
 
     def bind_voice_turn(
         self,
@@ -349,6 +388,7 @@ class VoiceRealtimeSession:
         state = self._playback_state.get(response_id)
         if state is not None:
             state["generation_done"] = True
+            state.setdefault("generation_done_event", asyncio.Event()).set()
         await self._finalize_response_if_complete(response_id)
 
     def record_playback_terminal(
@@ -592,49 +632,60 @@ class VoiceRealtimeSession:
                 self.validate_voice_tool_call(self._bound_voice_calls[call_id])
                 await self.client.send_function_call_output(call_id, tool_output)
             await self.client.update_session_instructions(instructions)
-            response_id = str(uuid4())
-            claim = await self._output_arbiter.claim(response_id, self.media_session_id)
-            playback_id = str(uuid4())
-            queue = self.subscribe_response(response_id)
-            self._responses_idle.clear()
-            try:
-                await self.client.create_first_response(response_id)
-            except Exception:
-                self._response_queues.pop(response_id, None)
-                if not self._response_queues:
-                    self._responses_idle.set()
-                await self._output_arbiter.release(response_id, self.media_session_id)
-                raise
-            self._completed_voice_call_ids.update(call_ids)
-            self._response_claims[response_id] = claim
-            self._playback_ids[response_id] = playback_id
-            self._playback_state[response_id] = {
-                "output_epoch": claim.output_epoch,
-                "playback_id": playback_id,
-                "scheduled_frames": 0,
-                "scheduled_ms": 0,
-                "opened": False,
-                "terminal": False,
-                "last_seq": 0,
-                "receipts": {},
-                "played_ms": 0,
-                "invalidated": False,
-            }
-            self._response_input_ids[response_id] = input_turn_id
-            turn = self._voice_turns.get(input_turn_id)
-            if turn is not None:
-                turn["response_ids"].append(response_id)
-            return {
-                "response_id": response_id,
-                "playback_id": playback_id,
-                "output_epoch": claim.output_epoch,
-                "events": queue,
-                "instruction_facts": facts,
-                "input_turn_id": input_turn_id,
-                "turn_id": str(turn["turn_id"]) if turn is not None else None,
-            }
+            async with self._foreground_command_lock:
+                response_id = str(uuid4())
+                claim = await self._output_arbiter.claim(response_id, self.media_session_id)
+                playback_id = str(uuid4())
+                queue = self.subscribe_response(response_id)
+                self._responses_idle.clear()
+                self._response_claims[response_id] = claim
+                self._playback_ids[response_id] = playback_id
+                self._playback_state[response_id] = {
+                    "output_epoch": claim.output_epoch,
+                    "playback_id": playback_id,
+                    "scheduled_frames": 0,
+                    "scheduled_ms": 0,
+                    "opened": False,
+                    "terminal": False,
+                    "generation_done": False,
+                    "generation_done_event": asyncio.Event(),
+                    "last_seq": 0,
+                    "receipts": {},
+                    "played_ms": 0,
+                    "invalidated": False,
+                }
+                self._response_input_ids[response_id] = input_turn_id
+                turn = self._voice_turns.get(input_turn_id)
+                if turn is not None:
+                    turn["response_ids"].append(response_id)
+                try:
+                    await self.client.create_first_response(response_id)
+                except (Exception, asyncio.CancelledError):
+                    await self._release_response_locked(response_id)
+                    if turn is not None and response_id in turn["response_ids"]:
+                        turn["response_ids"].remove(response_id)
+                    raise
+                self._completed_voice_call_ids.update(call_ids)
+                return {
+                    "response_id": response_id,
+                    "playback_id": playback_id,
+                    "output_epoch": claim.output_epoch,
+                    "events": queue,
+                    "instruction_facts": facts,
+                    "input_turn_id": input_turn_id,
+                    "turn_id": str(turn["turn_id"]) if turn is not None else None,
+                }
 
     async def release_response(self, response_id: str) -> None:
+        async with self._foreground_command_lock:
+            await self._release_response_locked(response_id)
+
+    async def _release_response_locked(self, response_id: str) -> None:
+        state = self._playback_state.get(response_id)
+        recent = self._recent_playback_receipts.get(response_id)
+        if state is not None and recent is not None:
+            recent["generation_done"] = bool(state.get("generation_done"))
+            recent["playback_terminal"] = bool(state.get("terminal"))
         claim = self._response_claims.pop(response_id, None)
         self._playback_ids.pop(response_id, None)
         self._response_queues.pop(response_id, None)
@@ -693,15 +744,15 @@ class VoiceRealtimeSession:
         state = self._playback_state.get(response_id)
         return state["last_seq"] + 1 if state is not None else None
 
-    def accept_playback_receipt(self, request: Any) -> bool:
+    def accept_playback_receipt(
+        self, request: Any, *, raw_request: dict[str, Any] | None = None
+    ) -> bool:
         """Bind playback lifecycle reports to server-issued identities and PCM bounds."""
         state = self._playback_state.get(request.response_id)
         claim = self._response_claims.get(request.response_id)
         playback_id = self._playback_ids.get(request.response_id)
         if state is None or playback_id is None:
             raise VoiceRealtimeSessionError("playback response is not active")
-        if state.get("invalidated") and request.action != "interrupt":
-            raise VoiceRealtimeSessionError("invalidated playback accepts only its terminal interrupt receipt")
         if (
             request.session_id != self.session_id
             or request.media_session_id != self.media_session_id
@@ -717,12 +768,19 @@ class VoiceRealtimeSession:
         actual_turn_id = str(actual_turn_id) if actual_turn_id is not None else None
         if actual_turn_id != expected_turn_id:
             raise VoiceRealtimeSessionError("playback receipt turn_id does not match the authorized response")
-        payload = request.model_dump(mode="json")
+        payload = (
+            copy.deepcopy(raw_request)
+            if raw_request is not None
+            else request.model_dump(mode="json", exclude_unset=True)
+        )
         previous = state["receipts"].get(request.producer_seq)
         if previous is not None:
             if previous != payload:
                 raise VoiceRealtimeSessionError("playback producer sequence conflicts with earlier facts")
             return False
+        pending_prefix = self._barge_in_pending_prefixes.get(request.response_id, {})
+        if state.get("invalidated") and pending_prefix.get(request.producer_seq) != payload:
+            raise VoiceRealtimeSessionError("invalidated playback accepts only receipts in its confirmed prefix")
         if request.producer_seq <= state["last_seq"]:
             raise VoiceRealtimeSessionError("playback producer sequence is not increasing")
         if state["terminal"]:
@@ -746,6 +804,145 @@ class VoiceRealtimeSession:
         state["last_seq"] = request.producer_seq
         state["receipts"][request.producer_seq] = payload
         return True
+
+    def note_playback_receipt_persisted(
+        self, request: Any, raw_request: dict[str, Any]
+    ) -> None:
+        state = self._playback_state.get(request.response_id)
+        if state is not None:
+            accepted = state["receipts"].get(request.producer_seq)
+            if accepted != raw_request:
+                raise VoiceRealtimeSessionError("persisted playback receipt differs from its validated request")
+            state.setdefault("persisted_receipts", {})[request.producer_seq] = copy.deepcopy(raw_request)
+        self._remember_recent_playback_receipt(request, raw_request)
+
+    def _remember_recent_playback_receipt(
+        self, request: Any, raw_request: dict[str, Any]
+    ) -> None:
+        config = self._playback_coordination_config
+        if config is None:
+            return
+        now_ms = int(time.monotonic() * 1000)
+        retention_ms = config.recent_response_retention_ms
+        for response_id, entry in tuple(self._recent_playback_receipts.items()):
+            if now_ms - entry["seen_at_ms"] > retention_ms:
+                self._recent_playback_receipts.pop(response_id, None)
+        entry = self._recent_playback_receipts.get(request.response_id)
+        identity = {
+            "session_id": request.session_id,
+            "media_session_id": request.media_session_id,
+            "response_id": request.response_id,
+            "playback_id": request.playback_id,
+            "output_epoch": request.output_epoch,
+        }
+        if entry is None:
+            state = self._playback_state.get(request.response_id)
+            entry = {
+                "identity": identity,
+                "receipts": {},
+                "generation_done": bool(state and state.get("generation_done")),
+                "playback_terminal": bool(state and state.get("terminal")),
+                "seen_at_ms": now_ms,
+            }
+            self._recent_playback_receipts[request.response_id] = entry
+        elif entry["identity"] != identity:
+            raise VoiceRealtimeSessionError("recent playback identity conflicts with an earlier receipt")
+        previous = entry["receipts"].get(request.producer_seq)
+        if previous is not None and previous != raw_request:
+            raise VoiceRealtimeSessionError("recent playback sequence conflicts with its persisted request")
+        entry["receipts"][request.producer_seq] = copy.deepcopy(raw_request)
+        entry["seen_at_ms"] = now_ms
+        self._recent_playback_receipts.move_to_end(request.response_id)
+        while len(self._recent_playback_receipts) > config.recent_response_limit:
+            self._recent_playback_receipts.popitem(last=False)
+
+    def recent_playback_receipts(self, response_id: str) -> dict[str, Any] | None:
+        config = self._playback_coordination_config
+        entry = self._recent_playback_receipts.get(response_id)
+        if config is None or entry is None:
+            return None
+        now_ms = int(time.monotonic() * 1000)
+        if now_ms - entry["seen_at_ms"] > config.recent_response_retention_ms:
+            self._recent_playback_receipts.pop(response_id, None)
+            return None
+        return copy.deepcopy(entry)
+
+    async def wait_for_generation_done(self, response_id: str) -> None:
+        state = self._playback_state.get(response_id)
+        if state is None:
+            recent = self.recent_playback_receipts(response_id)
+            if recent is not None and recent.get("generation_done"):
+                return
+            raise VoiceRealtimeSessionError("response generation state is no longer available")
+        if state.get("generation_done"):
+            return
+        event = state.setdefault("generation_done_event", asyncio.Event())
+        await event.wait()
+
+    def barge_in_command_fingerprint(
+        self, message: Any, raw_message: dict[str, Any]
+    ) -> str:
+        semantic = copy.deepcopy(raw_message)
+        semantic.pop("producer_seq", None)
+        semantic["session_id"] = str(message.session_id)
+        semantic["media_session_id"] = message.media_session_id
+        semantic["command_id"] = str(message.command_id)
+        semantic["capture_instance_id"] = str(message.capture_instance_id)
+        semantic["response_id"] = message.response_id
+        semantic["output_epoch"] = message.output_epoch
+        semantic["playback_id"] = message.playback_id
+        try:
+            canonical = json.dumps(
+                semantic,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise VoiceRealtimeSessionError("confirmed barge-in body is not canonical JSON") from exc
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def cached_barge_in_result(
+        self, message: Any, raw_message: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        config = self._playback_coordination_config
+        if config is None:
+            return None
+        command_id = str(message.command_id)
+        fingerprint = self.barge_in_command_fingerprint(message, raw_message)
+        now_ms = int(time.monotonic() * 1000)
+        for key, entry in tuple(self._barge_in_commands.items()):
+            if now_ms - entry["seen_at_ms"] > config.recent_response_retention_ms:
+                self._barge_in_commands.pop(key, None)
+        entry = self._barge_in_commands.get(command_id)
+        if entry is None:
+            return None
+        if entry["fingerprint"] != fingerprint:
+            raise VoiceRealtimeSessionError("command_id was reused with different confirmed barge-in content")
+        entry["seen_at_ms"] = now_ms
+        self._barge_in_commands.move_to_end(command_id)
+        return copy.deepcopy(entry["result"])
+
+    def cache_barge_in_result(
+        self,
+        message: Any,
+        raw_message: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        config = self._playback_coordination_config
+        if config is None:
+            raise VoiceRealtimeSessionError("C7 playback coordination config is unavailable")
+        command_id = str(message.command_id)
+        fingerprint = self.barge_in_command_fingerprint(message, raw_message)
+        self._barge_in_commands[command_id] = {
+            "fingerprint": fingerprint,
+            "result": copy.deepcopy(result),
+            "seen_at_ms": int(time.monotonic() * 1000),
+        }
+        self._barge_in_commands.move_to_end(command_id)
+        while len(self._barge_in_commands) > config.recent_response_limit:
+            self._barge_in_commands.popitem(last=False)
 
     async def process_utterance(
         self,

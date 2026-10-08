@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "configuration_id": "voice-barge-in-initial-v1",
+  "configuration_id": "voice-barge-in-initial-v2",
   "validation_status": "unvalidated",
   "model": "v6",
   "audio": {
@@ -41,6 +41,9 @@
       "minimum_positive_frames": 3,
       "require_current_frame": true
     }
+  },
+  "readiness": {
+    "server_ready_timeout_ms": 30000
   },
   "worker": {
     "execution_provider": "wasm",
