@@ -1446,8 +1446,10 @@ describe("ChatPage outbox replies", () => {
   it("opens and returns from the fixed task session without mixing conversation history", async () => {
     const origin = "11111111-1111-4111-8111-111111111111";
     const taskSession = "22222222-2222-4222-8222-222222222222";
+    const secondTaskSession = "44444444-4444-4444-8444-444444444444";
     const taskId = "33333333-3333-4333-8333-333333333333";
     const taskSessionLoads: string[] = [];
+    const activitySessions: string[] = [];
     sessionStorage.setItem("hexis-chat-session-id", origin);
     class FakeEventSource {
       static lastUrl = "";
@@ -1478,13 +1480,47 @@ describe("ChatPage outbox replies", () => {
             tasks: [
               {
                 task_id: taskId,
-                task_title: "S9专项任务",
+                task_title: "S9专项任务 A",
                 task_state: "idle",
                 task_session_id: taskSession,
                 revision: 2,
                 pending: [],
               },
+              {
+                task_id: "55555555-5555-4555-8555-555555555555",
+                task_title: "S9专项任务 B",
+                task_state: "idle",
+                task_session_id: secondTaskSession,
+                revision: 1,
+                pending: [],
+              },
             ],
+          });
+        }
+        if (url.startsWith("/api/chat/activity?")) {
+          const query = new URL(url, "http://localhost").searchParams;
+          const sessionId = query.get("session_id") || "";
+          activitySessions.push(sessionId);
+          const row = (eventId: string, title: string, detail: string) => ({
+            event_id: eventId,
+            event_type: "TOOL_RESULT",
+            stream_id: "background-task",
+            session_id: sessionId,
+            seq: 1,
+            recorded_at: "2026-10-09T00:00:00.000Z",
+            call_id: `${eventId}-call`,
+            activity: { id: eventId, kind: "tool_result", title, detail },
+          });
+          const events = sessionId === taskSession
+            ? [row("task-a-event", "read_file", "Task A README output")]
+            : sessionId === secondTaskSession
+              ? [row("task-b-event", "recall", "Task B only output")]
+              : [];
+          return Response.json({
+            session_id: sessionId,
+            cursor: events.length ? { "background-task": 1 } : {},
+            has_more: false,
+            events,
           });
         }
         if (url === `/api/chat/session/${origin}`) {
@@ -1503,20 +1539,35 @@ describe("ChatPage outbox replies", () => {
     );
 
     render(<ChatPage />);
-    await screen.findByText("来源会话历史");
+    await screen.findByText("来源会话历史", { selector: "span" });
     fireEvent.click(screen.getByRole("button", { name: "任务列表" }));
-    fireEvent.click(await screen.findByRole("button", { name: /进入任务：S9专项任务/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /进入任务：S9专项任务 A/ }));
 
-    expect(await screen.findByText("任务专属正文")).toBeInTheDocument();
+    expect(await screen.findByText("任务专属正文", { selector: "span" })).toBeInTheDocument();
     expect(screen.queryByText("来源会话历史")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show activity" }));
+    expect(await screen.findByText("Task A README output")).toBeInTheDocument();
+    expect(screen.queryByText("Task B only output")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "任务列表" }));
+    fireEvent.click(await screen.findByRole("button", { name: /进入任务：S9专项任务 B/ }));
+    expect(await screen.findByText("Task B only output")).toBeInTheDocument();
+    expect(screen.queryByText("Task A README output")).toBeNull();
+
     fireEvent.click(screen.getByRole("button", { name: "任务列表" }));
     fireEvent.click(screen.getByRole("button", { name: "返回来源会话" }));
-    expect(await screen.findByText("来源会话历史")).toBeInTheDocument();
+    expect(await screen.findByText("来源会话历史", { selector: "span" })).toBeInTheDocument();
     expect(screen.queryByText("任务专属正文")).toBeNull();
+    expect(screen.queryByText("Task A README output")).toBeNull();
+    expect(screen.queryByText("Task B only output")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "任务列表" }));
-    fireEvent.click(await screen.findByRole("button", { name: /进入任务：S9专项任务/ }));
-    expect(await screen.findByText("任务专属正文")).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: /进入任务：S9专项任务 A/ }));
+    expect(await screen.findByText("任务专属正文", { selector: "span" })).toBeInTheDocument();
+    expect(await screen.findByText("Task A README output")).toBeInTheDocument();
+    expect(activitySessions).toContain(origin);
+    expect(activitySessions).toContain(taskSession);
+    expect(activitySessions).toContain(secondTaskSession);
     expect(taskSessionLoads).toEqual([
       `/api/chat/session/${taskSession}`,
       `/api/chat/session/${taskSession}`,

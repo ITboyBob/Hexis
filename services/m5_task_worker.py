@@ -168,9 +168,20 @@ class M5TaskWorker:
                 visual_attachments=visual_attachments,
             )
             execution_started = True
+            event_callback_factory = getattr(self._executor, "work_event_callback", None)
+            on_event = (
+                event_callback_factory(
+                    task_id=task_id,
+                    work_execution_id=work_id,
+                    task_session_id=task_session_id,
+                )
+                if callable(event_callback_factory)
+                else None
+            )
             result = await self._executor.execute_work(
                 prepared,
                 work_execution_id=work_id,
+                on_event=on_event,
             )
             turn_id = UUID(str(result.turn_id)) if result.turn_id is not None else None
             result_payload = BackgroundExecutor.m5_work_result_payload(result)

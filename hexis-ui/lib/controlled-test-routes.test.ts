@@ -26,6 +26,9 @@ describe("受控测试页面的 Next 路由注册", () => {
     expect(apiMatchers.some((matcher) => matcher.match("/api/__test__/tool-activity/identity"))).toBe(true);
     expect(apiMatchers.some((matcher) => matcher.match("/api/__test__/tool-activity/script"))).toBe(true);
     expect(apiMatchers.some((matcher) => matcher.match("/api/__test__/tool-activity/voice-recall"))).toBe(true);
+    expect(apiMatchers.some((matcher) => matcher.match("/api/__test__/tool-activity/background/start"))).toBe(true);
+    expect(apiMatchers.some((matcher) => matcher.match("/api/__test__/tool-activity/background/status"))).toBe(true);
+    expect(apiMatchers.some((matcher) => matcher.match("/api/__test__/tool-activity/background/release"))).toBe(true);
   });
 
   it("拒绝未转义的私有目录，防止处理函数单测掩盖路由 404", async () => {

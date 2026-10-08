@@ -226,6 +226,134 @@ async def test_accepted_submit_runs_outside_voice_lifecycle_and_owns_task_sessio
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_worker_persists_actual_tool_events_while_work_is_running(db_pool, monkeypatch):
+    from uuid import UUID
+
+    from services import m5_task_worker
+    from services.background_executor import BackgroundExecutor
+    from services.m5_task_service import M5TaskService
+
+    service = M5TaskService(db_pool)
+    async with db_pool.acquire() as conn:
+        origin = await conn.fetchval(
+            "SELECT (get_or_create_chat_session(NULL,'chat',$1,'{}'::jsonb)->>'session_id')::uuid",
+            f"m5-tool-event-origin-{uuid4()}",
+        )
+    accepted = await service.submit_m5_task(
+        origin,
+        uuid4(),
+        "检查文件并总结",
+        "请检查 README 并给出总结。",
+        {
+            "origin_session_id": str(origin),
+            "input_turn_id": str(uuid4()),
+            "input_order": 1,
+            "stimulus_revision": 0,
+            "response_id": f"response-{uuid4()}",
+            "supplier_response_id": f"supplier-{uuid4()}",
+            "request_id": f"request-{uuid4()}",
+            "actual_call_id": f"submit-{uuid4()}",
+        },
+    )
+    claim = await service.claim_work_round(accepted["work_execution_id"])
+    assert claim is not None
+    registry = BackgroundExecutor(db_pool)
+    actual_registry = await registry._create_registry()
+    read_file = actual_registry.get("read_file")
+    assert read_file is not None
+    original_execute = read_file.execute
+    entered, release = asyncio.Event(), asyncio.Event()
+    call_id = f"read-file-{uuid4()}"
+
+    async def delayed_execute(arguments, context):
+        entered.set()
+        await release.wait()
+        return await original_execute(arguments, context)
+
+    monkeypatch.setattr(read_file, "execute", delayed_execute)
+
+    async def prepare(_pool, session_id, _message, history, **_kwargs):
+        assert str(session_id) == accepted["task_session_id"]
+        return SimpleNamespace(
+            loop_options={
+                "timeout_seconds": 30,
+                "temperature": 0.0,
+                "max_tokens": 256,
+                "is_operator": False,
+                "on_approval": None,
+            },
+            system_prompt="You are a background task worker.",
+            llm_config={"provider": "openai", "model": "offline-fixture"},
+            registry=actual_registry,
+            selection=SimpleNamespace(skills=[], available=[]),
+            session_id=str(session_id),
+            user_message="请检查 README 并给出总结。",
+            history=history,
+            user_content="请检查 README 并给出总结。",
+        )
+
+    provider_calls = 0
+
+    async def fake_chat_completion(**_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 1:
+            return {
+                "content": "Checking README.",
+                "tool_calls": [{"id": call_id, "name": "read_file", "arguments": {"path": "README.md"}}],
+                "raw": None,
+            }
+        return {"content": "README 已检查。", "tool_calls": [], "raw": None}
+
+    monkeypatch.setattr(m5_task_worker, "prepare_background_turn", prepare)
+    monkeypatch.setattr("core.agent_loop.chat_completion", fake_chat_completion)
+    worker = m5_task_worker.M5TaskWorker(db_pool, executor=registry, poll_interval=0.02)
+    execution = None
+    try:
+        execution = asyncio.create_task(worker._execute_claim(claim))
+        await asyncio.wait_for(entered.wait(), 3)
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT event_type,event_id,session_id,task_id,call_id,payload->>'execution_id' AS execution_id "
+                "FROM behavior_events WHERE task_id=$1::text AND event_type IN ('TOOL_START','TOOL_RESULT') ORDER BY recorded_at,producer_seq",
+                str(accepted["task_id"]),
+            )
+            work_state = await conn.fetchval(
+                "SELECT status FROM m5_work_rounds WHERE id=$1::uuid", accepted["work_execution_id"]
+            )
+        assert [row["event_type"] for row in rows] == ["TOOL_START"]
+        assert work_state == "running"
+        assert rows[0]["session_id"] == UUID(accepted["task_session_id"])
+        assert rows[0]["task_id"] == accepted["task_id"]
+        assert rows[0]["call_id"] == call_id
+        assert rows[0]["execution_id"] == accepted["work_execution_id"]
+
+        release.set()
+        await asyncio.wait_for(execution, 3)
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT event_type,event_id,session_id,task_id,call_id,payload->>'execution_id' AS execution_id "
+                "FROM behavior_events WHERE task_id=$1::text AND event_type IN ('TOOL_START','TOOL_RESULT') ORDER BY recorded_at,producer_seq",
+                str(accepted["task_id"]),
+            )
+            work_state = await conn.fetchval(
+                "SELECT status FROM m5_work_rounds WHERE id=$1::uuid", accepted["work_execution_id"]
+            )
+        assert [row["event_type"] for row in rows] == ["TOOL_START", "TOOL_RESULT"]
+        assert len({row["event_id"] for row in rows}) == 2
+        assert {row["session_id"] for row in rows} == {UUID(accepted["task_session_id"])}
+        assert {row["task_id"] for row in rows} == {accepted["task_id"]}
+        assert {row["call_id"] for row in rows} == {call_id}
+        assert {row["execution_id"] for row in rows} == {accepted["work_execution_id"]}
+        assert work_state == "completed"
+    finally:
+        release.set()
+        if execution is not None:
+            await asyncio.gather(execution, return_exceptions=True)
+        await worker.close()
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_task_window_context_reaches_preparation_then_is_cleared(db_pool, monkeypatch):
     from services import m5_task_worker
     from services.m5_task_service import M5TaskService

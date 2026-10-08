@@ -119,3 +119,34 @@ def test_unknown_receipt_appends_only_a_real_error_reason() -> None:
     )
     assert result is not None
     assert result["detail"] == "工具调用结果无法确认。\n原因：reason"
+
+
+def test_background_recall_keeps_full_content_beyond_voice_recall_limit() -> None:
+    content = "完整后台召回正文" * 400
+    result = format_tool_result(
+        {
+            "tool_name": "recall",
+            "success": True,
+            "output": {"memories": [{"content": content}], "partial_activations": []},
+        },
+        event_id="background-recall-long",
+    )
+    assert result["detail"] == "1. " + content
+    assert len(result["detail"]) > 2000
+
+
+def test_unlisted_background_tool_keeps_its_actual_name_and_output_shape() -> None:
+    result = format_tool_result(
+        {
+            "tool_name": "read_file",
+            "success": True,
+            "arguments": {"path": "README.md"},
+            "display_output": "D" * 1200,
+            "output": {"ui": {"kind": "file", "title": "README.md"}},
+        },
+        event_id="read-file-result",
+    )
+    assert result["title"] == "read_file"
+    assert result["detail"] == "D" * 1000
+    assert result["display_output"] == "D" * 1200
+    assert result["ui"] == {"kind": "file", "title": "README.md"}

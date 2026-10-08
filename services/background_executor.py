@@ -56,6 +56,27 @@ class BackgroundExecutor:
     def __init__(self, pool: Any) -> None:
         self._pool = pool
 
+    def work_event_callback(
+        self,
+        *,
+        task_id: UUID | str,
+        work_execution_id: UUID | str,
+        task_session_id: UUID | str,
+    ) -> Any:
+        """Bind AgentLoop tool events to one claimed M5 work round."""
+        state = _EventBridgeState(
+            task_id=str(UUID(str(task_id))),
+            execution_id=str(UUID(str(work_execution_id))),
+            session_id=UUID(str(task_session_id)),
+        )
+
+        async def on_agent_event(event: AgentEventData) -> None:
+            await self._on_agent_event(event, state)
+            if state.error is not None:
+                raise state.error
+
+        return on_agent_event
+
     async def _load_config(self) -> dict[str, Any]:
         async with self._pool.acquire() as conn:
             return await load_llm_config(conn, "llm.chat", fallback_key="llm")

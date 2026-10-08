@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
 type ToolLog = {
@@ -50,6 +50,11 @@ export default function ControlledToolActivityScenario() {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
+  const [barrierId, setBarrierId] = useState("");
+
+  useEffect(() => {
+    setBarrierId(sessionStorage.getItem("hexis-bob108-background-barrier-id") || "");
+  }, []);
 
   const createSession = async () => {
     const sessionResponse = await fetch("/api/chat/session", { method: "POST", cache: "no-store" });
@@ -123,6 +128,76 @@ export default function ControlledToolActivityScenario() {
     }
   };
 
+  const runBackgroundTask = async () => {
+    setBusy(true);
+    setStatus("Creating two real M5 task sessions and pausing the real read_file handler after its request event…");
+    try {
+      const originSessionId = await createSession();
+      const response = await fetch("/api/__test__/tool-activity/background/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ origin_session_id: originSessionId }),
+        cache: "no-store",
+      });
+      const result = await response.json();
+      if (!response.ok || result.origin_session_id !== originSessionId || !result.barrier_id || !result.task_a?.task_session_id || !result.task_b?.task_session_id) {
+        throw new Error(result.error || `Controlled M5 task did not start (${response.status}).`);
+      }
+      sessionStorage.setItem("hexis-bob108-background-barrier-id", result.barrier_id);
+      sessionStorage.setItem("hexis-bob108-background-tasks", JSON.stringify({ origin_session_id: originSessionId, task_a: result.task_a, task_b: result.task_b }));
+      setBarrierId(result.barrier_id);
+      setStatus(`Task A ${result.task_a.task_id} and task B ${result.task_b.task_id} created. Opening their origin conversation…`);
+      router.push("/chat");
+    } catch (error: unknown) {
+      setStatus(error instanceof Error ? error.message : "The controlled background task failed.");
+      setBusy(false);
+    }
+  };
+
+  const inspectBackgroundBarrier = async () => {
+    const selectedBarrier = barrierId || sessionStorage.getItem("hexis-bob108-background-barrier-id") || "";
+    if (!selectedBarrier) return;
+    setBusy(true);
+    try {
+      const response = await fetch("/api/__test__/tool-activity/background/status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ barrier_id: selectedBarrier }),
+        cache: "no-store",
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `Barrier status failed (${response.status}).`);
+      setStatus(`Barrier entered=${result.entered}; released=${result.released}; task A=${result.states.task_a?.product_state}/${result.states.task_a?.work_status}; persisted tool events=${result.events.length}.`);
+    } catch (error: unknown) {
+      setStatus(error instanceof Error ? error.message : "The barrier status could not be read.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const releaseBackgroundBarrier = async () => {
+    const selectedBarrier = barrierId || sessionStorage.getItem("hexis-bob108-background-barrier-id") || "";
+    if (!selectedBarrier) return;
+    setBusy(true);
+    try {
+      const response = await fetch("/api/__test__/tool-activity/background/release", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ barrier_id: selectedBarrier }),
+        cache: "no-store",
+      });
+      const result = await response.json();
+      if (!response.ok || result.released !== true) throw new Error(result.error || `Barrier release failed (${response.status}).`);
+      setStatus("Released the real read_file handler. The task worker can persist TOOL_RESULT and finish the turn.");
+      sessionStorage.removeItem("hexis-bob108-background-barrier-id");
+      setBarrierId("");
+    } catch (error: unknown) {
+      setStatus(error instanceof Error ? error.message : "The barrier could not be released.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <main className="mx-auto max-w-2xl space-y-6 p-8">
       <a href="/chat" className="text-sm font-semibold text-[var(--teal)] underline">Back to Chat</a>
@@ -148,6 +223,20 @@ export default function ControlledToolActivityScenario() {
         >
           {busy ? "Running…" : "Run controlled voice_recall"}
         </button>
+        <button
+          type="button"
+          onClick={() => void runBackgroundTask()}
+          disabled={busy}
+          className="ml-3 mt-5 rounded-md border border-[var(--outline)] px-4 py-2 text-sm font-semibold hover:border-[var(--teal)] disabled:opacity-50"
+        >
+          {busy ? "Running…" : "Run controlled background tasks"}
+        </button>
+        {barrierId ? (
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button type="button" onClick={() => void inspectBackgroundBarrier()} disabled={busy} className="rounded-md border border-[var(--outline)] px-3 py-2 text-xs font-semibold hover:border-[var(--teal)] disabled:opacity-50">Check background barrier</button>
+            <button type="button" onClick={() => void releaseBackgroundBarrier()} disabled={busy} className="rounded-md bg-[var(--foreground)] px-3 py-2 text-xs font-semibold text-white hover:bg-[var(--teal)] disabled:opacity-50">Release read_file handler</button>
+          </div>
+        ) : null}
         {status ? <p role="status" className="mt-4 rounded-md bg-[var(--surface-strong)] p-3 text-sm">{status}</p> : null}
       </section>
     </main>

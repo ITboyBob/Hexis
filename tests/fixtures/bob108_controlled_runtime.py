@@ -7,9 +7,9 @@ import asyncio
 import json
 import os
 from collections import deque
+from dataclasses import dataclass, replace
 from typing import Any
-from uuid import uuid4
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -86,6 +86,20 @@ scripted_provider = ScriptedProvider()
 provider_app = FastAPI(title="BOB-108 loopback scripted provider")
 
 
+@dataclass
+class BackgroundToolBarrier:
+    barrier_id: str
+    task_a: dict[str, str]
+    task_b: dict[str, str]
+    entered: asyncio.Event
+    release: asyncio.Event
+
+
+_background_barriers: dict[str, BackgroundToolBarrier] = {}
+_active_background_barrier: BackgroundToolBarrier | None = None
+_background_prepare_wrapped = False
+
+
 @provider_app.post("/__control/script")
 async def replace_provider_script(request: Request):
     if os.environ.get("BOB108_CONTROLLED_RUNTIME") != "1":
@@ -157,6 +171,69 @@ async def chat_completions(request: Request):
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
     )
+
+
+class _BackgroundBarrierRegistry:
+    """Delegate the unchanged production registry and pause one real handler result."""
+
+    def __init__(self, registry: Any, barrier: BackgroundToolBarrier) -> None:
+        self._registry = registry
+        self._barrier = barrier
+        self.pool = registry.pool
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._registry, name)
+
+    async def execute(self, tool_name: str, arguments: dict[str, Any], context: Any):
+        result = await self._registry.execute(tool_name, arguments, context)
+        if tool_name == "read_file" and not self._barrier.entered.is_set():
+            self._barrier.entered.set()
+            await self._barrier.release.wait()
+        return result
+
+
+def _install_background_prepare_barrier() -> None:
+    global _background_prepare_wrapped
+    if _background_prepare_wrapped:
+        return
+    from services import m5_task_worker
+    from services.background_preparation import prepare_background_turn
+
+    async def prepare_with_barrier(*args: Any, **kwargs: Any):
+        prepared = await prepare_background_turn(*args, **kwargs)
+        barrier = _active_background_barrier
+        if barrier is None or barrier.release.is_set() or str(prepared.session_id) != barrier.task_a["task_session_id"]:
+            return prepared
+        return replace(prepared, registry=_BackgroundBarrierRegistry(prepared.registry, barrier))
+
+    m5_task_worker.prepare_background_turn = prepare_with_barrier
+    _background_prepare_wrapped = True
+
+
+async def _submit_controlled_task(origin_session_id: UUID, *, title: str, text: str) -> dict[str, str]:
+    from services.m5_task_service import M5TaskService
+
+    accepted = await M5TaskService(hexis_api._pool).submit_m5_task(
+        origin_session_id,
+        uuid4(),
+        title,
+        text,
+        {
+            "origin_session_id": str(origin_session_id),
+            "input_turn_id": str(uuid4()),
+            "input_order": 1,
+            "stimulus_revision": 0,
+            "response_id": f"bob108-response-{uuid4()}",
+            "supplier_response_id": f"bob108-supplier-{uuid4()}",
+            "request_id": f"bob108-request-{uuid4()}",
+            "actual_call_id": f"bob108-submit-{uuid4()}",
+        },
+    )
+    return {
+        "task_id": str(accepted["task_id"]),
+        "task_session_id": str(accepted["task_session_id"]),
+        "work_execution_id": str(accepted["work_execution_id"]),
+    }
 
 
 def _install_controlled_api_routes() -> None:
@@ -282,9 +359,116 @@ def _install_controlled_api_routes() -> None:
             "result_status": output.get("status"),
         }
 
+    async def background_start(request: Request):
+        global _active_background_barrier
+        if os.environ.get("BOB108_CONTROLLED_RUNTIME") != "1" or hexis_api._pool is None:
+            raise HTTPException(status_code=404)
+        if _active_background_barrier is not None and not _active_background_barrier.release.is_set():
+            raise HTTPException(status_code=409, detail="A controlled background barrier is already active.")
+        body = await request.json()
+        try:
+            origin_session_id = UUID(str(body.get("origin_session_id")))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="origin_session_id must be a UUID") from exc
+        async with hexis_api._pool.acquire() as conn:
+            exists = await conn.fetchval("SELECT EXISTS (SELECT 1 FROM chat_sessions WHERE id=$1)", origin_session_id)
+        if not exists:
+            raise HTTPException(status_code=404, detail="The selected owned origin session does not exist.")
+        worker = hexis_api._m5_task_worker
+        if worker is None or not worker.running:
+            raise HTTPException(status_code=503, detail="The controlled M5 task worker is not ready.")
+
+        background_readme = os.path.join(os.path.expanduser("~"), "README.md")
+        try:
+            await scripted_provider.replace([
+                {"tool_call": {"id": f"bob108-read-file-{uuid4()}", "name": "read_file", "arguments": {"path": background_readme}}},
+                {"content": "受控 README 工具调用已完成。"},
+                {"content": "任务 B 不执行工具，仅用于会话隔离检查。"},
+            ])
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        task_a = await _submit_controlled_task(
+            origin_session_id,
+            title="BOB-108 受控 README 检查 A",
+            text="请使用 read_file 检查 README.md 并总结。",
+        )
+        task_b = await _submit_controlled_task(
+            origin_session_id,
+            title="BOB-108 隔离检查 B",
+            text="请用一句话说明任务 B 已就绪。",
+        )
+        barrier = BackgroundToolBarrier(
+            barrier_id=str(uuid4()),
+            task_a=task_a,
+            task_b=task_b,
+            entered=asyncio.Event(),
+            release=asyncio.Event(),
+        )
+        _active_background_barrier = barrier
+        _background_barriers[barrier.barrier_id] = barrier
+        _install_background_prepare_barrier()
+        worker.wake()
+        return {
+            "barrier_id": barrier.barrier_id,
+            "origin_session_id": str(origin_session_id),
+            "task_a": task_a,
+            "task_b": task_b,
+            "scripted_actions": 3,
+        }
+
+    async def background_status(request: Request):
+        if os.environ.get("BOB108_CONTROLLED_RUNTIME") != "1" or hexis_api._pool is None:
+            raise HTTPException(status_code=404)
+        body = await request.json()
+        barrier_id = body.get("barrier_id") if isinstance(body, dict) else None
+        barrier = _background_barriers.get(str(barrier_id))
+        if barrier is None:
+            raise HTTPException(status_code=404, detail="Unknown controlled background barrier.")
+        states: dict[str, Any] = {}
+        events: list[dict[str, Any]] = []
+        async with hexis_api._pool.acquire() as conn:
+            for name, task in (("task_a", barrier.task_a), ("task_b", barrier.task_b)):
+                row = await conn.fetchrow(
+                    "SELECT t.product_state,w.status AS work_status FROM m5_tasks t "
+                    "JOIN m5_work_rounds w ON w.id=t.current_work_execution_id WHERE t.id=$1::uuid",
+                    task["task_id"],
+                )
+                states[name] = dict(row) if row is not None else None
+            events = [dict(row) for row in await conn.fetch(
+                "SELECT event_type,event_id,session_id,task_id,call_id,payload->>'tool_name' AS tool_name,"
+                "payload->>'execution_id' AS execution_id,recorded_at "
+                "FROM behavior_events WHERE task_id=$1::text AND event_type IN ('TOOL_START','TOOL_RESULT') "
+                "ORDER BY recorded_at,producer_seq",
+                barrier.task_a["task_id"],
+            )]
+        return {
+            "barrier_id": barrier.barrier_id,
+            "entered": barrier.entered.is_set(),
+            "released": barrier.release.is_set(),
+            "task_a": barrier.task_a,
+            "task_b": barrier.task_b,
+            "states": states,
+            "events": [{**event, "recorded_at": event["recorded_at"].isoformat()} for event in events],
+        }
+
+    async def background_release(request: Request):
+        if os.environ.get("BOB108_CONTROLLED_RUNTIME") != "1":
+            raise HTTPException(status_code=404)
+        body = await request.json()
+        barrier_id = body.get("barrier_id") if isinstance(body, dict) else None
+        barrier = _background_barriers.get(str(barrier_id))
+        if barrier is None:
+            raise HTTPException(status_code=404, detail="Unknown controlled background barrier.")
+        barrier.release.set()
+        return {"barrier_id": barrier.barrier_id, "released": True}
+
     hexis_api.app.add_api_route("/__test__/tool-activity/identity", identity, methods=["GET"])
     hexis_api.app.add_api_route("/__test__/tool-activity/script", script, methods=["POST"])
     hexis_api.app.add_api_route("/__test__/tool-activity/voice-recall", voice_recall, methods=["POST"])
+    hexis_api.app.add_api_route("/__test__/tool-activity/background/start", background_start, methods=["POST"])
+    hexis_api.app.add_api_route("/__test__/tool-activity/background/status", background_status, methods=["POST"])
+    hexis_api.app.add_api_route("/__test__/tool-activity/background/release", background_release, methods=["POST"])
 
 
 async def _serve(run_dir: str) -> None:
