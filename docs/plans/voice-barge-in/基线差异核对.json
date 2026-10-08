@@ -1,0 +1,67 @@
+{
+  "date": "2026-10-08",
+  "original_head": "07b2ffae0e3ae120cfb2e573fa39fa476d066622",
+  "current_head": "fadb6a7ab1575c13b14b132eec0134e979683f0c",
+  "committed_changed_paths": [
+    "services/prompts/voice_m5_per_turn.md"
+  ],
+  "worktree_status": [
+    " M hexis-ui/public/avatar-preview/grok/upstream.json",
+    " M services/prompts/voice_m5_stable.md",
+    "?? config/"
+  ],
+  "core_files": [
+    {
+      "path": "services/voice_realtime_transport.py",
+      "sha256": "503ce53081ad1637620c4b62371e006796885b659c39c3744897d919c58a1744",
+      "unchanged_from_original_baseline": true
+    },
+    {
+      "path": "hexis-ui/lib/voice-realtime/contracts.ts",
+      "sha256": "9c36b68b21d0317051e2f48889e30c0939659efae3a5e8eb314be7b816a5be98",
+      "unchanged_from_original_baseline": true
+    },
+    {
+      "path": "hexis-ui/lib/voice-realtime/capture.ts",
+      "sha256": "1983e8906f681476e849c2951fe25f6b71bb12aef46aa9a86db102a819167dc0",
+      "unchanged_from_original_baseline": true
+    },
+    {
+      "path": "hexis-ui/app/chat/talk-mode.tsx",
+      "sha256": "c3bd2e319c813424e282b272f4ab862f972c45d54c9207ae058d2644429e1376",
+      "unchanged_from_original_baseline": true
+    },
+    {
+      "path": "services/voice_realtime_session.py",
+      "sha256": "b8e7dcc29ab351817309aeef37624759d654eacaa46502437b23aadc5aa06753",
+      "unchanged_from_original_baseline": true
+    },
+    {
+      "path": "apps/hexis_api.py",
+      "sha256": "0a1ae2ed6263a619df1a4077d055ef4d34fd6caf4f38839ad64bc25bcf3cf296",
+      "unchanged_from_original_baseline": true
+    },
+    {
+      "path": "ops/Dockerfile.ui",
+      "sha256": "d91e4592f8d9993ceb0ffcb54548578b81489eb5deebb579f95f6966cd35a44e",
+      "unchanged_from_original_baseline": true
+    },
+    {
+      "path": "hexis-ui/package.json",
+      "sha256": "db061cec761b4a60ce5605294b7ec8d07b9b887d7422834520568c825a58d3b8",
+      "unchanged_from_original_baseline": true
+    }
+  ],
+  "prompt_files": [
+    {
+      "path": "services/prompts/voice_m5_per_turn.md",
+      "sha256": "2050988695861ffeee9d630e9813d3e4a848202ccb46cb103c5b5cf30f080bba"
+    },
+    {
+      "path": "services/prompts/voice_m5_stable.md",
+      "sha256": "65ed68bfd607bb40fe425749985c1d91fd56ea2d50f3034bdb9ccf813b885654"
+    }
+  ],
+  "source_edits_by_this_task": false,
+  "architect_current_baseline_review": "通过，静态计划审查；未实施、未运行验证"
+}
