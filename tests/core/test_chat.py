@@ -71,17 +71,10 @@ class _RememberMem:
         }
 
 
-async def test_remember_conversation_calls_record_chat_session_turn_for_uuid():
+async def test_remember_conversation_does_not_write_new_action_receipts():
     mem = _RememberMem()
     session_id = str(uuid4())
     turn_id = str(uuid4())
-    receipts = [
-        {
-            "name": "remember",
-            "success": True,
-            "result": {"memory_id": str(uuid4())},
-        }
-    ]
 
     await chat_mod._remember_conversation(  # noqa: SLF001
         mem,
@@ -89,7 +82,6 @@ async def test_remember_conversation_calls_record_chat_session_turn_for_uuid():
         assistant_message="noted",
         session_id=session_id,
         source_identity="chat:test",
-        action_receipts=receipts,
         agent_turn_id=turn_id,
         surface="cli",
     )
@@ -102,8 +94,7 @@ async def test_remember_conversation_calls_record_chat_session_turn_for_uuid():
     assert mem.record_chat_session_turn_calls[0][1]["session_id"] == session_id
     assert mem.record_chat_session_turn_calls[0][1]["surface"] == "cli"
     context = mem.record_chat_session_turn_calls[0][1]["context"]
-    assert context["assistant_metadata"]["action_receipts"] == receipts
-    assert context["assistant_metadata"]["agent_turn_id"] == turn_id
+    assert context["assistant_metadata"] == {"agent_turn_id": turn_id}
 
 
 async def test_message_history_rehydrates_authoritative_action_receipts():
@@ -122,13 +113,92 @@ async def test_message_history_rehydrates_authoritative_action_receipts():
                 "content": "Stored it.",
                 "metadata": {"action_receipts": [receipt]},
             }
-        ]
+        ],
+        trusted_database=True,
     )
 
     assert history[0]["metadata"]["action_receipts"] == [receipt]
     assert history[1]["role"] == "system"
     assert "Authoritative prior-action evidence" in history[1]["content"]
     assert memory_id in history[1]["content"]
+
+
+async def test_message_history_preserves_paired_internal_tool_messages():
+    session_id = str(uuid4())
+    turn_id = str(uuid4())
+    call_id = "call-history-pair"
+    history = chat_mod._message_history_only(  # noqa: SLF001
+        [
+            {
+                "role": "user",
+                "content": "Read README",
+                "content_blocks": [{"type": "text", "text": "Read README"}],
+                "source_message_id": "chat:prior:user",
+                "metadata": {},
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "content_blocks": [{
+                    "type": "toolCall",
+                    "id": call_id,
+                    "name": "read_file",
+                    "arguments": {"path": "README.md"},
+                }],
+                "source_message_id": f"tool:{turn_id}:{call_id}:call",
+                "metadata": {"agent_turn_id": turn_id},
+            },
+            {
+                "role": "toolResult",
+                "content": "Hexis project",
+                "content_blocks": [{"type": "text", "text": "Hexis project"}],
+                "source_message_id": f"tool:{turn_id}:{call_id}:result",
+                "metadata": {
+                    "agent_turn_id": turn_id,
+                    "tool_result": {
+                        "toolCallId": call_id,
+                        "toolName": "read_file",
+                        "isError": False,
+                        "details": {"title": "Hexis"},
+                    },
+                },
+            },
+        ],
+        session_id=session_id,
+        trusted_database=True,
+    )
+
+    assert [item["role"] for item in history] == ["user", "assistant", "toolResult"]
+    assert history[1]["content_blocks"][0]["id"] == call_id
+    assert history[2]["metadata"]["tool_result"]["details"] == {"title": "Hexis"}
+
+
+async def test_new_input_filter_keeps_legacy_client_history_for_empty_db_session(db_pool):
+    session_id = str(uuid4())
+    request_identity = await chat_mod._persist_chat_user_source(  # noqa: SLF001
+        db_pool,
+        user_message="Current question",
+        session_id=session_id,
+        client_message_id=None,
+        surface="api",
+    )
+    history = await chat_mod._hydrate_chat_history(  # noqa: SLF001
+        db_pool,
+        session_id,
+        [
+            {"role": "user", "content": "Legacy previous turn"},
+            {
+                "role": "assistant",
+                "content": "I stored it.",
+                "metadata": {"action_receipts": [{"name": "remember", "success": True}]},
+            },
+        ],
+        exclude_source_message_id=request_identity["user_source_message_id"],
+    )
+
+    assert [item["role"] for item in history] == ["user", "assistant"]
+    assert history[0]["content"] == "Legacy previous turn"
+    assert "metadata" not in history[1]
 
 
 async def test_turn_id_survives_without_action_receipts():
@@ -153,7 +223,8 @@ async def test_turn_id_survives_without_action_receipts():
                 "content": "Hello.",
                 "metadata": {"agent_turn_id": turn_id},
             }
-        ]
+        ],
+        trusted_database=True,
     )
     assert history == [
         {
@@ -360,10 +431,10 @@ async def test_chat_turn_hydrates_db_session_history_before_agent(monkeypatch, d
     )
 
     assert result["assistant"] == "fresh response"
-    assert captured["history"] == [
-        {"role": "user", "content": "db says alpha"},
-        {"role": "assistant", "content": "db says beta"},
-    ]
+    assert [
+        (item["role"], item["content"]) for item in captured["history"]
+    ] == [("user", "db says alpha"), ("assistant", "db says beta")]
+    assert all("content_blocks" in item for item in captured["history"])
 
 
 async def test_stream_chat_turn_reports_empty_timeout_without_memory(monkeypatch):
@@ -747,9 +818,7 @@ async def test_stream_chat_events_persists_successful_tool_receipt(monkeypatch, 
 
     assert any(event.event == AgentEvent.TOOL_RESULT for event in events)
     assert captured["agent_turn_id"] == turn_id
-    receipts = captured["action_receipts"]
-    assert receipts[0]["name"] == "remember"
-    assert receipts[0]["result"]["memory_id"] == memory_id
+    assert "action_receipts" not in captured
 
 
 async def test_chat_turn_persists_user_before_agent_and_reuses_client_identity(monkeypatch, db_pool):
@@ -862,12 +931,19 @@ async def test_chat_turn_persists_user_before_agent_and_reuses_client_identity(m
             session_id,
             f"{source_identity}:user",
         ) == 1
-        assert await connection.fetchval(
-            "SELECT count(*) FROM chat_messages WHERE session_id=$1::uuid "
+        assistant_metadata = await connection.fetchval(
+            "SELECT metadata FROM chat_messages WHERE session_id=$1::uuid "
             "AND source_message_id=$2 AND role='assistant'",
             session_id,
             f"{source_identity}:assistant",
-        ) == 1
+        )
+        assert assistant_metadata is not None
+        assistant_metadata = (
+            json.loads(assistant_metadata)
+            if isinstance(assistant_metadata, str)
+            else assistant_metadata
+        )
+        assert "action_receipts" not in assistant_metadata
 
     replay = await chat_mod.chat_turn(
         user_message="Question with one source identity.",

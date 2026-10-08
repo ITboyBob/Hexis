@@ -114,6 +114,16 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str | None, list[
     """
     system_parts: list[str] = []
     contents: list[dict[str, Any]] = []
+    call_id_to_name: dict[str, str] = {}
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        for tool_call in message.get("tool_calls") or []:
+            function = tool_call.get("function", {})
+            call_id = str(tool_call.get("id") or "")
+            name = str(function.get("name") or "")
+            if call_id and name:
+                call_id_to_name[call_id] = name
 
     for msg in messages:
         role = msg.get("role", "")
@@ -168,7 +178,9 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str | None, list[
                 "role": "function",
                 "parts": [{
                     "functionResponse": {
-                        "name": msg.get("name") or msg.get("tool_call_id") or "tool",
+                        "name": msg.get("name") or call_id_to_name.get(
+                            str(msg.get("tool_call_id") or "")
+                        ) or "tool",
                         "response": tool_content if isinstance(tool_content, dict) else {"result": str(tool_content)},
                     }
                 }],

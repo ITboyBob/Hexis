@@ -110,6 +110,7 @@ DECLARE
     turn agent_turns%ROWTYPE;
     current_calls JSONB;
     prior_calls JSONB;
+    prior_receipts JSONB := '[]'::jsonb;
     calls JSONB;
     flagged JSONB := '[]'::jsonb;
     sentence TEXT;
@@ -138,23 +139,157 @@ BEGIN
                                   'successful_tool_calls', 0, 'error', 'turn_not_found');
     END IF;
 
-    current_calls := COALESCE(turn.runtime_state->'tool_calls_made', '[]'::jsonb);
+    IF COALESCE((turn.runtime_state->>'chat_message_projection')::boolean, FALSE)
+       AND turn.session_id IS NOT NULL THEN
+        SELECT COALESCE(jsonb_agg(jsonb_build_object(
+            'id', call_block.value->>'id',
+            'name', call_block.value->>'name',
+            'arguments', call_block.value->'arguments',
+            'success', TRUE,
+            'output', result_message.metadata#>'{tool_result,details}'
+        )), '[]'::jsonb)
+        INTO current_calls
+        FROM public.chat_messages AS call_message
+        CROSS JOIN LATERAL jsonb_array_elements(call_message.content_blocks) AS call_block(value)
+        JOIN public.chat_messages AS result_message
+          ON result_message.session_id = call_message.session_id
+         AND result_message.role = 'toolResult'
+         AND result_message.metadata->>'agent_turn_id' = turn.id::text
+         AND result_message.metadata#>>'{tool_result,toolCallId}' = call_block.value->>'id'
+         AND result_message.metadata#>>'{tool_result,toolName}' = call_block.value->>'name'
+         AND COALESCE((result_message.metadata#>>'{tool_result,isError}')::boolean, TRUE) = FALSE
+        WHERE call_message.session_id = turn.session_id
+          AND call_message.role = 'assistant'
+          AND call_message.metadata->>'agent_turn_id' = turn.id::text
+          AND NOT (call_message.metadata ? 'forked_from_message_id')
+          AND NOT (result_message.metadata ? 'forked_from_message_id')
+          AND call_block.value->>'type' = 'toolCall';
+    ELSE
+        current_calls := COALESCE(turn.runtime_state->'tool_calls_made', '[]'::jsonb);
+    END IF;
+
+    WITH historical_receipts AS (
+        SELECT receipt.value AS receipt
+        FROM jsonb_array_elements(COALESCE(turn.messages, '[]'::jsonb)) AS message(value)
+        CROSS JOIN LATERAL jsonb_array_elements(
+            CASE
+                WHEN jsonb_typeof(message.value#>'{metadata,action_receipts}') = 'array'
+                    THEN message.value#>'{metadata,action_receipts}'
+                ELSE '[]'::jsonb
+            END
+        ) AS receipt(value)
+        WHERE message.value->>'role' = 'assistant'
+          AND message.value#>>'{metadata,hexis_internal}' = 'durable_chat_history'
+
+        UNION
+
+        SELECT receipt.value AS receipt
+        FROM public.chat_messages AS historical_message
+        JOIN LATERAL (
+            SELECT current_input.ordinal
+            FROM public.chat_messages AS current_input
+            WHERE current_input.session_id = turn.session_id
+              AND current_input.source_message_id =
+                  (turn.runtime_state->>'chat_source_identity') || ':user'
+        ) AS current_input ON TRUE
+        JOIN LATERAL (
+            SELECT min(history_row.ordinal) AS first_ordinal
+            FROM (
+                SELECT prior_message.ordinal
+                FROM public.chat_messages AS prior_message
+                WHERE prior_message.session_id = turn.session_id
+                  AND prior_message.visible_in_context
+                  AND prior_message.ordinal < current_input.ordinal
+                ORDER BY prior_message.ordinal DESC
+                LIMIT GREATEST(
+                    LEAST(GREATEST(COALESCE(get_config_int('chat.session_history_limit'), 40), 1), 200) - 1,
+                    0
+                )
+            ) AS history_row
+        ) AS history_window ON TRUE
+        CROSS JOIN LATERAL jsonb_array_elements(
+            CASE
+                WHEN jsonb_typeof(historical_message.metadata->'action_receipts') = 'array'
+                    THEN historical_message.metadata->'action_receipts'
+                ELSE '[]'::jsonb
+            END
+        ) AS receipt(value)
+        WHERE historical_message.session_id = turn.session_id
+          AND historical_message.role = 'assistant'
+          AND historical_message.ordinal >= history_window.first_ordinal
+          AND historical_message.ordinal < current_input.ordinal
+          AND NOT (historical_message.metadata ? 'forked_from_message_id')
+    )
     SELECT COALESCE(jsonb_agg(receipt), '[]'::jsonb)
+    INTO prior_receipts
+    FROM historical_receipts
+    WHERE COALESCE((receipt->>'success')::boolean, FALSE);
+
+    SELECT COALESCE(jsonb_agg(evidence), '[]'::jsonb)
     INTO prior_calls
-    FROM jsonb_array_elements(COALESCE(turn.messages, '[]'::jsonb)) message
-    CROSS JOIN LATERAL jsonb_array_elements(
-        CASE
-            WHEN jsonb_typeof(message#>'{metadata,action_receipts}') = 'array'
-                THEN message#>'{metadata,action_receipts}'
-            ELSE '[]'::jsonb
-        END
-    ) receipt
-    WHERE message->>'role' = 'assistant'
-      AND COALESCE((receipt->>'success')::boolean, FALSE);
+    FROM (
+        SELECT receipt.value AS evidence
+        FROM jsonb_array_elements(prior_receipts) AS receipt(value)
+
+        UNION ALL
+
+        SELECT jsonb_build_object(
+            'id', call_block.value->>'id',
+            'name', call_block.value->>'name',
+            'arguments', call_block.value->'arguments',
+            'success', TRUE,
+            'output', result_message.metadata#>'{tool_result,details}'
+        ) AS evidence
+        FROM public.chat_messages AS call_message
+        JOIN LATERAL (
+            SELECT current_input.ordinal
+            FROM public.chat_messages AS current_input
+            WHERE current_input.session_id = turn.session_id
+              AND current_input.source_message_id =
+                  (turn.runtime_state->>'chat_source_identity') || ':user'
+        ) AS current_input ON TRUE
+        JOIN LATERAL (
+            SELECT min(history_row.ordinal) AS first_ordinal
+            FROM (
+                SELECT prior_message.ordinal
+                FROM public.chat_messages AS prior_message
+                WHERE prior_message.session_id = turn.session_id
+                  AND prior_message.visible_in_context
+                  AND prior_message.ordinal < current_input.ordinal
+                ORDER BY prior_message.ordinal DESC
+                LIMIT GREATEST(
+                    LEAST(GREATEST(COALESCE(get_config_int('chat.session_history_limit'), 40), 1), 200) - 1,
+                    0
+                )
+            ) AS history_row
+        ) AS history_window ON TRUE
+        CROSS JOIN LATERAL jsonb_array_elements(call_message.content_blocks) AS call_block(value)
+        JOIN public.agent_turns AS prior_turn
+          ON prior_turn.id = _db_brain_try_uuid(call_message.metadata->>'agent_turn_id')
+         AND prior_turn.session_id = call_message.session_id
+        JOIN public.chat_messages AS result_message
+          ON result_message.session_id = call_message.session_id
+         AND result_message.role = 'toolResult'
+         AND result_message.metadata->>'agent_turn_id' = prior_turn.id::text
+         AND result_message.metadata#>>'{tool_result,toolCallId}' = call_block.value->>'id'
+         AND result_message.metadata#>>'{tool_result,toolName}' = call_block.value->>'name'
+         AND COALESCE((result_message.metadata#>>'{tool_result,isError}')::boolean, TRUE) = FALSE
+        WHERE turn.session_id IS NOT NULL
+          AND call_message.session_id = turn.session_id
+          AND call_message.ordinal >= history_window.first_ordinal
+          AND call_message.ordinal < current_input.ordinal
+          AND result_message.ordinal >= history_window.first_ordinal
+          AND result_message.ordinal < current_input.ordinal
+          AND call_message.role = 'assistant'
+          AND prior_turn.id <> turn.id
+          AND NOT (call_message.metadata ? 'forked_from_message_id')
+          AND NOT (result_message.metadata ? 'forked_from_message_id')
+          AND call_block.value->>'type' = 'toolCall'
+    ) AS prior_evidence(evidence);
     SELECT count(*) INTO success_count
     FROM jsonb_array_elements(current_calls) c
     WHERE COALESCE((c->>'success')::boolean, FALSE);
-    prior_receipt_count := jsonb_array_length(prior_calls);
+    prior_receipt_count := jsonb_array_length(prior_receipts);
 
     -- Split on newlines, then on sentence enders followed by whitespace, so
     -- dots inside file paths ("core/agent_loop.py") never split a sentence.
@@ -198,7 +333,7 @@ BEGIN
             IF pat.require_arg_key IS NOT NULL THEN
                 file_tokens := ARRAY(
                     SELECT DISTINCT m[1]
-                    FROM regexp_matches(norm, '([A-Za-z0-9_./-]+\.(?:py|sql|md|ts|tsx|js|jsx|json|ya?ml|toml|sh|go|rs))', 'g') AS m
+                    FROM regexp_matches(sentence, '([A-Za-z0-9_./-]+\.(?:py|sql|md|ts|tsx|js|jsx|json|ya?ml|toml|sh|go|rs))', 'g') AS m
                 );
             END IF;
 

@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from core import llm
+from core.conversation_messages import internal_to_provider
 
 pytestmark = pytest.mark.core
 
@@ -370,6 +371,133 @@ class TestMessagesToResponsesInput:
         _, items = llm._messages_to_responses_input(messages)  # noqa: SLF001
         fc = items[0]
         assert fc["arguments"] == '{"key": "val"}'
+
+    def test_durable_tool_history_enters_each_provider_serializer_in_public_shape(
+        self, monkeypatch
+    ):
+        session_id = "10000000-0000-4000-8000-000000000001"
+        turn_id = "20000000-0000-4000-8000-000000000001"
+        call_id = "call-provider-history"
+        internal = [
+            {
+                "role": "user",
+                "content": "Read README",
+                "content_blocks": [{"type": "text", "text": "Read README"}],
+                "source_message_id": "chat:prior:user",
+                "metadata": {"private_marker": "INTERNAL_SENTINEL"},
+            },
+            {
+                "role": "assistant",
+                "content": "Checking.",
+                "content_blocks": [
+                    {"type": "text", "text": "Checking."},
+                    {
+                        "type": "toolCall",
+                        "id": call_id,
+                        "name": "read_file",
+                        "arguments": {"path": "README.md"},
+                    },
+                ],
+                "source_message_id": f"tool:{turn_id}:{call_id}:call",
+                "metadata": {"agent_turn_id": turn_id},
+            },
+            {
+                "role": "toolResult",
+                "content": "Project title: Hexis",
+                "content_blocks": [{"type": "text", "text": "Project title: Hexis"}],
+                "source_message_id": f"tool:{turn_id}:{call_id}:result",
+                "metadata": {
+                    "agent_turn_id": turn_id,
+                    "tool_result": {
+                        "toolCallId": call_id,
+                        "toolName": "read_file",
+                        "isError": False,
+                        "details": {"title": "Hexis", "sentinel": "INTERNAL_SENTINEL"},
+                    },
+                },
+            },
+        ]
+        provider_messages, diagnostics = internal_to_provider(
+            internal, session_id=session_id
+        )
+        assert not diagnostics
+        assert all(
+            "content_blocks" not in message
+            and "metadata" not in message
+            and "INTERNAL_SENTINEL" not in json.dumps(message)
+            for message in provider_messages
+        )
+        assert [message["role"] for message in provider_messages] == [
+            "user", "assistant", "tool"
+        ]
+
+        _, responses_items = llm._messages_to_responses_input(provider_messages)  # noqa: SLF001
+        _, codex_items = llm._messages_to_codex_responses_input(provider_messages)  # noqa: SLF001
+        assert responses_items[1] == {"role": "assistant", "content": "Checking."}
+        assert responses_items[2] == {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": "read_file",
+            "arguments": '{"path":"README.md"}',
+        }
+        assert responses_items[3] == {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": "Project title: Hexis",
+        }
+        assert codex_items[1] == {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Checking."}],
+        }
+        assert codex_items[2:] == responses_items[2:]
+
+        anthropic_messages = llm._messages_to_anthropic_messages(provider_messages)  # noqa: SLF001
+        assert anthropic_messages == [
+            {"role": "user", "content": "Read README"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Checking."},
+                    {
+                        "type": "tool_use",
+                        "id": call_id,
+                        "name": "read_file",
+                        "input": {"path": "README.md"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": "Project title: Hexis",
+                }],
+            },
+        ]
+
+        class _Struct:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        fake_gemini_types = type(
+            "FakeGeminiTypes",
+            (),
+            {
+                "Part": _Struct,
+                "Content": _Struct,
+                "FunctionCall": _Struct,
+                "FunctionResponse": _Struct,
+            },
+        )
+        monkeypatch.setattr(llm, "gemini_types", fake_gemini_types)
+        gemini_contents = llm._messages_to_gemini_contents(provider_messages)  # noqa: SLF001
+        assert gemini_contents[1].parts[1].function_call.id == call_id
+        assert gemini_contents[1].parts[1].function_call.name == "read_file"
+        assert gemini_contents[1].parts[1].function_call.args == {"path": "README.md"}
+        assert gemini_contents[2].parts[0].function_response.response == {
+            "content": "Project title: Hexis"
+        }
 
 
 class TestExtractResponsesResult:

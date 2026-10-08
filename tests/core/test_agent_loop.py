@@ -203,6 +203,71 @@ class TestBasicText:
         assert len(result.messages) == 5
         assert result.messages[1]["content"] == "Previous question"
 
+    @patch("core.agent_loop.chat_completion")
+    async def test_internal_chat_history_is_converted_before_provider_call(self, mock_llm):
+        session_id = str(uuid.uuid4())
+        prior_turn_id = str(uuid.uuid4())
+        call_id = "prior-call"
+        internal_history = [
+            {
+                "role": "user",
+                "content": "Read README",
+                "content_blocks": [{"type": "text", "text": "Read README"}],
+                "source_message_id": "chat:prior:user",
+                "metadata": {},
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "content_blocks": [{
+                    "type": "toolCall",
+                    "id": call_id,
+                    "name": "read_file",
+                    "arguments": {"path": "README.md"},
+                }],
+                "source_message_id": f"tool:{prior_turn_id}:{call_id}:call",
+                "metadata": {"agent_turn_id": prior_turn_id},
+            },
+            {
+                "role": "toolResult",
+                "content": "Hexis project",
+                "content_blocks": [{"type": "text", "text": "Hexis project"}],
+                "source_message_id": f"tool:{prior_turn_id}:{call_id}:result",
+                "metadata": {
+                    "agent_turn_id": prior_turn_id,
+                    "tool_result": {
+                        "toolCallId": call_id,
+                        "toolName": "read_file",
+                        "isError": False,
+                        "details": {"title": "Hexis"},
+                    },
+                },
+            },
+        ]
+        mock_llm.return_value = _text_response("The file describes Hexis.")
+
+        agent = AgentLoop(_make_config(session_id=session_id))
+        await agent.run("Summarize it", history=internal_history)
+
+        request_messages = mock_llm.await_args.kwargs["messages"]
+        assert [item["role"] for item in request_messages] == [
+            "system", "user", "assistant", "tool", "user"
+        ]
+        assert request_messages[2]["tool_calls"] == [{
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": '{"path":"README.md"}',
+            },
+        }]
+        assert request_messages[3] == {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": "Hexis project",
+        }
+        assert all("content_blocks" not in item and "metadata" not in item for item in request_messages)
+
 
 # ============================================================================
 # Unit: tool calls
@@ -1457,14 +1522,17 @@ class TestErrorHandling:
 
 class TestMessageFormat:
     @patch("core.agent_loop.chat_completion")
-    async def test_provider_messages_strip_internal_receipt_metadata(self, mock_llm):
+    async def test_provider_and_new_turn_messages_strip_legacy_receipt_metadata(self, mock_llm):
         mock_llm.return_value = _text_response("Understood.")
         receipt = {"name": "remember", "success": True}
         history = [
             {
                 "role": "assistant",
                 "content": "Stored it.",
-                "metadata": {"action_receipts": [receipt]},
+                "metadata": {
+                    "action_receipts": [receipt],
+                    "hexis_internal": "durable_chat_history",
+                },
             }
         ]
 
@@ -1472,10 +1540,15 @@ class TestMessageFormat:
 
         sent_messages = mock_llm.call_args.kwargs["messages"]
         assert all("metadata" not in message for message in sent_messages)
-        stored_history = [
-            message for message in result.messages if message.get("role") == "assistant"
-        ]
-        assert stored_history[0]["metadata"]["action_receipts"] == [receipt]
+        assert all(
+            "action_receipts" not in (message.get("metadata") or {})
+            for message in result.messages
+        )
+        assert any(
+            message.get("role") == "system"
+            and "<action_receipts>" in message.get("content", "")
+            for message in result.messages
+        )
 
     @patch("core.agent_loop.chat_completion")
     async def test_assistant_message_includes_tool_calls(self, mock_llm):
@@ -2370,7 +2443,10 @@ class TestActionClaimGuardrail:
                         {
                             "role": "assistant",
                             "content": "I stored an earlier fact.",
-                            "metadata": {"action_receipts": [prior_receipt]},
+                            "metadata": {
+                                "action_receipts": [prior_receipt],
+                                "hexis_internal": "durable_chat_history",
+                            },
                         }
                     ],
                 )
@@ -2378,8 +2454,119 @@ class TestActionClaimGuardrail:
             verifier_messages = mock_chat_json.await_args.kwargs["messages"]
             payload = json.loads(verifier_messages[1]["content"])
             assert payload["prior_action_receipts"] == [prior_receipt]
+            async with _DB_POOL.acquire() as conn:
+                saved_messages = await conn.fetchval(
+                    "SELECT messages FROM agent_turns WHERE id=$1::uuid",
+                    result.turn_id,
+                )
+            saved_messages = json.loads(saved_messages) if isinstance(saved_messages, str) else saved_messages
+            assert all(
+                "action_receipts" not in (message.get("metadata") or {})
+                for message in saved_messages
+            )
         finally:
             async with _DB_POOL.acquire() as conn:
                 await conn.execute(
                     "UPDATE config SET value = 'false'::jsonb WHERE key = 'guardrails.action_claims.llm_verifier_enabled'"
+                )
+
+    @patch("core.llm_json.chat_json", new_callable=AsyncMock)
+    @patch("core.agent_loop.chat_completion")
+    async def test_llm_verifier_receives_prior_paired_tool_evidence(
+        self, mock_llm, mock_chat_json
+    ):
+        from uuid import uuid4
+
+        session_id = str(uuid4())
+        client_message_id = str(uuid4())
+        source_identity = f"chat:{session_id}:{client_message_id}"
+        prior_source = f"chat:{session_id}:{uuid4()}"
+        prior_call_id = f"call_{uuid4().hex}"
+        mock_llm.return_value = _text_response(
+            "Earlier I inspected core/agent_loop.py and I emailed the team."
+        )
+        mock_chat_json.return_value = ({"confirmed": [], "additional": []}, "{}")
+
+        async with _DB_POOL.acquire() as conn:
+            await conn.fetchval(
+                "SELECT get_or_create_chat_session($1::uuid,'chat',NULL,'{}'::jsonb)",
+                session_id,
+            )
+            prior_turn_raw = await conn.fetchval(
+                "SELECT start_agent_turn('chat','prior inspect',$1::uuid,$2::jsonb)",
+                session_id,
+                json.dumps({"runtime_state": {
+                    "chat_message_projection": True,
+                    "chat_source_identity": prior_source,
+                }}),
+            )
+            prior_turn_payload = json.loads(prior_turn_raw) if isinstance(prior_turn_raw, str) else prior_turn_raw
+            prior_turn = prior_turn_payload["turn_id"]
+            await conn.fetchval(
+                "SELECT apply_agent_llm_result($1::uuid,$2::jsonb)",
+                prior_turn,
+                json.dumps({"tool_calls": [{
+                    "id": prior_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "inspect_source",
+                        "arguments": '{"path":"core/agent_loop.py"}',
+                    },
+                }]}),
+            )
+            await conn.fetchval(
+                "SELECT apply_agent_tool_result($1::uuid,$2,$3::jsonb)",
+                prior_turn,
+                prior_call_id,
+                json.dumps({
+                    "tool_name": "inspect_source",
+                    "arguments": {"path": "core/agent_loop.py"},
+                    "success": True,
+                    "output": {"path": "core/agent_loop.py"},
+                    "energy_spent": 1,
+                }),
+            )
+            await conn.fetchval(
+                "SELECT append_chat_message_blocks($1::uuid,'user',$2,$3::jsonb,'{}'::jsonb,$4,TRUE)",
+                session_id,
+                "Check the repository",
+                json.dumps([{"type": "text", "text": "Check the repository"}]),
+                f"{source_identity}:user",
+            )
+            await conn.execute(
+                "UPDATE config SET value='true'::jsonb WHERE key='guardrails.action_claims.enabled'"
+            )
+            await conn.execute(
+                "UPDATE config SET value='true'::jsonb WHERE key='guardrails.action_claims.llm_verifier_enabled'"
+            )
+
+        try:
+            with patch(
+                "core.llm_config.load_llm_config", new_callable=AsyncMock
+            ) as mock_cfg:
+                mock_cfg.return_value = {
+                    "provider": "openai",
+                    "model": "test",
+                    "api_key": "k",
+                }
+                result = await AgentLoop(
+                    _make_config(
+                        session_id=session_id,
+                        chat_message_projection=True,
+                        chat_source_identity=source_identity,
+                    )
+                ).run("Check the repository")
+            assert "[Correction]" not in result.text
+            verifier_messages = mock_chat_json.await_args.kwargs["messages"]
+            payload = json.loads(verifier_messages[1]["content"])
+            assert any(
+                item.get("name") == "inspect_source"
+                and item.get("call_id") == prior_call_id
+                and item.get("arguments") == {"path": "core/agent_loop.py"}
+                for item in payload["prior_action_receipts"]
+            )
+        finally:
+            async with _DB_POOL.acquire() as conn:
+                await conn.execute(
+                    "UPDATE config SET value='false'::jsonb WHERE key='guardrails.action_claims.llm_verifier_enabled'"
                 )

@@ -922,13 +922,68 @@ def _content_to_anthropic(content: Any) -> Any:
 
 def _messages_to_anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     converted: list[dict[str, Any]] = []
-    for msg in messages:
+    index = 0
+    while index < len(messages):
+        msg = messages[index]
+        index += 1
         role = msg.get("role")
-        if role not in {"user", "assistant", "tool"}:
+        if role == "system":
             continue
-        next_msg = dict(msg)
-        next_msg["content"] = _content_to_anthropic(next_msg.get("content"))
-        converted.append(next_msg)
+        if role in {"user", "assistant"}:
+            content = _content_to_anthropic(msg.get("content"))
+            tool_calls = msg.get("tool_calls") or []
+            if role == "user" or not tool_calls:
+                converted.append({"role": role, "content": content})
+                continue
+            blocks = (
+                list(content)
+                if isinstance(content, list)
+                else ([{"type": "text", "text": content}] if content else [])
+            )
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function") or {}
+                if not isinstance(function, dict):
+                    continue
+                name = function.get("name")
+                call_id = tool_call.get("id")
+                if not isinstance(name, str) or not name or not isinstance(call_id, str) or not call_id:
+                    raise ValueError("Anthropic tool calls require a call id and function name")
+                raw_arguments = function.get("arguments", "{}")
+                if isinstance(raw_arguments, str):
+                    try:
+                        arguments = json.loads(raw_arguments) if raw_arguments else {}
+                    except ValueError as exc:
+                        raise ValueError("Anthropic tool call arguments must be valid JSON") from exc
+                else:
+                    arguments = raw_arguments
+                if not isinstance(arguments, dict):
+                    raise ValueError("Anthropic tool call arguments must be a JSON object")
+                blocks.append({
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": arguments,
+                })
+            converted.append({"role": "assistant", "content": blocks})
+            continue
+        if role == "tool":
+            results: list[dict[str, Any]] = []
+            tool_messages = [msg]
+            while index < len(messages) and messages[index].get("role") == "tool":
+                tool_messages.append(messages[index])
+                index += 1
+            for tool_message in tool_messages:
+                call_id = tool_message.get("tool_call_id")
+                if not isinstance(call_id, str) or not call_id:
+                    raise ValueError("Anthropic tool results require a tool_call_id")
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": _content_to_anthropic(tool_message.get("content", "")),
+                })
+            converted.append({"role": "user", "content": results})
     return converted
 
 

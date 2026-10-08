@@ -132,37 +132,6 @@ _LOCAL_OPERATOR_SURFACES = {"api", "chat", "cli", "openai_compat", "tui", "web"}
 _MAX_ACTION_RECEIPTS_PER_TURN = 12
 _MAX_ACTION_RECEIPT_TEXT = 320
 _MAX_RECEIPT_HISTORY_TURNS = 8
-_RECEIPT_ARGUMENT_KEYS = {
-    "action",
-    "channel",
-    "content",
-    "goal_id",
-    "item_id",
-    "memory_id",
-    "path",
-    "query",
-    "recipient",
-    "session_id",
-    "task_id",
-    "title",
-    "to",
-    "type",
-    "url",
-}
-_RECEIPT_RESULT_KEYS = {
-    "confidence",
-    "content",
-    "count",
-    "created",
-    "deleted",
-    "reused",
-    "scheduled",
-    "sent",
-    "status",
-    "trust_level",
-    "type",
-    "updated",
-}
 
 
 async def _build_system_prompt(
@@ -226,67 +195,9 @@ def _bounded_receipt_value(value: Any, *, depth: int = 0) -> Any:
     return str(value)[:_MAX_ACTION_RECEIPT_TEXT]
 
 
-def _receipt_subset(value: Any, allowed_keys: set[str]) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-    selected: dict[str, Any] = {}
-    for raw_key, raw_value in value.items():
-        key = str(raw_key)
-        if (
-            key in allowed_keys
-            or key == "id"
-            or key.endswith("_id")
-            or key.endswith("_ids")
-        ):
-            selected[key] = _bounded_receipt_value(raw_value)
-        if len(selected) >= 16:
-            break
-    return selected
-
-
-def _compact_action_receipts(
-    tool_calls: list[dict[str, Any]] | None,
-    *,
-    agent_turn_id: str | None = None,
-) -> list[dict[str, Any]]:
-    receipts: list[dict[str, Any]] = []
-    for call in tool_calls or []:
-        if not isinstance(call, dict) or call.get("success") is not True:
-            continue
-        name = str(call.get("name") or call.get("tool_name") or "").strip()
-        if not name:
-            continue
-        turn_id = _uuid_text_or_none(
-            str(call.get("turn_id") or agent_turn_id or "") or None
-        )
-        receipt: dict[str, Any] = {
-            "name": name[:120],
-            "success": True,
-        }
-        if turn_id:
-            receipt["agent_turn_id"] = turn_id
-        call_id = str(call.get("id") or call.get("call_id") or "").strip()
-        if call_id:
-            receipt["call_id"] = call_id[:200]
-        arguments = _receipt_subset(call.get("arguments"), _RECEIPT_ARGUMENT_KEYS)
-        if name != "remember":
-            arguments.pop("content", None)
-        if arguments:
-            receipt["arguments"] = arguments
-        result = _receipt_subset(call.get("output"), _RECEIPT_RESULT_KEYS)
-        if name != "remember":
-            result.pop("content", None)
-        if result:
-            receipt["result"] = result
-        receipts.append(receipt)
-        if len(receipts) >= _MAX_ACTION_RECEIPTS_PER_TURN:
-            break
-    return receipts
-
-
 def _stored_action_receipts(item: dict[str, Any]) -> list[dict[str, Any]]:
     metadata = item.get("metadata")
-    if not isinstance(metadata, dict):
+    if not isinstance(metadata, dict) or metadata.get("forked_from_message_id"):
         return []
     raw = metadata.get("action_receipts")
     if not isinstance(raw, list):
@@ -316,11 +227,15 @@ def _render_action_receipt_evidence(receipts: list[dict[str, Any]]) -> str:
     )
 
 
-def _message_history_only(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _message_history_only(
+    messages: list[dict[str, Any]],
+    *,
+    session_id: str | None = None,
+    trusted_database: bool = False,
+) -> list[dict[str, Any]]:
     receipt_indexes = {
-        index
-        for index, item in enumerate(messages)
-        if isinstance(item, dict) and _stored_action_receipts(item)
+        index for index, item in enumerate(messages)
+        if trusted_database and isinstance(item, dict) and _stored_action_receipts(item)
     }
     receipt_indexes = set(sorted(receipt_indexes)[-_MAX_RECEIPT_HISTORY_TURNS:])
     normalized: list[dict[str, Any]] = []
@@ -330,15 +245,25 @@ def _message_history_only(messages: list[dict[str, Any]]) -> list[dict[str, Any]
         role = item.get("role")
         content = item.get("content")
         metadata = item.get("metadata")
+        if not trusted_database and role not in {"system", "user", "assistant"}:
+            continue
         if (
             role == "system"
             and isinstance(metadata, dict)
             and metadata.get("hexis_internal") == "action_receipt_evidence"
         ):
             continue
-        if role in {"system", "user", "assistant"} and isinstance(content, str):
+        if role in {"system", "user", "assistant", "toolResult"} and isinstance(content, str):
             message: dict[str, Any] = {"role": role, "content": content}
-            receipts = _stored_action_receipts(item)
+            if session_id and trusted_database:
+                message["session_id"] = session_id
+            if trusted_database and "content_blocks" in item:
+                message["content_blocks"] = item["content_blocks"]
+            if trusted_database and isinstance(item.get("source_message_id"), str):
+                message["source_message_id"] = item["source_message_id"]
+            if trusted_database and isinstance(metadata, dict) and metadata:
+                message["metadata"] = metadata
+            receipts = _stored_action_receipts(item) if trusted_database else []
             raw_turn_id = (
                 metadata.get("agent_turn_id") if isinstance(metadata, dict) else None
             )
@@ -351,7 +276,9 @@ def _message_history_only(messages: list[dict[str, Any]]) -> list[dict[str, Any]
                     message_metadata["action_receipts"] = receipts
                 if agent_turn_id:
                     message_metadata["agent_turn_id"] = agent_turn_id
-                message["metadata"] = message_metadata
+                message.setdefault("metadata", {}).update(message_metadata)
+            if receipts:
+                message.setdefault("metadata", {})["hexis_internal"] = "durable_chat_history"
             normalized.append(message)
             if receipts and index in receipt_indexes:
                 normalized.append(
@@ -392,13 +319,19 @@ async def _hydrate_chat_history(
                     if not isinstance(item, dict)
                     or item.get("source_message_id") != exclude_source_message_id
                 ]
-            return _message_history_only(messages)
+            if not messages and fallback_history:
+                return _message_history_only(fallback_history)
+            return _message_history_only(
+                messages,
+                session_id=parsed,
+                trusted_database=True,
+            )
     except Exception:
         logger.debug(
             "DB chat-session hydration failed; falling back to caller history",
             exc_info=True,
         )
-    return _message_history_only(fallback_history or [])
+    return _message_history_only(fallback_history or [], session_id=parsed)
 
 
 async def resolve_prompt_addenda(pool: Any, addenda: list[str] | None) -> list[str]:
@@ -441,7 +374,6 @@ async def _remember_conversation(
     user_label: str | None = None,
     background_dsn: str | None = None,
     emotional_state: dict[str, Any] | None = None,
-    action_receipts: list[dict[str, Any]] | None = None,
     agent_turn_id: str | None = None,
     surface: str = "chat",
     attachments: list[dict[str, Any]] | None = None,
@@ -466,15 +398,8 @@ async def _remember_conversation(
     if emotional_state:
         context["emotional_state"] = emotional_state
     parsed_turn = _uuid_text_or_none(agent_turn_id)
-    if action_receipts or parsed_turn:
-        assistant_metadata: dict[str, Any] = {}
-        if action_receipts:
-            assistant_metadata["action_receipts"] = action_receipts[
-                :_MAX_ACTION_RECEIPTS_PER_TURN
-            ]
-        if parsed_turn:
-            assistant_metadata["agent_turn_id"] = parsed_turn
-        context["assistant_metadata"] = assistant_metadata
+    if parsed_turn:
+        context["assistant_metadata"] = {"agent_turn_id": parsed_turn}
     context["surface"] = surface
     if source_identity:
         context["source_identity"] = source_identity
@@ -511,10 +436,14 @@ async def _hydrate_after_persist(
     try:
         messages = await mem_client.hydrate_chat_session(parsed)
         if messages:
-            return _message_history_only(messages)
+            return _message_history_only(
+                messages,
+                session_id=parsed,
+                trusted_database=True,
+            )
     except Exception:
         logger.debug("Post-write chat-session hydration failed", exc_info=True)
-    return _message_history_only(fallback_history)
+    return _message_history_only(fallback_history, session_id=parsed)
 
 
 async def _build_execution_context(
@@ -826,22 +755,13 @@ async def chat_turn(
         )
         assistant_text = loop_result.text
         agent_turn_id = getattr(loop_result, "turn_id", None)
-        action_receipts = _compact_action_receipts(
-            getattr(loop_result, "tool_results", []),
-            agent_turn_id=agent_turn_id,
-        )
         assistant_history: dict[str, Any] = {
             "role": "assistant",
             "content": assistant_text,
         }
         parsed_agent_turn_id = _uuid_text_or_none(agent_turn_id)
-        if action_receipts or parsed_agent_turn_id:
-            assistant_metadata: dict[str, Any] = {}
-            if action_receipts:
-                assistant_metadata["action_receipts"] = action_receipts
-            if parsed_agent_turn_id:
-                assistant_metadata["agent_turn_id"] = parsed_agent_turn_id
-            assistant_history["metadata"] = assistant_metadata
+        if parsed_agent_turn_id:
+            assistant_history["metadata"] = {"agent_turn_id": parsed_agent_turn_id}
 
         fallback_history = [
             *history,
@@ -856,7 +776,6 @@ async def chat_turn(
             session_id=session_id,
             user_label=user_label,
             background_dsn=dsn,
-            action_receipts=action_receipts,
             agent_turn_id=agent_turn_id,
             surface=surface,
             attachments=attachments,
@@ -1377,7 +1296,6 @@ async def stream_chat_events(
         appraisal_affect: dict[str, Any] | None = None
         tool_energy_spent = 0
         agent_turn_id: str | None = None
-        completed_tool_calls: list[dict[str, Any]] = []
 
         async for event in stream_agent(
             pool,
@@ -1434,16 +1352,6 @@ async def stream_chat_events(
                     if isinstance(emotion, dict):
                         appraisal_affect = emotion
             elif event.event == AgentEvent.TOOL_RESULT:
-                completed_tool_calls.append(
-                    {
-                        "id": event.data.get("call_id"),
-                        "name": event.data.get("tool_name"),
-                        "arguments": event.data.get("arguments"),
-                        "success": event.data.get("success") is True,
-                        "output": event.data.get("output"),
-                        "turn_id": event_turn_id or agent_turn_id,
-                    }
-                )
                 try:
                     tool_energy_spent += int(event.data.get("energy_spent") or 0)
                 except Exception:
@@ -1452,10 +1360,6 @@ async def stream_chat_events(
 
         full_text = "".join(collected)
         if full_text and not timed_out and not failed:
-            action_receipts = _compact_action_receipts(
-                completed_tool_calls,
-                agent_turn_id=agent_turn_id,
-            )
             persisted = await _remember_conversation(
                 CognitiveMemory(pool),
                 user_message=user_message,
@@ -1464,7 +1368,6 @@ async def stream_chat_events(
                 user_label=user_label,
                 emotional_state=appraisal_affect,
                 background_dsn=dsn,
-                action_receipts=action_receipts,
                 agent_turn_id=agent_turn_id,
                 surface=surface,
                 attachments=attachments,

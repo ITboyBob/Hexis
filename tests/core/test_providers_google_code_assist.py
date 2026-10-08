@@ -14,6 +14,7 @@ from core.providers.google_code_assist import (
     _parse_candidates,
     google_code_assist_completion,
 )
+from core.conversation_messages import internal_to_provider
 
 pytestmark = pytest.mark.core
 
@@ -82,6 +83,68 @@ def test_convert_messages_tool_calls():
     assert contents[1]["parts"][0]["functionCall"]["name"] == "recall"
     # Tool result
     assert "functionResponse" in contents[2]["parts"][0]
+
+
+def test_durable_history_converts_to_google_code_assist_tool_protocol():
+    session_id = "10000000-0000-4000-8000-000000000001"
+    turn_id = "20000000-0000-4000-8000-000000000001"
+    call_id = "google-call-1"
+    history, diagnostics = internal_to_provider(
+        [
+            {
+                "role": "user",
+                "content": "Read README",
+                "content_blocks": [{"type": "text", "text": "Read README"}],
+                "source_message_id": "prior-user",
+                "metadata": {"private_marker": "INTERNAL_SENTINEL"},
+            },
+            {
+                "role": "assistant",
+                "content": "Checking.",
+                "content_blocks": [
+                    {"type": "text", "text": "Checking."},
+                    {"type": "toolCall", "id": call_id, "name": "read_file", "arguments": {"path": "README.md"}},
+                ],
+                "source_message_id": f"tool:{turn_id}:{call_id}:call",
+                "metadata": {"agent_turn_id": turn_id},
+            },
+            {
+                "role": "toolResult",
+                "content": "Hexis",
+                "content_blocks": [{"type": "text", "text": "Hexis"}],
+                "source_message_id": f"tool:{turn_id}:{call_id}:result",
+                "metadata": {
+                    "agent_turn_id": turn_id,
+                    "tool_result": {
+                        "toolCallId": call_id,
+                        "toolName": "read_file",
+                        "isError": False,
+                        "details": {"title": "Hexis", "sentinel": "INTERNAL_SENTINEL"},
+                    },
+                },
+            },
+        ],
+        session_id=session_id,
+    )
+    assert not diagnostics
+    assert "INTERNAL_SENTINEL" not in json.dumps(history)
+
+    system, contents = _convert_messages(history)
+    assert system is None
+    assert contents == [
+        {"role": "user", "parts": [{"text": "Read README"}]},
+        {
+            "role": "model",
+            "parts": [
+                {"text": "Checking."},
+                {"functionCall": {"name": "read_file", "args": {"path": "README.md"}}},
+            ],
+        },
+        {
+            "role": "function",
+            "parts": [{"functionResponse": {"name": "read_file", "response": {"result": "Hexis"}}}],
+        },
+    ]
 
 
 def test_convert_tools_basic():
