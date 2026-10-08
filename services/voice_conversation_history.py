@@ -30,6 +30,7 @@ class VoiceConversationHistory:
         session_id: UUID,
         input_turn_id: UUID,
         input_order: int,
+        stimulus_revision: int,
         user_text: str,
         context_version: str,
     ) -> UUID:
@@ -37,8 +38,18 @@ class VoiceConversationHistory:
             raise ValueError("voice turn identity must use UUID values")
         if isinstance(input_order, bool) or not isinstance(input_order, int) or input_order < 0:
             raise ValueError("input_order must be a non-negative integer")
+        if isinstance(stimulus_revision, bool) or not isinstance(stimulus_revision, int) or stimulus_revision < 0:
+            raise ValueError("stimulus_revision must be a non-negative integer")
         if not user_text.strip() or not context_version.strip():
             raise ValueError("voice turn needs authorized user text and context version")
+        source_identity = f"voice:{session_id}:{input_turn_id}:{stimulus_revision}"
+        user_metadata = {
+            "channel": "voice",
+            "input_turn_id": str(input_turn_id),
+            "input_order": input_order,
+            "stimulus_revision": stimulus_revision,
+            "context_version": context_version,
+        }
         context = json.dumps(
             {
                 "messages": [],
@@ -46,19 +57,34 @@ class VoiceConversationHistory:
                     "channel": "voice",
                     "input_turn_id": str(input_turn_id),
                     "input_order": input_order,
+                    "stimulus_revision": stimulus_revision,
                     "context_version": context_version,
+                    "chat_message_projection": True,
+                    "chat_source_identity": source_identity,
                 },
             },
+            ensure_ascii=False,
             separators=(",", ":"),
         )
         async with self._pool.acquire() as conn:
-            raw = await conn.fetchval(
-                "SELECT start_agent_turn($1, $2, $3::uuid, $4::jsonb)",
-                "voice",
-                user_text,
-                session_id,
-                context,
-            )
+            async with conn.transaction():
+                await conn.fetchval(
+                    """SELECT public.append_chat_message_blocks(
+                        $1::uuid,'user',$2,$3::jsonb,$4::jsonb,$5,TRUE
+                    )""",
+                    session_id,
+                    user_text,
+                    json.dumps([{"type": "text", "text": user_text}], ensure_ascii=False),
+                    json.dumps(user_metadata, ensure_ascii=False),
+                    f"{source_identity}:user",
+                )
+                raw = await conn.fetchval(
+                    "SELECT public.start_agent_turn($1, $2, $3::uuid, $4::jsonb)",
+                    "voice",
+                    user_text,
+                    session_id,
+                    context,
+                )
         turn_id = _object(raw).get("turn_id")
         try:
             return UUID(str(turn_id))
@@ -141,4 +167,65 @@ class VoiceConversationHistory:
                     json.dumps(completion_metadata, separators=(",", ":")),
                     json.dumps(envelopes, separators=(",", ":")),
                 )
+        return _object(raw)
+
+    async def register_tool_call(
+        self,
+        *,
+        turn_id: UUID,
+        call_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(turn_id, UUID):
+            raise ValueError("voice tool call requires the actual agent turn UUID")
+        if not isinstance(call_id, str) or not call_id.strip():
+            raise ValueError("voice tool call requires the supplier call_id")
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            raise ValueError("voice tool call requires a tool name")
+        if not isinstance(arguments, dict):
+            raise ValueError("voice tool call arguments must be a JSON object")
+        async with self._pool.acquire() as conn:
+            raw = await conn.fetchval(
+                "SELECT public.record_voice_tool_call($1::uuid,$2,$3,$4::jsonb)",
+                turn_id,
+                call_id,
+                tool_name,
+                json.dumps(arguments, ensure_ascii=False),
+            )
+        return _object(raw)
+
+    async def record_tool_result(
+        self,
+        *,
+        turn_id: UUID,
+        call_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        output: dict[str, Any] | list[Any] | None,
+        output_text: str,
+        success: bool,
+    ) -> dict[str, Any]:
+        if not isinstance(turn_id, UUID):
+            raise ValueError("voice tool result requires the actual agent turn UUID")
+        if not isinstance(arguments, dict) or not isinstance(output_text, str):
+            raise ValueError("voice tool result has an invalid argument or text shape")
+        if not isinstance(success, bool):
+            raise ValueError("voice tool result success must be a boolean")
+        result = {
+            "tool_name": tool_name,
+            "call_id": call_id,
+            "arguments": arguments,
+            "success": success,
+            "output": output,
+            "model_output": output_text,
+            "energy_spent": 0,
+        }
+        async with self._pool.acquire() as conn:
+            raw = await conn.fetchval(
+                "SELECT public.record_voice_tool_result($1::uuid,$2,$3::jsonb)",
+                turn_id,
+                call_id,
+                json.dumps(result, ensure_ascii=False),
+            )
         return _object(raw)

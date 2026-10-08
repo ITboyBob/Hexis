@@ -768,7 +768,11 @@ BEGIN
         -- choke point that can mark real user contact (#112). Without it,
         -- last_user_contact only ever moved via the RabbitMQ inbox poller,
         -- leaving chat-only agents permanently reading "Never hours".
-        IF NOT COALESCE((ctx->>'host_background')::boolean, FALSE) THEN
+        IF NOT COALESCE((ctx->>'host_background')::boolean, FALSE)
+           AND NOT (
+               ctx->>'channel'='voice'
+               AND v_source_identity LIKE 'voice:%'
+           ) THEN
             PERFORM mark_user_contact();
         END IF;
     END IF;

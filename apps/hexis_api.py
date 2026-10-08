@@ -3224,6 +3224,7 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
             session_id=session.session_id,
             input_turn_id=receipt.identity.input_turn_id,
             input_order=receipt.identity.input_order,
+            stimulus_revision=receipt.identity.stimulus_revision,
             user_text=receipt.transcript,
             context_version=gate.hydration.instructions_hash,
         )
@@ -3672,7 +3673,9 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                         )
                         from services.voice_recall import VoiceRecallService
                         from services.m5_task_service import M5TaskService
+                        from services.voice_conversation_history import VoiceConversationHistory
 
+                        voice_history = VoiceConversationHistory(_pool)
                         tool_outputs: list[tuple[str, str]] = []
 
                         async def submit_m5_tool(bound_call: Any, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -3763,14 +3766,44 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
 
                         for bound_call in pending_voice_calls.values():
                             session.validate_voice_tool_call(bound_call)
-                            if bound_call.name == "voice_recall":
-                                voice_turn = session._voice_turns.get(
-                                    bound_call.input_turn_id
+                            voice_turn = session._voice_turns.get(
+                                bound_call.input_turn_id
+                            )
+                            if not isinstance(voice_turn, dict) or not isinstance(
+                                voice_turn.get("turn_id"), uuid.UUID
+                            ):
+                                raise RuntimeError(
+                                    "voice tool call has no real persisted AgentLoop turn"
                                 )
-                                if voice_turn is None:
+                            try:
+                                tool_arguments = json.loads(bound_call.raw_arguments)
+                            except (json.JSONDecodeError, TypeError) as exc:
+                                raise RuntimeError(
+                                    "voice tool arguments cannot be safely recorded"
+                                ) from exc
+                            if not isinstance(tool_arguments, dict):
+                                raise RuntimeError(
+                                    "voice tool arguments must be a JSON object before execution"
+                                )
+                            call_state = await voice_history.register_tool_call(
+                                turn_id=voice_turn["turn_id"],
+                                call_id=bound_call.actual_call_id,
+                                tool_name=bound_call.name,
+                                arguments=tool_arguments,
+                            )
+                            if call_state.get("status") == "completed":
+                                saved_output = call_state.get("output")
+                                if not isinstance(saved_output, str):
                                     raise RuntimeError(
-                                        "recall activity has no authorized voice input"
+                                        "persisted voice tool result has no reusable provider output"
                                     )
+                                tool_outputs.append((bound_call.actual_call_id, saved_output))
+                                continue
+                            if call_state.get("status") != "registered":
+                                raise RuntimeError(
+                                    str(call_state.get("error") or "voice tool result is uncertain; execution was not repeated")
+                                )
+                            if bound_call.name == "voice_recall":
                                 recall_identity = {
                                     "session_id": str(session.session_id),
                                     "input_turn_id": bound_call.input_turn_id,
@@ -3800,22 +3833,34 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                                             bound_call.input_turn_id
                                         ),
                                         name=bound_call.name,
-                                        arguments=bound_call.raw_arguments,
+                                        arguments=json.dumps(
+                                            tool_arguments, ensure_ascii=False
+                                        ),
                                     )
                                 except Exception:
-                                    await session.emit_event(
-                                        "voice_recall_ended",
+                                    tool_output = json.dumps(
                                         {
-                                            **recall_activity,
-                                            "state": "ended",
-                                            "status": "failed",
+                                            "status": "error",
+                                            "error": {
+                                                "code": "VOICE_RECALL_FAILED",
+                                                "message": "Voice memory recall could not be completed.",
+                                            },
                                         },
-                                        input_turn_id=bound_call.input_turn_id,
-                                        stimulus_revision=bound_call.stimulus_revision,
+                                        ensure_ascii=False,
+                                        separators=(",", ":"),
                                     )
-                                    raise
-                                recall_status = json.loads(tool_output).get(
-                                    "status", "unknown"
+                                tool_result = json.loads(tool_output)
+                                if not isinstance(tool_result, dict):
+                                    raise RuntimeError("voice recall returned a non-object result")
+                                recall_status = str(tool_result.get("status") or "unknown")
+                                await voice_history.record_tool_result(
+                                    turn_id=voice_turn["turn_id"],
+                                    call_id=bound_call.actual_call_id,
+                                    tool_name=bound_call.name,
+                                    arguments=tool_arguments,
+                                    output=tool_result,
+                                    output_text=tool_output,
+                                    success=recall_status not in {"error", "failed"},
                                 )
                                 await session.emit_event(
                                     "voice_recall_executed",
@@ -3851,6 +3896,27 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
                                     session,
                                     bound_call,
                                     handlers=m5_handlers,
+                                )
+                                try:
+                                    tool_result = json.loads(tool_output)
+                                except (json.JSONDecodeError, TypeError) as exc:
+                                    raise RuntimeError(
+                                        "M5 voice tool returned an invalid receipt and was not sent to the provider"
+                                    ) from exc
+                                if not isinstance(tool_result, dict) or not isinstance(
+                                    tool_result.get("ok"), bool
+                                ):
+                                    raise RuntimeError(
+                                        "M5 voice tool returned a malformed eight-field receipt"
+                                    )
+                                await voice_history.record_tool_result(
+                                    turn_id=voice_turn["turn_id"],
+                                    call_id=bound_call.actual_call_id,
+                                    tool_name=bound_call.name,
+                                    arguments=tool_arguments,
+                                    output=tool_result,
+                                    output_text=tool_output,
+                                    success=tool_result["ok"],
                                 )
                             tool_outputs.append(
                                 (bound_call.actual_call_id, tool_output)
@@ -4259,10 +4325,11 @@ async def _complete_ready_voice_turn(session: Any, input_turn_id: str) -> dict[s
             response_ids=snapshot["response_ids"],
             playback_ids=snapshot["playback_ids"],
         )
-        if result.get("status") == "repair_required":
+        if result.get("status") != "completed":
             logger.error(
-                "Voice turn completion requires repair for input %s; source message rows already exist",
+                "Voice turn completion did not commit for input %s (status=%s)",
                 input_turn_id,
+                result.get("status"),
             )
             await session.finish_voice_turn_completion(input_turn_id, success=False)
             return result
