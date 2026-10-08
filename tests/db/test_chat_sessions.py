@@ -274,6 +274,138 @@ async def test_blocks_roundtrip_through_hydrate_artifact_and_fork(db_pool):
     assert all(message["metadata"].get("forked_from_message_id") for message in forked["messages"])
 
 
+async def test_tool_pair_roundtrip_and_fork_keep_provenance_without_execution_authority(db_pool):
+    session_id = uuid4()
+    call_id = f"call_{uuid4().hex}"
+    receipt = {
+        "contract_version": "m5-tool-v1",
+        "tool_name": "submit",
+        "call_id": call_id,
+        "operation_id": str(uuid4()),
+        "ok": True,
+        "state": "accepted",
+        "data": {"task_id": str(uuid4())},
+        "error": None,
+    }
+    receipt_text = json.dumps(receipt, ensure_ascii=False, separators=(",", ":"))
+    async with db_pool.acquire() as conn:
+        await conn.fetchval(
+            "SELECT get_or_create_chat_session($1::uuid,'chat',NULL,'{}'::jsonb)",
+            session_id,
+        )
+        turn_id = await conn.fetchval(
+            "INSERT INTO agent_turns(mode,session_id,status,phase) "
+            "VALUES('chat',$1,'completed','execute') RETURNING id",
+            session_id,
+        )
+        await conn.fetchval(
+            "SELECT append_chat_message_blocks($1::uuid,'user',$2,$3::jsonb,'{}'::jsonb,$4,TRUE)",
+            session_id,
+            "Start this task",
+            json.dumps([{"type": "text", "text": "Start this task"}]),
+            f"chat:{session_id}:{uuid4()}:user",
+        )
+        call = _j(await conn.fetchval(
+            "SELECT append_chat_message_blocks($1::uuid,'assistant','',$2::jsonb,$3::jsonb,$4,TRUE)",
+            session_id,
+            json.dumps([{
+                "type": "toolCall",
+                "id": call_id,
+                "name": "submit",
+                "arguments": {"task_description": "Prepare a plan"},
+            }]),
+            json.dumps({"agent_turn_id": str(turn_id)}),
+            f"tool:{turn_id}:{call_id}:call",
+        ))
+        result = _j(await conn.fetchval(
+            "SELECT append_chat_message_blocks($1::uuid,'toolResult',$2,$3::jsonb,$4::jsonb,$5,TRUE)",
+            session_id,
+            receipt_text,
+            json.dumps([{"type": "text", "text": receipt_text}]),
+            json.dumps({
+                "agent_turn_id": str(turn_id),
+                "tool_result": {
+                    "toolCallId": call_id,
+                    "toolName": "submit",
+                    "isError": False,
+                    "details": receipt,
+                },
+            }),
+            f"tool:{turn_id}:{call_id}:result",
+        ))
+        await conn.fetchval(
+            "SELECT append_chat_message_blocks($1::uuid,'assistant',$2,$3::jsonb,'{}'::jsonb,$4,TRUE)",
+            session_id,
+            "The task was accepted.",
+            json.dumps([{"type": "text", "text": "The task was accepted."}]),
+            f"chat:{session_id}:{uuid4()}:assistant",
+        )
+        hydrated = _j(await conn.fetchval(
+            "SELECT hydrate_chat_session($1::uuid)", session_id
+        ))
+        truncated = _j(await conn.fetchval(
+            "SELECT hydrate_chat_session($1::uuid,2)", session_id
+        ))
+        artifact = _j(await conn.fetchval(
+            "SELECT get_chat_session_artifact($1::uuid,TRUE,TRUE)", session_id
+        ))
+        forked = _j(await conn.fetchval(
+            "SELECT fork_chat_session($1::uuid,NULL,'Tool history fork','{}'::jsonb)",
+            session_id,
+        ))
+
+        forked_call = next(
+            message for message in forked["messages"]
+            if message["source_message_id"] == f"tool:{turn_id}:{call_id}:call"
+        )
+        fork_id = forked["session"]["session_id"]
+        with pytest.raises(Exception, match="agent_turn_id does not belong"):
+            await conn.fetchval(
+                "SELECT append_chat_message_blocks($1::uuid,$2,$3,$4::jsonb,$5::jsonb,$6,TRUE)",
+                fork_id,
+                forked_call["role"],
+                forked_call["content"],
+                json.dumps(forked_call["content_blocks"]),
+                json.dumps(forked_call["metadata"]),
+                forked_call["source_message_id"],
+            )
+        fork_turn_count = await conn.fetchval(
+            "SELECT count(*) FROM agent_turns WHERE session_id=$1::uuid", fork_id
+        )
+
+    for messages in (hydrated["messages"], artifact["messages"], forked["messages"]):
+        paired_call = next(
+            message for message in messages
+            if message["source_message_id"] == f"tool:{turn_id}:{call_id}:call"
+        )
+        paired_result = next(
+            message for message in messages
+            if message["source_message_id"] == f"tool:{turn_id}:{call_id}:result"
+        )
+        assert paired_call["role"] == "assistant"
+        assert paired_call["metadata"]["agent_turn_id"] == str(turn_id)
+        assert paired_call["content"] == ""
+        assert paired_result["role"] == "toolResult"
+        assert paired_result["metadata"]["agent_turn_id"] == str(turn_id)
+        assert paired_result["metadata"]["tool_result"]["details"] == receipt
+        assert paired_result["source_message_id"] == f"tool:{turn_id}:{call_id}:result"
+    assert call["source_message_id"] == f"tool:{turn_id}:{call_id}:call"
+    assert result["source_message_id"] == f"tool:{turn_id}:{call_id}:result"
+    assert all(
+        message["metadata"].get("forked_from_message_id")
+        for message in forked["messages"]
+    )
+    assert fork_turn_count == 0
+    assert [message["role"] for message in truncated["messages"]] == [
+        "toolResult", "assistant"
+    ]
+    assert not any(
+        any(block.get("type") == "toolCall" for block in message["content_blocks"])
+        for message in truncated["messages"]
+        if message["role"] == "assistant"
+    )
+
+
 async def test_fork_rejects_tool_call_idempotency_with_parent_turn(db_pool):
     session_id = uuid4()
     call_id = f"call_{uuid4().hex}"
@@ -383,8 +515,8 @@ async def test_recording_a_user_turn_marks_user_contact(db_pool):
         await tr.start()
         try:
             await _stub_get_embedding(conn)
-            before = await conn.fetchval(
-                "SELECT last_user_contact FROM heartbeat_state WHERE id = 1"
+            await conn.execute(
+                "UPDATE heartbeat_state SET last_user_contact=NULL WHERE id=1"
             )
 
             await conn.fetchval(
@@ -396,8 +528,6 @@ async def test_recording_a_user_turn_marks_user_contact(db_pool):
                 "SELECT last_user_contact FROM heartbeat_state WHERE id = 1"
             )
             assert after is not None
-            if before is not None:
-                assert after > before
 
             # An assistant-only turn (no user text) is not user contact.
             before_assistant_only = after

@@ -770,8 +770,8 @@ BEGIN
         -- leaving chat-only agents permanently reading "Never hours".
         IF NOT COALESCE((ctx->>'host_background')::boolean, FALSE)
            AND NOT (
-               ctx->>'channel'='voice'
-               AND v_source_identity LIKE 'voice:%'
+               COALESCE(ctx->>'channel'='voice',FALSE)
+               AND COALESCE(v_source_identity LIKE 'voice:%',FALSE)
            ) THEN
             PERFORM mark_user_contact();
         END IF;

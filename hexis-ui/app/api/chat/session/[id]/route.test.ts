@@ -45,6 +45,45 @@ describe("/api/chat/session/[id]", () => {
     );
   });
 
+  it("passes tool blocks, source identity, and result metadata through hydrate", async () => {
+    const call = {
+      role: "assistant",
+      content: "",
+      content_blocks: [{
+        type: "toolCall",
+        id: "call-1",
+        name: "read_file",
+        arguments: { path: "README.md" },
+      }],
+      source_message_id: "tool:turn-1:call-1:call",
+      metadata: { agent_turn_id: "turn-1" },
+    };
+    const result = {
+      role: "toolResult",
+      content: "",
+      content_blocks: [{ type: "text", text: "" }],
+      source_message_id: "tool:turn-1:call-1:result",
+      metadata: {
+        agent_turn_id: "turn-1",
+        tool_result: {
+          toolCallId: "call-1",
+          toolName: "read_file",
+          isError: false,
+          details: { title: "Hexis" },
+        },
+      },
+    };
+    query.mockResolvedValueOnce([{
+      session: { session_id: "11111111-1111-4111-8111-111111111111", messages: [call, result] },
+    }]);
+
+    const response = await GET(new Request("http://localhost/api/chat/session/x"), {
+      params: Promise.resolve({ id: "11111111-1111-4111-8111-111111111111" }),
+    });
+
+    expect((await response.json()).messages).toEqual([call, result]);
+  });
+
   it("rejects non-UUID session ids", async () => {
     const response = await GET(new Request("http://localhost/api/chat/session/not-a-uuid"), {
       params: Promise.resolve({ id: "not-a-uuid" }),

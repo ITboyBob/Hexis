@@ -29,20 +29,23 @@ import { Badge } from "../components/ui/badge";
 import { Spinner } from "../components/ui/spinner";
 import { normalizeMessagePresentation } from "../../lib/message-presentation";
 import type { MessagePresentation } from "../../lib/message-presentation";
+import { toolMessageViewFromDbRecord } from "../../lib/chat-tool-message";
+import type { ToolMessageView } from "../../lib/chat-tool-message";
 import type { M5Task, M5TaskSelection, M5TaskSnapshot } from "../../lib/m5-tasks";
 import { isImageAttachmentFile, normalizeUploadFile } from "./attachment-helpers";
 import { AttachmentCard, type AttachmentKind } from "./attachment-card";
-import { MessagePresentationView } from "./message-presentation";
+import { MessagePresentationView, ToolMessageCard } from "./message-presentation";
 import { VoiceRecorder } from "./voice-recorder";
 import { TalkMode } from "./talk-mode";
 import { TaskList } from "./task-list";
 
 type ChatMessage = {
   id: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "toolResult";
   content: string;
   attachments?: ChatAttachmentView[];
   presentation?: MessagePresentation;
+  toolMessage?: ToolMessageView;
   ui?: ChatUiArtifact[];
   incomplete?: boolean;
   error?: string;
@@ -987,6 +990,37 @@ function attachmentViewsFromMetadata(value: unknown): ChatAttachmentView[] | und
   return views.length > 0 ? views : undefined;
 }
 
+function toolVisualAttachmentViewsFromMetadata(value: unknown): ChatAttachmentView[] | undefined {
+  const metadata = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const raw = metadata.model_visual_attachments;
+  if (!Array.isArray(raw)) return undefined;
+  const views: ChatAttachmentView[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as Record<string, unknown>;
+    const dataUrl = typeof record.data_url === "string" ? record.data_url : "";
+    const mimeType = typeof record.mime_type === "string" ? record.mime_type : "";
+    if (
+      !/^data:image\/(png|jpeg|webp|gif);base64,/.test(dataUrl) ||
+      !/^image\/(png|jpeg|webp|gif)$/.test(mimeType) ||
+      dataUrl.slice(0, dataUrl.indexOf(";")) !== `data:${mimeType}`
+    ) continue;
+    const name = typeof record.name === "string" && record.name.trim()
+      ? record.name.trim()
+      : `Tool result image ${views.length + 1}`;
+    views.push({
+      id: `${name}:${views.length}`,
+      name,
+      mimeType,
+      kind: "image",
+      dataUrl,
+    });
+  }
+  return views.length > 0 ? views : undefined;
+}
+
 function dbMessagesToChatMessages(value: unknown): ChatMessage[] | null {
   if (!Array.isArray(value)) return null;
   const messages: ChatMessage[] = [];
@@ -995,6 +1029,19 @@ function dbMessagesToChatMessages(value: unknown): ChatMessage[] | null {
     const record = item as Record<string, unknown>;
     const role = record.role;
     const content = record.content;
+    const toolMessage = toolMessageViewFromDbRecord(record);
+    if (toolMessage) {
+      messages.push({
+        id: typeof record.message_id === "string" ? record.message_id : crypto.randomUUID(),
+        role: role === "toolResult" ? "toolResult" : "assistant",
+        content: "",
+        toolMessage,
+        attachments: role === "toolResult"
+          ? toolVisualAttachmentViewsFromMetadata(record.metadata)
+          : undefined,
+      });
+      continue;
+    }
     if ((role === "user" || role === "assistant") && typeof content === "string") {
       messages.push({
         id: typeof record.message_id === "string" ? record.message_id : crypto.randomUUID(),
@@ -1087,7 +1134,11 @@ export default function ChatPage() {
   const historyPayload = useMemo(
     () =>
       messages
-        .filter((msg) => msg.content.trim() && !msg.incomplete)
+        .filter((msg) =>
+          (msg.role === "user" || msg.role === "assistant") &&
+          msg.content.trim() &&
+          !msg.incomplete
+        )
         .map((msg) => ({ role: msg.role, content: msg.content })),
     [messages]
   );
@@ -2752,15 +2803,34 @@ export default function ChatPage() {
                   <p className="mt-2 text-sm text-[var(--ink-soft)]">What is on your mind?</p>
                 </div>
               ) : null}
-              {messages.map((message) => (
-                <div key={message.id} className={`flex gap-3 ${message.role === "user" ? "justify-end" : "justify-start"}`}>
-                  {message.role === "assistant" ? (
+              {messages.map((message) => {
+                const userMessage = message.role === "user";
+                return (
+                <div key={message.id} className={`flex gap-3 ${userMessage ? "justify-end" : "justify-start"}`}>
+                  {!userMessage ? (
                     agentStatus.portrait_url ? <Image src={agentStatus.portrait_url} alt="" width={32} height={32} unoptimized className="mt-1 h-8 w-8 flex-none rounded-md object-cover" /> : <div className="mt-1 flex h-8 w-8 flex-none items-center justify-center rounded-md bg-[var(--surface-strong)] text-xs font-semibold">H</div>
                   ) : null}
-                  <div className={`max-w-[85%] text-sm leading-6 ${message.role === "user" ? "flex flex-col items-end gap-2" : "min-w-0 flex-1 py-1 text-[var(--foreground)]"}`}>
-                    {message.role === "assistant" ? (
+                  <div className={`max-w-[85%] text-sm leading-6 ${userMessage ? "flex flex-col items-end gap-2" : "min-w-0 flex-1 py-1 text-[var(--foreground)]"}`}>
+                    {!userMessage ? (
                       <div className="space-y-3">
-                        {message.presentation ? (
+                        {message.toolMessage ? (
+                          <>
+                            <ToolMessageCard tool={message.toolMessage} />
+                            {message.attachments?.map((attachment) => (
+                              attachment.kind === "image" && attachment.dataUrl ? (
+                                <Image
+                                  key={attachment.id}
+                                  src={attachment.dataUrl}
+                                  alt={attachment.name}
+                                  width={360}
+                                  height={240}
+                                  unoptimized
+                                  className="mt-2 max-h-72 rounded-lg border border-[var(--outline)] object-contain"
+                                />
+                              ) : null
+                            ))}
+                          </>
+                        ) : message.presentation ? (
                           <MessagePresentationView presentation={message.presentation} />
                         ) : message.content ? (
                           <MessagePresentationView presentation={{ tone: "neutral", blocks: [{ type: "text", text: message.content }] }} />
@@ -2826,7 +2896,8 @@ export default function ChatPage() {
                     )}
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
 

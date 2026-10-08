@@ -98,6 +98,146 @@ describe("ChatPage attachments", () => {
     sessionStorage.clear();
   });
 
+  it("restores tool calls and accepted results from the DB without creating a blank assistant bubble", async () => {
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    sessionStorage.setItem("hexis-chat-session-id", sessionId);
+    const messages = [
+      { role: "user", content: "Start a task", message_id: "user-1" },
+      {
+        role: "assistant",
+        content: "",
+        content_blocks: [{
+          type: "toolCall",
+          id: "call-submit",
+          name: "submit",
+          arguments: { task_description: "DO_NOT_RENDER_RAW_ARGUMENTS" },
+        }],
+        metadata: { agent_turn_id: "turn-1" },
+        message_id: "call-message",
+      },
+      {
+        role: "toolResult",
+        content: JSON.stringify({
+          contract_version: "m5-tool-v1",
+          tool_name: "submit",
+          call_id: "call-submit",
+          operation_id: "DO_NOT_RENDER_RAW_DETAILS",
+          ok: true,
+          state: "accepted",
+          data: { task_id: "DO_NOT_RENDER_RAW_DETAILS" },
+          error: null,
+        }),
+        content_blocks: [{ type: "text", text: "" }],
+        metadata: {
+          agent_turn_id: "turn-1",
+          model_visual_attachments: [{
+            name: "proof.png",
+            mime_type: "image/png",
+            data_url: "data:image/png;base64,aGVsbG8=",
+          }],
+          tool_result: {
+            toolCallId: "call-submit",
+            toolName: "submit",
+            isError: false,
+            details: {
+              ok: true,
+              state: "accepted",
+              operation_id: "DO_NOT_RENDER_RAW_DETAILS",
+              data: { task_id: "DO_NOT_RENDER_RAW_DETAILS" },
+            },
+          },
+        },
+        message_id: "result-message",
+      },
+      { role: "assistant", content: "The task was accepted.", message_id: "assistant-final" },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/api/status")) {
+          return Response.json({ configured: true, agent_name: "Samantha" });
+        }
+        if (url.endsWith("/api/outbox")) return Response.json({ unread: 0, messages: [] });
+        if (url === `/api/chat/session/${sessionId}`) return Response.json({ messages });
+        return Response.json({});
+      }) as unknown as typeof fetch
+    );
+
+    render(<ChatPage />);
+
+    expect(await screen.findByRole("group", { name: "Tool call: submit" })).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "Tool result: submit" })).toHaveTextContent("Accepted");
+    expect(await screen.findByAltText("proof.png")).toHaveAttribute(
+      "src",
+      "data:image/png;base64,aGVsbG8="
+    );
+    expect(screen.getByText("The task was accepted.")).toBeInTheDocument();
+    expect(screen.queryByText("DO_NOT_RENDER_RAW_ARGUMENTS")).not.toBeInTheDocument();
+    expect(screen.queryByText("DO_NOT_RENDER_RAW_DETAILS")).not.toBeInTheDocument();
+    expect(screen.queryByText("Thinking...")).not.toBeInTheDocument();
+  });
+
+  it("does not send internal toolResult roles from display cache as provider chat history", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    sessionStorage.setItem("hexis-chat-display-messages", JSON.stringify([
+      { id: "user-1", role: "user", content: "Start the task" },
+      {
+        id: "call-1",
+        role: "assistant",
+        content: "",
+        toolMessage: {
+          kind: "call",
+          callId: "call-1",
+          toolName: "submit",
+          summary: "Tool call",
+        },
+      },
+      {
+        id: "result-1",
+        role: "toolResult",
+        content: "RAW_TOOL_RESULT_SENTINEL",
+        toolMessage: {
+          kind: "result",
+          callId: "call-1",
+          toolName: "submit",
+          summary: "Accepted",
+          failed: false,
+        },
+      },
+      { id: "assistant-1", role: "assistant", content: "Accepted." },
+    ]));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/api/status")) {
+          return Response.json({ configured: true, agent_name: "Samantha" });
+        }
+        if (url.endsWith("/api/outbox")) return Response.json({ unread: 0, messages: [] });
+        if (url.endsWith("/api/chat")) {
+          bodies.push(JSON.parse(String(init?.body || "{}")));
+          return eventStream([
+            'event: done\ndata: {"assistant":"Done.","session_id":"22222222-2222-4222-8222-222222222222"}\n\n',
+          ]);
+        }
+        return Response.json({});
+      }) as unknown as typeof fetch
+    );
+
+    render(<ChatPage />);
+    expect(await screen.findByRole("group", { name: "Tool result: submit" })).toBeInTheDocument();
+    fireEvent.change(await screen.findByLabelText("Message Samantha"), {
+      target: { value: "Continue" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(bodies).toHaveLength(1));
+    const history = bodies[0].history as Array<Record<string, unknown>>;
+    expect(history.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(JSON.stringify(history)).not.toContain("RAW_TOOL_RESULT_SENTINEL");
+  });
+
   it("turns pasted clipboard images into sendable file attachments", async () => {
     render(<ChatPage />);
 

@@ -1,4 +1,5 @@
 import type { MessagePresentation } from "../../lib/message-presentation";
+import type { ToolMessageView } from "../../lib/chat-tool-message";
 
 function escapeHtml(text: string): string {
   return text
@@ -139,5 +140,41 @@ export function MessagePresentationView({
         return <div key={`text-${index}`}>{renderMarkdown(block.text)}</div>;
       })}
     </div>
+  );
+}
+
+export function ToolMessageCard({ tool }: { tool: ToolMessageView }) {
+  const label = tool.kind === "call"
+    ? "Tool call"
+    : tool.kind === "incomplete"
+      ? "Incomplete tool record"
+      : tool.failed
+        ? "Tool error"
+        : "Tool result";
+  const tone = tool.kind === "incomplete" || (tool.kind === "result" && tool.failed)
+    ? "border-red-200 bg-red-50 text-red-950"
+    : "border-[var(--outline)] bg-[var(--surface)] text-[var(--foreground)]";
+
+  return (
+    <section
+      role="group"
+      aria-label={`${label}: ${tool.toolName}`}
+      data-tool-call-id={tool.callId ?? undefined}
+      data-agent-turn-id={tool.agentTurnId}
+      className={`rounded-lg border px-4 py-3 ${tone}`}
+    >
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="text-[10px] font-semibold uppercase tracking-wide opacity-70">
+          {label}
+        </span>
+        <span className="font-mono text-xs font-semibold">
+          {tool.toolName.replace(/_/g, " ")}
+        </span>
+      </div>
+      <p className="mt-1 text-xs">{tool.summary}</p>
+      {tool.kind === "result" && tool.text ? (
+        <p className="mt-2 whitespace-pre-wrap break-words text-sm">{tool.text}</p>
+      ) : null}
+    </section>
   );
 }
