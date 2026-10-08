@@ -1184,6 +1184,10 @@ class VoiceRealtimeSessionRegistry:
     def get(self, session_id: UUID) -> VoiceRealtimeSession | None:
         return self._sessions.get(session_id)
 
+    def active_sessions(self) -> tuple[VoiceRealtimeSession, ...]:
+        """只返回本 API 进程拥有的 session 快照，供显式关闭收尾。"""
+        return tuple(self._sessions.values())
+
     def get_by_media_session_id(self, media_session_id: str) -> VoiceRealtimeSession | None:
         return self._by_media_session_id.get(media_session_id)
 

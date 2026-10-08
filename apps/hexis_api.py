@@ -80,6 +80,8 @@ _m5_acceptance_runtime_fingerprints: dict[str, str] | None = None
 _m5_lightweight_executor: Any | None = None
 _voice_barge_in_environment: dict[str, Any] | None = None
 _voice_barge_in_start_record: dict[str, Any] | None = None
+_m6_registered_chat_sessions: set[uuid.UUID] = set()
+_m6_session_registration_lock = asyncio.Lock()
 
 
 def _should_start_m5_background_workers(voice_barge_in_selected: bool) -> bool:
@@ -101,6 +103,70 @@ def _m5_report_runner_enabled() -> bool:
             "disabling the M5 report runner requires the isolated BOB-107 runtime"
         )
     return False
+
+
+def _selected_m6_session_policy() -> dict[str, str] | None:
+    """只有核验过的 M6 API 启动记录可以放行受限 session。"""
+    if not os.environ.get("HEXIS_VOICE_BARGE_IN_ENV"):
+        return None
+    from apps.voice_barge_in_environment import load_profile, session_execution_policy, validate_m6_migration_verification, selected_ui_origin, validate_api_start_endpoint
+
+    record = _voice_barge_in_start_record or {}
+    environment_record = _voice_barge_in_environment or {}
+    if (record.get("status") != "started" or not record.get("start_id")
+            or not record.get("environment_id") or record.get("environment_id") != environment_record.get("env_id")):
+        raise ValueError("M6 session policy requires the selected E1/API start identity")
+    validate_m6_migration_verification(record.get("migration_verification"))
+    profile_path = Path(__file__).resolve().parents[1] / "config/voice-barge-in/run-profile.json"
+    profile = load_profile(profile_path)
+    selected_endpoint = validate_api_start_endpoint(profile, record)
+    if (os.environ.get("HEXIS_BROWSER_API_URL") != selected_endpoint
+            or record.get("api_url_source", "C6_api_url") != os.environ.get("HEXIS_VOICE_BARGE_IN_API_URL_SOURCE", "C6_api_url")):
+        raise ValueError("M6 browser-reachable API URL must remain bound to selected C6/API startup")
+    if (record.get("ui_origin") != os.environ.get("HEXIS_UI_ORIGIN")
+            or selected_ui_origin(profile, record.get("ui_origin")) != record.get("ui_origin")):
+        raise ValueError("M6 UI origin must remain bound to its explicit API startup selection")
+    if hashlib.sha256(profile_path.read_bytes()).hexdigest() != record.get("config_fingerprints", {}).get("C6"):
+        raise ValueError("M6 C6 policy changed after API startup")
+    policy = session_execution_policy(profile)
+    if record.get("session_execution_policy") != policy:
+        raise ValueError("M6 API start policy does not match selected C6")
+    return policy
+
+
+async def _execute_restricted_voice_tool(session: Any, call: Any, history: Any) -> str:
+    """保留受限回执，并将合法拒绝绑定到真实语音 turn；不执行业务操作。"""
+    from services.m5_tool_bridge import execute_restricted_bound_tool
+
+    output_text = await execute_restricted_bound_tool(session, call)
+    receipt = json.loads(output_text)
+    if not isinstance(receipt, dict) or receipt.get("ok") is not False:
+        raise RuntimeError("restricted voice tool returned a malformed denial receipt")
+    error = receipt.get("error")
+    if isinstance(error, dict) and error.get("code") in {"INVALID_JSON", "INVALID_ARGUMENTS"}:
+        return output_text
+    arguments = json.loads(call.raw_arguments)
+    if not isinstance(arguments, dict):
+        raise RuntimeError("restricted voice tool arguments must be an object")
+    voice_turn = session._voice_turns.get(call.input_turn_id)
+    if not isinstance(voice_turn, dict) or not isinstance(voice_turn.get("turn_id"), uuid.UUID):
+        raise RuntimeError("restricted voice tool has no real persisted AgentLoop turn")
+    turn_id = voice_turn["turn_id"]
+    state = await history.register_tool_call(
+        turn_id=turn_id, call_id=call.actual_call_id, tool_name=call.name, arguments=arguments,
+    )
+    if state.get("status") == "completed":
+        saved_output = state.get("output")
+        if not isinstance(saved_output, str):
+            raise RuntimeError("persisted restricted voice result has no reusable output")
+        return saved_output
+    if state.get("status") != "registered":
+        raise RuntimeError("restricted voice tool result is uncertain; execution was not repeated")
+    await history.record_tool_result(
+        turn_id=turn_id, call_id=call.actual_call_id, tool_name=call.name,
+        arguments=arguments, output=receipt, output_text=output_text, success=False,
+    )
+    return output_text
 
 
 def _dsn() -> str:
@@ -137,8 +203,19 @@ def _write_voice_barge_in_api_start_record(
     record_path: Path,
     environment_record: dict[str, Any],
     database_identity: dict[str, Any],
+    *, migration_verification: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    source_root = Path(environment_record["repository_root"])
+    from urllib.parse import urlparse
+    from apps.voice_barge_in_probe import _api_source_fingerprints
+
+    source_root = Path(environment_record["repository_root"]).resolve()
+    if source_root != Path(__file__).resolve().parents[1]:
+        raise RuntimeError("M6 API startup source checkout does not match the selected E1 repository")
+    source_fingerprints = _api_source_fingerprints(source_root)
+    from apps.voice_barge_in_environment import load_profile, session_execution_policy, selected_api_url, validate_api_start_endpoint
+
+    profile = load_profile(source_root / "config/voice-barge-in/run-profile.json")
+    policy = session_execution_policy(profile)
     config_paths = {
         "C1": "hexis-ui/lib/voice-realtime/speech-detection-config.json",
         "C2": "hexis-ui/lib/voice-realtime/vad-assets-manifest.json",
@@ -154,9 +231,16 @@ def _write_voice_barge_in_api_start_record(
         if not file_path.is_file():
             raise RuntimeError(f"M6 API startup configuration {label} is missing: {relative}")
         fingerprints[label] = hashlib.sha256(file_path.read_bytes()).hexdigest()
+    provider_key_env = os.environ.get("HEXIS_VOICE_BARGE_IN_PROVIDER_KEY_ENV")
+    credential_env_names = ["POSTGRES_USER", "POSTGRES_PASSWORD"]
+    if provider_key_env:
+        realtime_config = json.loads((source_root / config_paths["C5"]).read_text(encoding="utf-8"))
+        if provider_key_env != realtime_config.get("api_key_env") or not os.environ.get(provider_key_env):
+            raise RuntimeError("selected M6 provider credential name/value does not match C5")
+        credential_env_names.append(provider_key_env)
     environment_id = environment_record["env_id"]
     listen_host = os.environ.get("HEXIS_VOICE_BARGE_IN_LISTEN_HOST", "127.0.0.1")
-    listen_port = int(os.environ.get("HEXIS_VOICE_BARGE_IN_LISTEN_PORT", "43817"))
+    listen_port = int(os.environ.get("HEXIS_VOICE_BARGE_IN_LISTEN_PORT", str(urlparse(selected_api_url(profile)).port or 80)))
     record = {
         "schema_version": 1,
         "environment_id": environment_id,
@@ -179,6 +263,15 @@ def _write_voice_barge_in_api_start_record(
             if environment_record.get("source_clone", {}).get(key) is not None
         },
         "config_fingerprints": fingerprints,
+        "source_fingerprints": source_fingerprints,
+        "credential_env_names": credential_env_names,
+        "session_execution_policy": policy,
+        "acceptance_session_id": str(uuid.uuid4()),
+        "browser_api_url": os.environ.get("HEXIS_BROWSER_API_URL", selected_api_url(profile)),
+        "api_url_source": os.environ.get("HEXIS_VOICE_BARGE_IN_API_URL_SOURCE", "C6_api_url"),
+        "ui_origin": os.environ.get("HEXIS_UI_ORIGIN"),
+        "ui_origin_source": os.environ.get("HEXIS_VOICE_BARGE_IN_UI_ORIGIN_SOURCE"),
+        "migration_verification": migration_verification or {"status": "not_verified"},
         "actual_current_database": database_identity["database"],
         "actual_server_address_and_port": {
             "address": database_identity["server_address"],
@@ -187,12 +280,70 @@ def _write_voice_barge_in_api_start_record(
         "endpoints": {"api_host": listen_host, "api_port": listen_port, "health": "/health", "voice_realtime": "/api/voice/realtime"},
         "status": "started",
     }
+    validate_api_start_endpoint(profile, record)
     record_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(record_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         json.dump(record, stream, ensure_ascii=False, indent=2)
         stream.write("\n")
     return record
+
+
+async def _verify_m6_migration_ledger(conn: Any, source_manifest: dict[str, Any]) -> dict[str, Any]:
+    """只读核对已提交源码与现有 ledger；不建表、不迁移、不自愈。"""
+    table = await conn.fetchval(
+        "SELECT CASE WHEN to_regclass('public.schema_migrations') IS NOT NULL THEN 'public.schema_migrations' "
+        "WHEN to_regclass('ag_catalog.schema_migrations') IS NOT NULL THEN 'ag_catalog.schema_migrations' END"
+    )
+    if table not in {"public.schema_migrations", "ag_catalog.schema_migrations"}:
+        raise RuntimeError("M6 read-only migration verification requires an existing migration ledger")
+    rows = await conn.fetch(f"SELECT version, checksum FROM {table}")
+    actual = {row["version"]: row["checksum"] for row in rows}
+    expected = {Path(relative).stem: digest for relative, digest in source_manifest["committed_files"].items()}
+    if set(actual) != set(expected):
+        raise RuntimeError("M6 schema ledger does not exactly match committed migration sources; explicit authorized migration review is required")
+    if actual != expected:
+        raise RuntimeError("M6 applied migration checksum differs from committed source; read-only startup is blocked")
+    return {**source_manifest, "status": "verified_read_only", "ledger_table": table,
+            "ledger_count": len(actual), "ledger_latest_version": max(actual)}
+
+
+async def _close_owned_voice_session(session: Any, reason: str) -> None:
+    """结束精确的本进程媒体对象与持久行，不扫其它聊天或云 session。"""
+    cloud_session_id = session.cloud_session_id
+    try:
+        await session.close(reason)
+    except Exception:
+        logger.exception("Could not close the owned realtime client")
+    finally:
+        pending = tuple(task for task in session._background_tasks if task is not asyncio.current_task())
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        registry = _voice_realtime_registry
+        if registry is not None and registry.get(session.session_id) is session:
+            registry.remove(session.session_id, session)
+        if cloud_session_id is not None and _pool is not None:
+            async with _pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE voice_realtime_sessions SET status=$3, closed_reason=$4, closed_at=now(), last_event_at=now() "
+                    "WHERE session_id=$1::uuid AND qwen_session_id=$2 AND status='active'",
+                    session.session_id, cloud_session_id, "failed" if reason == "error" else "closed", reason,
+                )
+
+
+async def _close_registered_voice_sessions() -> None:
+    if _voice_realtime_registry is None:
+        return
+    for session in _voice_realtime_registry.active_sessions():
+        if (os.environ.get("HEXIS_VOICE_BARGE_IN_ENV") and _voice_barge_in_start_record is not None
+                and str(session.session_id) != _voice_barge_in_start_record.get("acceptance_session_id")):
+            continue
+        try:
+            await _close_owned_voice_session(session, "manual")
+        except Exception:
+            logger.exception("Could not persist the owned realtime session shutdown")
 
 
 @asynccontextmanager
@@ -216,29 +367,38 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("M5 acceptance source fingerprints changed before API startup")
     else:
         _m5_acceptance_runtime_fingerprints = None
-    # Bring the schema up to date on startup (advisory-locked, idempotent, no data loss).
-    try:
-        from core.agent_api import apply_migrations
+    # M6 只读验收不能自动应用工作区中的外来 SQL；普通 API 保留迁移行为。
+    m6_migration_manifest = None
+    if selected_voice_run:
+        from apps.voice_barge_in_environment import m6_migration_source_manifest
 
-        applied = await apply_migrations(dsn)
-        if applied:
-            logger.info(
-                "Applied %d schema migration(s) on startup: %s", len(applied), applied
-            )
-    except Exception as exc:
-        if selected_voice_run:
-            raise RuntimeError(f"M6 selected database migration failed; API startup is blocked: {exc}") from exc
-        logger.warning("Startup migration check failed (continuing): %s", exc)
+        m6_migration_manifest = m6_migration_source_manifest()
+    else:
+        try:
+            from core.agent_api import apply_migrations
+
+            applied = await apply_migrations(dsn)
+            if applied:
+                logger.info("Applied %d schema migration(s) on startup: %s", len(applied), applied)
+        except Exception as exc:
+            logger.warning("Startup migration check failed (continuing): %s", exc)
     _min, _max = pool_sizes_from_env(2, 10)
     _pool = await asyncpg.create_pool(dsn, min_size=_min, max_size=_max)
     from core.usage import set_usage_pool
 
     set_usage_pool(_pool)
     if selected_voice_run:
-        async with _pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT current_database() AS database, inet_server_addr()::text AS server_address, inet_server_port() AS server_port"
-            )
+        try:
+            async with _pool.acquire() as conn:
+                async with conn.transaction(readonly=True):
+                    migration_verification = await _verify_m6_migration_ledger(conn, m6_migration_manifest)
+                    row = await conn.fetchrow(
+                        "SELECT current_database() AS database, inet_server_addr()::text AS server_address, inet_server_port() AS server_port"
+                    )
+        except Exception:
+            await _pool.close()
+            _pool = None
+            raise
         _voice_barge_in_start_record = _write_voice_barge_in_api_start_record(
             _voice_barge_in_api_start_record_path(selected_voice_run),
             _voice_barge_in_environment or {},
@@ -247,10 +407,13 @@ async def lifespan(app: FastAPI):
                 "server_address": row["server_address"],
                 "server_port": row["server_port"],
             },
+            migration_verification=migration_verification,
         )
     try:
-        async with _pool.acquire() as conn:
-            m5_ready = await conn.fetchval(
+        m5_ready = False
+        if not selected_voice_run:
+            async with _pool.acquire() as conn:
+                m5_ready = await conn.fetchval(
                 """
                 SELECT to_regclass('public.m5_actions') IS NOT NULL
                    AND to_regclass('public.m5_tasks') IS NOT NULL
@@ -339,18 +502,20 @@ async def lifespan(app: FastAPI):
     except Exception:
         _m5_task_worker = None
         logger.exception("M5 task worker could not start")
-    try:
-        from core.agent_api import record_build_change
+    if not selected_voice_run:
+        try:
+            from core.agent_api import record_build_change
 
-        async with _pool.acquire() as conn:
-            await record_build_change(conn, "api")
-    except Exception:
-        logger.debug("build-change journaling failed", exc_info=True)
+            async with _pool.acquire() as conn:
+                await record_build_change(conn, "api")
+        except Exception:
+            logger.debug("build-change journaling failed", exc_info=True)
     logger.info("Hexis API started (pool created)")
     try:
         yield
     finally:
         await auth_flow_coordinator.close()
+        await _close_registered_voice_sessions()
         if _m5_lightweight_executor is not None:
             try:
                 await _m5_lightweight_executor.close()
@@ -363,12 +528,13 @@ async def lifespan(app: FastAPI):
             except Exception:
                 logger.exception("M5 task worker shutdown failed")
             _m5_task_worker = None
-        try:
-            from core.tools.mcp_runtime import MCPRuntime
+        if not selected_voice_run:
+            try:
+                from core.tools.mcp_runtime import MCPRuntime
 
-            await MCPRuntime.instance().shutdown()
-        except Exception:
-            logger.debug("MCP runtime shutdown failed", exc_info=True)
+                await MCPRuntime.instance().shutdown()
+            except Exception:
+                logger.debug("MCP runtime shutdown failed", exc_info=True)
         if _pool:
             await _pool.close()
             logger.info("Pool closed")
@@ -998,6 +1164,13 @@ async def health():
             "database": _voice_barge_in_start_record["actual_current_database"],
             "server_address_and_port": _voice_barge_in_start_record["actual_server_address_and_port"],
             "status": _voice_barge_in_start_record["status"],
+            "session_execution_policy": _selected_m6_session_policy(),
+            "migration_verification": _voice_barge_in_start_record["migration_verification"],
+            "acceptance_session_id": _voice_barge_in_start_record.get("acceptance_session_id"),
+            "browser_api_url": _voice_barge_in_start_record.get("browser_api_url"),
+            "api_url_source": _voice_barge_in_start_record.get("api_url_source", "C6_api_url"),
+            "ui_origin": _voice_barge_in_start_record.get("ui_origin"),
+            "acceptance_session_registered": _voice_barge_in_start_record.get("acceptance_session_id") in {str(value) for value in _m6_registered_chat_sessions},
         }
     ok = all(checks.values())
     return JSONResponse(
@@ -3092,6 +3265,38 @@ def _browser_realtime_websocket_url(media_session_id: str) -> str:
     )
 
 
+@app.post("/api/voice-barge-in/chat-session")
+async def register_m6_acceptance_chat_session():
+    """显式登记服务器生成的新验收会话；不接受客户端指定的旧会话 ID。"""
+    try:
+        policy = _selected_m6_session_policy()
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail="Selected M6 execution policy is unavailable.") from exc
+    if policy is None:
+        raise HTTPException(status_code=404, detail="M6 acceptance session registration is disabled.")
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
+    try:
+        selected_id = uuid.UUID(_voice_barge_in_start_record["acceptance_session_id"])
+    except (KeyError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=503, detail="M6 API start record has no valid acceptance session identity.") from exc
+    async with _m6_session_registration_lock:
+        if selected_id not in _m6_registered_chat_sessions:
+            async with _pool.acquire() as conn:
+                async with conn.transaction():
+                    # 冲突意味着既有会话；禁止复用其身份或历史。
+                    if await conn.fetchval("SELECT EXISTS(SELECT 1 FROM chat_sessions WHERE id=$1::uuid)", selected_id):
+                        raise HTTPException(status_code=409, detail="The selected acceptance session ID already exists; restart this owned API run.")
+                    inserted = await conn.fetchval(
+                        "INSERT INTO chat_sessions(id, surface, metadata) VALUES($1::uuid, 'web', $2::jsonb) ON CONFLICT(id) DO NOTHING RETURNING id",
+                        selected_id, json.dumps({"source": "m6-acceptance", "api_start_id": _voice_barge_in_start_record["start_id"]}),
+                    )
+                    if inserted != selected_id:
+                        raise HTTPException(status_code=409, detail="The selected acceptance session could not be created without reusing an existing ID.")
+            _m6_registered_chat_sessions.add(selected_id)
+    return {"session_id": str(selected_id), "api_start_id": _voice_barge_in_start_record["start_id"], "session_execution_policy": policy}
+
+
 @app.post("/api/voice/realtime/sessions")
 async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
     """Create one server-owned cloud realtime session for a chat."""
@@ -3118,15 +3323,26 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
         VoiceRealtimeSession,
         new_media_session_id,
     )
+    media_session_id = new_media_session_id()
+    # 所有浏览器地址错误都必须先于 provider 构造/连接发现。
+    browser_websocket_url = _browser_realtime_websocket_url(media_session_id)
 
     registry = _voice_realtime_session_registry()
     if registry.get(req.session_id) is not None:
         raise HTTPException(status_code=409, detail="This chat already has an active realtime session.")
-    if req.tool_surface == "m5" and _m5_task_worker is None:
+    try:
+        m6_policy = _selected_m6_session_policy()
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail="The selected M6 session execution policy is unavailable or invalid.") from exc
+    if req.tool_surface == "m5" and _m5_task_worker is None and m6_policy is None:
         raise HTTPException(
             status_code=503,
             detail="M5 realtime tools are unavailable because the task worker is not ready.",
         )
+    if m6_policy is not None:
+        if (req.session_id not in _m6_registered_chat_sessions
+                or str(req.session_id) != _voice_barge_in_start_record.get("acceptance_session_id")):
+            raise HTTPException(status_code=403, detail="M6 C5-only acceptance requires the API-owned registered chat session for this run.")
 
     async with _pool.acquire() as conn:
         stale_id = await conn.fetchval(
@@ -3148,9 +3364,14 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
             )
 
     selected_realtime_path = os.environ.get("HEXIS_REALTIME_CONFIG")
-    if selected_realtime_path:
-        from pathlib import Path
+    if m6_policy is not None:
+        from apps.voice_barge_in_environment import load_profile
 
+        m6_profile = load_profile()
+        selected_realtime_path = str(Path(__file__).resolve().parents[1] / m6_profile["realtime_config"])
+        if hashlib.sha256(Path(selected_realtime_path).read_bytes()).hexdigest() != _voice_barge_in_start_record["config_fingerprints"]["C5"]:
+            raise HTTPException(status_code=503, detail="Selected C5 changed after M6 API startup.")
+    if selected_realtime_path:
         try:
             config = json.loads(Path(selected_realtime_path).read_text(encoding="utf-8"))
             if not isinstance(config, dict) or any(
@@ -3165,6 +3386,11 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
         start_timeout = _voice_realtime_start_timeout(config)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if m6_policy is not None and (
+        os.environ.get("HEXIS_VOICE_BARGE_IN_PROVIDER_KEY_ENV") != config["api_key_env"]
+        or config["api_key_env"] not in _voice_barge_in_start_record.get("credential_env_names", [])
+    ):
+        raise HTTPException(status_code=503, detail="The C5 provider credential was not explicitly selected for this M6 API run.")
     api_key = selected_env_value(config["api_key_env"])
     if not api_key:
         raise HTTPException(
@@ -3180,13 +3406,15 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
     else:
         instructions = load_m4_stable_instructions()
     m4_config_path = os.environ.get("HEXIS_M4_VOICE_CONFIG")
+    if m6_policy is not None:
+        m4_config_path = str(Path(__file__).resolve().parents[1] / m6_profile["runtime_config"])
+        if hashlib.sha256(Path(m4_config_path).read_bytes()).hexdigest() != _voice_barge_in_start_record["config_fingerprints"]["C4"]:
+            raise HTTPException(status_code=503, detail="Selected C4 changed after M6 API startup.")
     if not m4_config_path:
         raise HTTPException(
             status_code=503,
             detail="HEXIS_M4_VOICE_CONFIG is not selected for the M4 realtime input gate.",
         )
-    from pathlib import Path
-
     from apps.voice_realtime_harness import _build_runtime, _load_config
 
     try:
@@ -3196,6 +3424,7 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
             pool=_pool,
             session_id=req.session_id,
             stable_instructions=instructions,
+            **({"session_execution_policy": m6_policy} if m6_policy is not None else {}),
         )
         selected_run = os.environ.get("HEXIS_M5_ACCEPTANCE_RUN")
         if selected_run and tool_surface == "m5":
@@ -3289,7 +3518,6 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
             raise RuntimeError("realtime output websocket is not attached")
         await session._response_dispatch(output)
 
-    media_session_id = new_media_session_id()
     connect_factory = _default_connect_factory
     if os.environ.get("HEXIS_M5_ACCEPTANCE_RUN"):
         from apps.m5_acceptance_probe import acceptance_connect_factory
@@ -3313,6 +3541,15 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
         ),
         playback_coordination_config=playback_coordination_config,
     )
+    session.session_execution_policy = m6_policy
+    from services.voice_realtime_transport import RealtimeSessionResponse
+
+    session_response = RealtimeSessionResponse(
+        session_id=req.session_id,
+        media_session_id=media_session_id,
+        websocket_url=browser_websocket_url,
+        barge_in_capability=session.barge_in_capability,
+    ).model_dump(mode="json")
     session._response_dispatch = None
     session._input_error_dispatch = None
     from services.behavior_events import BehaviorEvent, record_behavior_event
@@ -3347,6 +3584,7 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
     session._event_sink = write_voice_event
     registry.register(req.session_id, session)
     receiver: asyncio.Task[None] | None = None
+    cloud_session_id: str | None = None
     try:
         try:
             async with asyncio.timeout(start_timeout):
@@ -3404,7 +3642,7 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
                 """,
                 req.session_id,
             )
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         try:
             await session.close("error")
         except Exception:
@@ -3414,29 +3652,31 @@ async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
                 receiver.cancel()
                 await asyncio.gather(receiver, return_exceptions=True)
             registry.remove(req.session_id, session)
+            if cloud_session_id is not None and _pool is not None:
+                try:
+                    async with _pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE voice_realtime_sessions SET status='failed', closed_reason='error', closed_at=now(), last_event_at=now() "
+                            "WHERE session_id=$1::uuid AND qwen_session_id=$2 AND status='active'",
+                            req.session_id, cloud_session_id,
+                        )
+                except Exception:
+                    logger.exception("Could not persist the exact failed realtime session terminal state")
         raise
-
-    from services.voice_realtime_transport import RealtimeSessionResponse
-
-    return RealtimeSessionResponse(
-        session_id=req.session_id,
-        media_session_id=media_session_id,
-        websocket_url=_browser_realtime_websocket_url(media_session_id),
-        barge_in_capability=session.barge_in_capability,
-    ).model_dump(mode="json")
+    return session_response
 
 
 @app.websocket("/api/voice/realtime/{media_session_id}")
 async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
     """Exchange explicit local media envelopes for one realtime session."""
 
-    await websocket.accept()
     registry = _voice_realtime_session_registry()
     session = registry.get_by_media_session_id(media_session_id)
     expected_origin = (os.getenv("HEXIS_UI_ORIGIN") or "http://localhost:3477").strip()
     if session is None or websocket.headers.get("origin") != expected_origin:
         await websocket.close(code=1008, reason="realtime session or origin is invalid")
         return
+    await websocket.accept()
 
     from services.voice_realtime_session import VoiceRealtimeSessionError
     from services.voice_realtime_transport import (
@@ -3469,8 +3709,12 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
         "instructions_hash": instructions_hash,
         "barge_in_capability": session.barge_in_capability.model_dump(mode="json"),
     }
-    parse_server_message(ready_message)
-    await websocket.send_json(ready_message)
+    try:
+        parse_server_message(ready_message)
+        await websocket.send_json(ready_message)
+    except (Exception, asyncio.CancelledError):
+        await _close_owned_voice_session(session, "error")
+        raise
 
     close_reason = "manual"
     speech_open = False
@@ -3808,6 +4052,12 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
 
                         for bound_call in pending_voice_calls.values():
                             session.validate_voice_tool_call(bound_call)
+                            if session.session_execution_policy is not None:
+                                tool_output = await _execute_restricted_voice_tool(
+                                    session, bound_call, voice_history,
+                                )
+                                tool_outputs.append((bound_call.actual_call_id, tool_output))
+                                continue
                             voice_turn = session._voice_turns.get(
                                 bound_call.input_turn_id
                             )
@@ -4312,21 +4562,7 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
     except WebSocketDisconnect:
         close_reason = "disconnect"
     finally:
-        await session.close(close_reason)
-        registry.remove(session.session_id, session)
-        if _pool is not None:
-            async with _pool.acquire() as conn:
-                status = "failed" if close_reason == "error" else "closed"
-                await conn.execute(
-                    """
-                    UPDATE voice_realtime_sessions
-                    SET status=$2, closed_reason=$3, closed_at=now(), last_event_at=now()
-                    WHERE session_id=$1::uuid AND status='active'
-                    """,
-                    session.session_id,
-                    status,
-                    close_reason,
-                )
+        await _close_owned_voice_session(session, close_reason)
         try:
             await websocket.close(code=1000, reason="realtime session closed")
         except Exception:
@@ -6071,9 +6307,10 @@ async def init_consent_request(req: InitConsentRequest):
 
 
 def main(argv: list[str] | None = None) -> None:
-    from dotenv import load_dotenv
+    if not os.environ.get("HEXIS_VOICE_BARGE_IN_ENV"):
+        from dotenv import load_dotenv
 
-    load_dotenv()
+        load_dotenv()
 
     parser = argparse.ArgumentParser(description="Hexis API server")
     parser.add_argument(

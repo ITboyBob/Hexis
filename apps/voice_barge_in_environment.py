@@ -16,7 +16,8 @@ import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 from urllib.parse import quote
 from pathlib import Path
 from typing import Any, Sequence
@@ -50,6 +51,109 @@ EXPECTED_SPRINT_USAGE = {
     "S5": ["automation"],
     "S6": ["inspection"],
 }
+M6_SESSION_EXECUTION_POLICY = {
+    "policy_id": "m6-c5-realtime-only-v1",
+    "background_workers": "disabled",
+    "business_tools": "permission_denied",
+    "voice_recall": "permission_denied",
+    "hydration": "database_only_no_recall",
+    "emotion": "permission_denied",
+    "external_requests": "selected_c5_realtime_only",
+    "schema_migrations": "verify_committed_applied_only",
+}
+
+
+def m6_migration_source_manifest(repository_root: Path = REPOSITORY_ROOT) -> dict[str, Any]:
+    """只选择 HEAD 已提交迁移；未授权文件仅记录路径，不读取 SQL。"""
+    result = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", "HEAD", "--", "db/migrations"],
+        cwd=repository_root, capture_output=True, text=True, check=True,
+    )
+    relative_paths = sorted(line for line in result.stdout.splitlines() if line.endswith(".sql"))
+    if not relative_paths:
+        raise ValueError("M6 migration verification requires committed repository migration sources")
+    committed = {}
+    for relative in relative_paths:
+        path = (repository_root / relative).resolve()
+        if (not path.is_relative_to((repository_root / "db/migrations").resolve())
+                or not path.is_file() or not re.fullmatch(r"[0-9]{4}_.+\.sql", path.name)):
+            raise ValueError("committed M6 migration source is missing or invalid")
+        committed[relative] = hashlib.sha256(path.read_text(encoding="utf-8").encode()).hexdigest()
+    excluded = sorted(str(path.relative_to(repository_root)) for path in (repository_root / "db/migrations").glob("*.sql") if str(path.relative_to(repository_root)) not in committed)
+    return {"mode": "committed_applied_only", "committed_files": committed, "excluded_files": excluded}
+
+
+def validate_m6_migration_verification(verification: Any, repository_root: Path = REPOSITORY_ROOT) -> dict[str, Any]:
+    """回读只读 schema 核验事实与已选择源字节，不打开数据库或外来 SQL。"""
+    if not isinstance(verification, dict) or verification.get("status") != "verified_read_only" or verification.get("mode") != "committed_applied_only":
+        raise ValueError("M6 migration provenance must be verified read-only against committed sources")
+    committed = verification.get("committed_files")
+    if not isinstance(committed, dict) or not committed:
+        raise ValueError("M6 migration provenance has no committed source files")
+    for relative, digest in committed.items():
+        if not isinstance(relative, str) or not relative.startswith("db/migrations/"):
+            raise ValueError("M6 migration provenance source path is invalid")
+        path = (repository_root / relative).resolve()
+        if (not path.is_relative_to((repository_root / "db/migrations").resolve()) or not path.is_file()
+                or hashlib.sha256(path.read_text(encoding="utf-8").encode()).hexdigest() != digest):
+            raise ValueError("M6 committed migration source changed after read-only verification")
+    excluded = sorted(str(path.relative_to(repository_root)) for path in (repository_root / "db/migrations").glob("*.sql") if str(path.relative_to(repository_root)) not in committed)
+    if (verification.get("excluded_files") != excluded or verification.get("ledger_count") != len(committed)
+            or verification.get("ledger_latest_version") != max(Path(relative).stem for relative in committed)
+            or verification.get("ledger_table") not in {"public.schema_migrations", "ag_catalog.schema_migrations"}):
+        raise ValueError("M6 migration ledger/source identity or excluded-file inventory is inconsistent")
+    return verification
+
+
+def session_execution_policy(profile: dict[str, Any]) -> dict[str, str]:
+    """拒绝缺失或放宽的验收执行策略；只返回明确选择的 C6 策略。"""
+    policy = profile.get("session_execution_policy")
+    if policy != M6_SESSION_EXECUTION_POLICY:
+        raise ValueError("C6 session_execution_policy must select m6-c5-realtime-only-v1 without widened permissions")
+    return dict(policy)
+
+
+def selected_ui_origin(profile: dict[str, Any], requested_origin: str | None = None) -> str:
+    """UI origin 来自 C6，或本次 owned API 的明确端口选择。"""
+    parsed = urlparse(requested_origin if requested_origin is not None else profile["ui_url"])
+    if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}
+            or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or requested_origin is not None and parsed.path not in {"", "/"}):
+        raise ValueError("selected UI origin must be an explicit local HTTP origin without credentials or a path")
+    port = parsed.port or 80
+    _validate_port(port)
+    authority = parsed.hostname if port == 80 else f"{parsed.hostname}:{port}"
+    return f"{parsed.scheme}://{authority}"
+
+
+def selected_api_url(profile: dict[str, Any], requested_port: int | None = None) -> str:
+    """保持 C6 的 loopback 主机，只允许本次启动明确选择不同端口。"""
+    parsed = urlparse(profile["api_url"])
+    if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}
+            or parsed.username or parsed.password or parsed.path not in {"", "/"}
+            or parsed.query or parsed.fragment):
+        raise ValueError("selected API endpoint must be a local HTTP origin without credentials or a path")
+    port = (parsed.port or 80) if requested_port is None else requested_port
+    if type(port) is not int:
+        raise ValueError("selected API port must be an integer")
+    _validate_port(port)
+    authority = parsed.hostname if port == 80 else f"{parsed.hostname}:{port}"
+    return f"http://{authority}"
+
+
+def validate_api_start_endpoint(profile: dict[str, Any], start_record: dict[str, Any]) -> str:
+    """UI、probe 与 API 策略共同核验 owned startup 的端口选择。"""
+    source = start_record.get("api_url_source", "C6_api_url")
+    endpoint = start_record.get("endpoints", {})
+    if source not in {"C6_api_url", "start_api_cli"}:
+        raise ValueError("selected API endpoint has no recognized startup selection source")
+    selected = selected_api_url(profile, endpoint.get("api_port") if source == "start_api_cli" else None)
+    parsed = urlparse(selected)
+    if (start_record.get("browser_api_url") != selected
+            or endpoint.get("api_host") != "127.0.0.1"
+            or endpoint.get("api_port") != (parsed.port or 80)):
+        raise ValueError("selected API endpoint does not match its explicit startup selection")
+    return selected
 
 
 def cache_root_default(environment: dict[str, str] | None = None) -> Path:
@@ -115,6 +219,7 @@ def validate_profile(profile: Any) -> dict[str, Any]:
         raise ValueError("legacy database_url_env is not supported in schema_version 2")
     if profile.get("path_base") != "repository_root":
         raise ValueError("run profile path_base must be repository_root")
+    session_execution_policy(profile)
     if profile.get("database") != {
         "pytest_service": "pytest-db",
         "talk_service": "talk-db",
@@ -237,6 +342,116 @@ def build_worker_environment(parent_environment: dict[str, str], *, port: int) -
         "NEXT_TELEMETRY_DISABLED": "1",
     })
     return worker_environment
+
+
+def build_api_environment(
+    parent_environment: dict[str, str], *, provider_key_name: str | None = None
+) -> dict[str, str]:
+    """仅允许本地运行设置与选定数据库凭据进入 M6 API。"""
+    missing_credentials = [
+        name for name in ("POSTGRES_USER", "POSTGRES_PASSWORD")
+        if not parent_environment.get(name)
+    ]
+    if missing_credentials:
+        raise ValueError(
+            "selected clone database credential environment variables must be present before API startup: "
+            + ", ".join(missing_credentials)
+        )
+    allowed_settings = {
+        "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "LC_CTYPE",
+        "TZ", "TERM", "NO_COLOR", "VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH",
+        "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX",
+        "PYTHONIOENCODING", "PYTHONUTF8", "PYTHONHASHSEED", "XDG_CACHE_HOME",
+        "POSTGRES_USER", "POSTGRES_PASSWORD",
+    }
+    result = {
+        key: value
+        for key, value in parent_environment.items()
+        if key in allowed_settings
+    }
+    if provider_key_name:
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", provider_key_name):
+            raise ValueError("selected provider credential must be an explicit environment variable name")
+        provider_key = parent_environment.get(provider_key_name)
+        if not provider_key:
+            raise ValueError(f"selected provider credential environment variable is not present: {provider_key_name}")
+        result[provider_key_name] = provider_key
+    return result
+
+
+def validate_selected_provider_key_env(
+    profile: dict[str, Any], requested_name: str | None, parent_environment: dict[str, str]
+) -> str | None:
+    if requested_name is None:
+        return None
+    config_path = (REPOSITORY_ROOT / profile["realtime_config"]).resolve()
+    if not config_path.is_relative_to(REPOSITORY_ROOT) or not config_path.is_file():
+        raise ValueError(f"selected realtime configuration is missing: {profile['realtime_config']}")
+    try:
+        realtime = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("selected realtime configuration is invalid JSON") from exc
+    configured_name = realtime.get("api_key_env") if isinstance(realtime, dict) else None
+    if requested_name != configured_name:
+        raise ValueError("provider key environment name must exactly match C5 api_key_env")
+    if not parent_environment.get(requested_name):
+        raise ValueError(f"selected provider credential environment variable is not present: {requested_name}")
+    return requested_name
+
+
+def build_talk_ui_environment(
+    parent_environment: dict[str, str],
+    *,
+    environment_id: str,
+    environment_record_path: Path,
+    environment_record: dict[str, Any],
+    profile: dict[str, Any],
+    port: int,
+    dist_dir: str,
+    api_start: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """Build a Talk UI environment bound only to the selected E1 clone and API."""
+    validate_environment_id(environment_id)
+    _validate_port(port)
+    if environment_record.get("env_id") != environment_id:
+        raise ValueError("selected E1 environment identity does not match the Talk UI")
+    identity = environment_record.get("db_identity", {}).get("talk")
+    owned = environment_record.get("owned_resources", {})
+    if not identity or identity.get("database") != owned.get("talk_database"):
+        raise ValueError("selected E1 talk database identity is missing or mismatched")
+    if int(identity.get("host_port", 0)) != int(owned.get("talk_host_port", -1)):
+        raise ValueError("selected E1 talk host port does not match its live identity")
+    username = parent_environment.get("POSTGRES_USER")
+    password = parent_environment.get("POSTGRES_PASSWORD")
+    if not username or not password:
+        raise ValueError("POSTGRES_USER and POSTGRES_PASSWORD for the selected clone are required")
+    relative_dist = Path(dist_dir)
+    if relative_dist.is_absolute() or ".." in relative_dist.parts or not relative_dist.parts or relative_dist.parts[0] != ".next":
+        raise ValueError("Talk UI dist directory must be a selected child of .next")
+    api_url = validate_api_start_endpoint(profile, api_start) if api_start is not None else selected_api_url(profile)
+    database_url = (
+        f"postgresql://{quote(username, safe='')}:{quote(password, safe='')}"
+        f"@127.0.0.1:{int(owned['talk_host_port'])}/{quote(str(identity['database']), safe='')}"
+    )
+    safe_settings = {
+        "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "LC_CTYPE",
+        "TZ", "TERM", "NO_COLOR", "XDG_CACHE_HOME",
+    }
+    result = {key: value for key, value in parent_environment.items() if key in safe_settings}
+    result.update({
+        "NODE_ENV": "development",
+        "HEXIS_UI_TEST_TARGET": "talk",
+        "HEXIS_UI_DIST_DIR": relative_dist.as_posix(),
+        "HEXIS_VOICE_BARGE_IN_ENV": str(environment_record_path.resolve()),
+        "HEXIS_DATABASE_URL": database_url,
+        "DATABASE_URL": database_url,
+        "HEXIS_API_URL": api_url,
+        "HEXIS_BROWSER_API_URL": api_url.rstrip("/"),
+        "HEXIS_UI_ORIGIN": selected_ui_origin(profile, f"{urlparse(profile['ui_url']).scheme}://{urlparse(profile['ui_url']).hostname}:{port}"),
+        "PORT": str(port),
+        "NEXT_TELEMETRY_DISABLED": "1",
+    })
+    return result
 
 
 def load_owned_environment_record(record_path: Path | str) -> tuple[Path, dict[str, Any]]:
@@ -688,12 +903,151 @@ def _read_environment_record(cache_root: Path, environment_id: str) -> tuple[Pat
         record = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read selected E1 environment record {path}: {exc}") from exc
-    if record.get("env_id") != environment_id or record.get("status") not in {"prepared", "partially_verified", "ready"}:
+    if not isinstance(record, dict) or record.get("env_id") != environment_id or record.get("status") not in {"prepared", "partially_verified", "ready"}:
         raise ValueError("selected E1 record does not identify a prepared environment")
     owned = record.get("owned_resources", {})
-    if owned.get("project_name") != derive_project_name(environment_id):
+    if not isinstance(owned, dict) or owned.get("project_name") != derive_project_name(environment_id):
         raise ValueError("selected E1 project identity does not match env-id")
     return path, record
+
+
+def _assert_rebind_runtime_inactive(cache_root: Path, environment_id: str, record: dict[str, Any]) -> None:
+    """查真实本地进程与带 owned 标签的容器，不查询数据库。"""
+    terminal = {"stopped", "already_exited", "exited_before_health", "start_failed"}
+    runtime_records = []
+    api_process = record.get("owned_resources", {}).get("api_process")
+    if api_process:
+        if not isinstance(api_process, dict):
+            raise ValueError("E1 owned API process identity is invalid")
+        runtime_records.append(("API", api_process, api_process))
+    for path in sorted((cache_root / "voice-barge-in/ui-runs").glob("*.json")):
+        try:
+            ui = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"cannot verify owned UI runtime record: {path.name}") from exc
+        if not isinstance(ui, dict):
+            raise ValueError(f"owned UI runtime record is not a JSON object: {path.name}")
+        if ui.get("env_id") == environment_id and ui.get("kind") in {"worker_ui_run", "talk_ui_run"}:
+            runtime_records.append((ui["kind"], ui, ui.get("process", {})))
+    for label, lifecycle, process in runtime_records:
+        if not isinstance(process, dict):
+            raise ValueError(f"owned {label} process identity is invalid")
+        if lifecycle.get("status") not in terminal:
+            missing_container_handle = (
+                label == "worker_ui_run" and lifecycle.get("target") == "standalone"
+                and lifecycle.get("status") == "start_failed_resource_left_for_explicit_recovery"
+                and not (lifecycle.get("container") or {}).get("id")
+            )
+            if not missing_container_handle:
+                raise RuntimeError(f"owned {label} must be explicitly stopped before profile rebinding")
+            run_id = lifecycle.get("run_id")
+            if not isinstance(run_id, str) or not run_id.strip():
+                raise ValueError("failed standalone Worker record has no explicit run-id for recovery verification")
+            matches = _run([
+                "docker", "ps", "-a", "--filter", f"label=com.hexis.voice-barge-in.env-id={environment_id}",
+                "--filter", f"label=com.hexis.voice-barge-in.run-id={run_id}",
+                "--filter", "label=com.hexis.voice-barge-in.mode=worker", "--format", "{{.ID}}",
+            ]).stdout.strip()
+            if matches:
+                raise RuntimeError("failed standalone Worker still has a matching owned container; explicit recovery is required")
+            # 真实 Docker 查询已证明该 env/run 的句柄不存在；保留旧 W1 状态。
+        pid = process.get("pid")
+        group_id = process.get("process_group_id")
+        if pid is not None:
+            if type(pid) is not int or pid <= 0 or group_id != pid:
+                raise ValueError(f"owned {label} process identity is invalid")
+            try:
+                os.killpg(group_id, 0)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                raise RuntimeError(f"cannot prove owned {label} process group is inactive") from exc
+            else:
+                raise RuntimeError(f"owned {label} process group is still live; profile rebinding is blocked")
+    running = _run([
+        "docker", "ps", "--filter", f"label=com.hexis.voice-barge-in.env-id={environment_id}",
+        "--filter", "label=com.hexis.voice-barge-in.mode=worker", "--format", "{{.ID}}",
+    ]).stdout.strip()
+    if running:
+        raise RuntimeError("owned Worker container is still running; profile rebinding is blocked")
+
+
+def _rebind_profile(args: argparse.Namespace) -> None:
+    """显式重绑停机 E1 的 C6 指纹，保留克隆身份与每次绑定历史。"""
+    from apps.voice_barge_in_probe import build_environment_preflight
+
+    environment_id = validate_environment_id(args.env_id)
+    record_path, record = _read_environment_record(args.cache_root, environment_id)
+    original_bytes = record_path.read_bytes()
+    if record.get("status") != "ready":
+        raise ValueError("profile rebinding requires an E1 ready environment")
+    if args.profile.resolve() != PROFILE_DEFAULT.resolve():
+        raise ValueError("profile rebinding must select the current repository C6 profile")
+    for name in ("expected_profile_fingerprint", "expected_clone_fingerprint"):
+        if not re.fullmatch(r"[a-f0-9]{64}", str(getattr(args, name, ""))):
+            raise ValueError(f"{name} must be an explicit SHA-256 fingerprint")
+    profile = load_profile(args.profile)
+    current_fingerprint = hashlib.sha256(json.dumps(profile, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    previous_fingerprint = record.get("profile_fingerprint")
+    history = record.get("profile_binding_history", [])
+    if not isinstance(history, list) or any(not isinstance(entry, dict) for entry in history):
+        raise ValueError("E1 profile binding history is invalid")
+    repeated = previous_fingerprint == current_fingerprint
+    if previous_fingerprint != args.expected_profile_fingerprint:
+        if not (repeated and history and history[-1].get("old_profile_fingerprint") == args.expected_profile_fingerprint
+                and history[-1].get("new_profile_fingerprint") == current_fingerprint
+                and history[-1].get("clone_data_fingerprint") == args.expected_clone_fingerprint):
+            raise ValueError("E1 prior profile binding does not match the explicitly selected fingerprint")
+    clone = record.get("source_clone", {})
+    if not isinstance(clone, dict):
+        raise ValueError("E1 clone identity is not a JSON object")
+    if (clone.get("source_data_fingerprint") != args.expected_clone_fingerprint
+            or clone.get("target_data_fingerprint") != args.expected_clone_fingerprint
+            or clone.get("agent_status_fingerprint") != clone.get("source_agent_status_fingerprint")
+            or not re.fullmatch(r"[a-f0-9]{64}", str(clone.get("agent_status_fingerprint", "")))
+            or clone.get("source_agent_configured") is not True
+            or clone.get("source_agent_terminated") is not False
+            or clone.get("source_consent_valid") is not True):
+        raise ValueError("E1 clone data/agent identity or consent does not match the selected verified clone")
+    previous_entry = None
+    for entry in history:
+        if (not all(re.fullmatch(r"[a-f0-9]{64}", str(entry.get(key, "")))
+                    for key in ("old_profile_fingerprint", "new_profile_fingerprint"))
+                or entry.get("old_profile_fingerprint") == entry.get("new_profile_fingerprint")
+                or entry.get("clone_data_fingerprint") != args.expected_clone_fingerprint
+                or entry.get("agent_status_fingerprint") != clone["agent_status_fingerprint"]
+                or entry.get("profile_path") != str(args.profile.resolve())
+                or (previous_entry and previous_entry["new_profile_fingerprint"] != entry["old_profile_fingerprint"])):
+            raise ValueError("E1 profile binding history does not preserve the selected clone/binding chain")
+        try:
+            timestamp = datetime.fromisoformat(entry["rebound_at_utc"])
+            if timestamp.tzinfo is None:
+                raise ValueError("missing timezone")
+        except (KeyError, ValueError, TypeError) as exc:
+            raise ValueError("E1 profile binding history timestamp is invalid") from exc
+        previous_entry = entry
+    if history and history[-1].get("new_profile_fingerprint") != previous_fingerprint:
+        raise ValueError("E1 current profile binding does not match its history")
+    # 使用同一严格 preflight 核验克隆状态、双 DB 身份、仓库和配置；
+    # 这里只给内存候选换指纹，未触及缓存或数据库。
+    candidate = dict(record, profile_fingerprint=current_fingerprint)
+    build_environment_preflight(profile, candidate, repository_root=REPOSITORY_ROOT)
+    _assert_rebind_runtime_inactive(args.cache_root, environment_id, record)
+    if record_path.read_bytes() != original_bytes:
+        raise RuntimeError("E1 changed during profile rebinding; repeat the explicit preflight")
+    if repeated:
+        print(f"E1 {environment_id} already binds the selected C6 profile; no JSON change")
+        return
+    candidate["profile_binding_history"] = history + [{
+        "old_profile_fingerprint": previous_fingerprint,
+        "new_profile_fingerprint": current_fingerprint,
+        "clone_data_fingerprint": args.expected_clone_fingerprint,
+        "agent_status_fingerprint": clone["agent_status_fingerprint"],
+        "profile_path": str(args.profile.resolve()),
+        "rebound_at_utc": datetime.now(timezone.utc).isoformat(),
+    }]
+    _atomic_json_write(record_path, candidate)
+    print(f"Rebound only E1 {environment_id} C6 profile fingerprint; clone identity and credentials unchanged")
 
 
 def _compose_environment(environment_id: str, record: dict[str, Any], base: dict[str, str] | None = None) -> dict[str, str]:
@@ -830,12 +1184,16 @@ def _prepare_db(args: argparse.Namespace) -> None:
         raise
     record["source_clone"].update({
         "status": "verified",
+        "recovery_verification": "full_table_content_hash",
         "target_size_bytes": target_identity["size_bytes"],
         "target_migration_count": target_identity["migration_count"],
         "target_extensions": target_identity["extensions"],
         "table_count": target_identity["table_count"],
         "row_count_fingerprint": target_identity["row_count_fingerprint"],
         "source_row_count_fingerprint": target_identity["source_row_count_fingerprint"],
+        "source_data_fingerprint": target_identity["source_data_fingerprint"],
+        "target_data_fingerprint": target_identity["target_data_fingerprint"],
+        "data_fingerprint_bytes": target_identity["data_fingerprint_bytes"],
         "agent_status_fingerprint": target_identity["agent_status_fingerprint"],
         "agent_status_matches": target_identity["agent_status_matches"],
     })
@@ -961,11 +1319,14 @@ def _start_api(args: argparse.Namespace) -> None:
     if os.environ.get("HEXIS_M5_ACCEPTANCE_RUN"):
         raise ValueError("HEXIS_M5_ACCEPTANCE_RUN conflicts with the selected M6 clone environment")
     profile = load_profile(args.profile)
-    api_url = urlparse(profile["api_url"])
-    if api_url.hostname not in {"127.0.0.1", "localhost"}:
-        raise ValueError("M6 API startup must bind to a local loopback address")
+    provider_key_name = validate_selected_provider_key_env(
+        profile, getattr(args, "provider_key_env", None), dict(os.environ)
+    )
+    ui_origin = selected_ui_origin(profile, getattr(args, "ui_origin", None))
+    browser_api_url = selected_api_url(profile, getattr(args, "api_port", None))
+    api_url = urlparse(browser_api_url)
     listen_host = "127.0.0.1"
-    listen_port = api_url.port or 43817
+    listen_port = api_url.port or 80
     _assert_port_available(listen_port)
     record_path = args.output_start_record.resolve()
     api_runs = (args.cache_root / "voice-barge-in" / "api-runs").resolve()
@@ -973,13 +1334,22 @@ def _start_api(args: argparse.Namespace) -> None:
         raise ValueError("API start record must be inside the selected cache root's api-runs directory")
     if record_path.exists():
         raise FileExistsError(f"refusing to overwrite API start record: {record_path}")
-    env = _compose_environment(environment_id, record)
+    env = _compose_environment(
+        environment_id, record,
+        base=build_api_environment(dict(os.environ), provider_key_name=provider_key_name),
+    )
     env.update({
         "HEXIS_VOICE_BARGE_IN_ENV": str(environment_record_path),
         "HEXIS_VOICE_BARGE_IN_API_START_RECORD": str(record_path),
         "HEXIS_VOICE_BARGE_IN_LISTEN_HOST": listen_host,
         "HEXIS_VOICE_BARGE_IN_LISTEN_PORT": str(listen_port),
+        "HEXIS_BROWSER_API_URL": browser_api_url,
+        "HEXIS_VOICE_BARGE_IN_API_URL_SOURCE": "start_api_cli" if getattr(args, "api_port", None) is not None else "C6_api_url",
+        "HEXIS_UI_ORIGIN": ui_origin,
+        "HEXIS_VOICE_BARGE_IN_UI_ORIGIN_SOURCE": "start_api_cli" if getattr(args, "ui_origin", None) is not None else "C6_ui_url",
     })
+    if provider_key_name:
+        env["HEXIS_VOICE_BARGE_IN_PROVIDER_KEY_ENV"] = provider_key_name
     log_path = record_path.with_suffix(".log")
     if log_path.exists():
         raise FileExistsError(f"refusing to overwrite API log: {log_path}")
@@ -1026,13 +1396,28 @@ def _start_api(args: argparse.Namespace) -> None:
                     raise RuntimeError("API start record does not match the selected E1 environment")
                 if identity.get("start_id") != start_record["start_id"]:
                     raise RuntimeError("API health start identity does not match api-start.json")
+                if (identity.get("session_execution_policy") != session_execution_policy(profile)
+                        or start_record.get("session_execution_policy") != session_execution_policy(profile)):
+                    raise RuntimeError("API health/start execution policy does not match restricted C6")
+                if identity.get("migration_verification") != start_record.get("migration_verification"):
+                    raise RuntimeError("API health/start read-only migration verification does not match")
+                validate_m6_migration_verification(start_record.get("migration_verification"))
+                if validate_api_start_endpoint(profile, start_record) != browser_api_url:
+                    raise RuntimeError("API startup endpoint does not match the explicit owned launch selection")
+                if start_record.get("api_url_source", "C6_api_url") != env["HEXIS_VOICE_BARGE_IN_API_URL_SOURCE"]:
+                    raise RuntimeError("API startup endpoint selection source does not match its explicit launch")
+                if (start_record.get("browser_api_url") != browser_api_url
+                        or identity.get("browser_api_url") != start_record["browser_api_url"]):
+                    raise RuntimeError("API browser-reachable URL does not match selected C6")
+                if start_record.get("ui_origin") != ui_origin or identity.get("ui_origin") != ui_origin:
+                    raise RuntimeError("API UI origin does not match the explicit owned launch selection")
                 record["owned_resources"]["api_process"].update({
                     "status": "healthy",
                     "start_id": start_record["start_id"],
-                    "api_url": profile["api_url"],
+                    "api_url": browser_api_url,
                 })
                 _atomic_json_write(environment_record_path, record)
-                print(f"M6 API healthy for {environment_id} at {profile['api_url']}; pid={process.pid}; record={record_path}")
+                print(f"M6 API healthy for {environment_id} at {browser_api_url}; pid={process.pid}; record={record_path}")
                 return
         except (OSError, ValueError, json.JSONDecodeError):
             pass
@@ -1103,6 +1488,27 @@ def _worker_ui_fingerprints() -> dict[str, str]:
         "hexis-ui/app/voice-vad-test/page.tsx",
         "hexis-ui/app/voice-vad-test/worker-harness.tsx",
         "hexis-ui/e2e/voice-vad-worker.spec.ts",
+    )
+    return _fingerprints(REPOSITORY_ROOT, paths)
+
+
+def _talk_ui_fingerprints() -> dict[str, str]:
+    paths = (
+        "hexis-ui/package.json",
+        "hexis-ui/package-lock.json",
+        "hexis-ui/next.config.ts",
+        "hexis-ui/app/layout.tsx",
+        "hexis-ui/app/chat/talk-mode.tsx",
+        "hexis-ui/lib/prisma.ts",
+        "hexis-ui/lib/voice-realtime/client.ts",
+        "hexis-ui/lib/voice-realtime/capture.ts",
+        "hexis-ui/lib/voice-realtime/speech-detection-config.json",
+        "hexis-ui/lib/voice-realtime/vad-assets-manifest.json",
+        "hexis-ui/lib/voice-playback/native-player.ts",
+        "hexis-ui/app/api/voice-barge-in/runtime-identity/route.ts",
+        "config/voice-barge-in/run-profile.json",
+        "config/voice-barge-in/playback-coordination.json",
+        "config/voice-barge-in/audio-cases.json",
     )
     return _fingerprints(REPOSITORY_ROOT, paths)
 
@@ -1252,6 +1658,253 @@ def _start_worker_ui(args: argparse.Namespace) -> None:
         raise
 
 
+def _selected_api_start_identity(record: dict[str, Any], profile: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+    process = record.get("owned_resources", {}).get("api_process", {})
+    if process.get("status") != "healthy":
+        raise ValueError("selected M6 API is not healthy at the URL in the selected profile")
+    start_path_value = process.get("start_record_path")
+    if not start_path_value:
+        raise ValueError("selected M6 API has no owned api-start record")
+    start_path = Path(start_path_value).expanduser().resolve()
+    expected_root = Path(record["repository_root"]).resolve()
+    try:
+        start_record = json.loads(start_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read selected API start record: {exc}") from exc
+    if start_record.get("environment_id") != record.get("env_id") or start_record.get("start_id") != process.get("start_id"):
+        raise ValueError("selected API start record does not match the E1 owned process")
+    if start_record.get("session_execution_policy") != session_execution_policy(profile):
+        raise ValueError("selected API start execution policy does not match restricted C6")
+    api_url = validate_api_start_endpoint(profile, start_record)
+    if process.get("api_url", "").rstrip("/") != api_url:
+        raise ValueError("selected API process URL does not match its startup endpoint")
+    if (selected_ui_origin(profile, start_record.get("ui_origin")) != start_record.get("ui_origin")
+            or start_record.get("ui_origin_source") not in {"C6_ui_url", "start_api_cli"}):
+        raise ValueError("selected API has no verified owned UI origin selection")
+    validate_m6_migration_verification(start_record.get("migration_verification"), expected_root)
+    if Path(start_record.get("source", {}).get("repository_root", "")).resolve() != expected_root:
+        raise ValueError("selected API start record points to a different source checkout")
+    return start_path, start_record
+
+
+def _register_selected_acceptance_session(profile: dict[str, Any], api_start: dict[str, Any]) -> dict[str, Any]:
+    """owned runner 显式注册本次服务器生成的验收会话，只访问所选本地 API。"""
+    request = Request(validate_api_start_endpoint(profile, api_start) + "/api/voice-barge-in/chat-session", method="POST")
+    with urlopen(request, timeout=5) as response:
+        registration = json.loads(response.read())
+    if (registration.get("session_id") != api_start.get("acceptance_session_id")
+            or registration.get("api_start_id") != api_start.get("start_id")
+            or registration.get("session_execution_policy") != session_execution_policy(profile)):
+        raise ValueError("M6 acceptance session registration does not match selected API/C6")
+    return registration
+
+
+def _read_talk_runtime_identity(url: str) -> dict[str, Any]:
+    try:
+        with urlopen(url, timeout=5) as response:
+            value = json.loads(response.read())
+    except HTTPError as exc:
+        if exc.code == 409:
+            raise RuntimeError("Talk UI runtime identity returned a database/upstream mismatch") from exc
+        if exc.code == 404:
+            raise RuntimeError("Talk UI runtime identity endpoint is missing") from exc
+        raise URLError(f"Talk UI runtime identity is not ready (HTTP {exc.code})") from exc
+    if not isinstance(value, dict):
+        raise ValueError("Talk UI runtime identity did not return a JSON object")
+    return value
+
+
+def _wait_for_talk_runtime_identity(
+    url: str,
+    *,
+    process: subprocess.Popen[Any],
+    environment_id: str,
+    database: str,
+    database_host_port: int,
+    database_server_port: int,
+    api_host: str,
+    api_port: int,
+    timeout_seconds: float = 90,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    last_error = "no response"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"Talk UI process exited before runtime identity was verified (exit {process.returncode})")
+        try:
+            identity = _read_talk_runtime_identity(url)
+            db_identity = identity.get("database", {})
+            api_identity = identity.get("api", {})
+            if (
+                identity.get("env_id") != environment_id
+                or db_identity.get("database") != database
+                or int(db_identity.get("server_port", 0)) != database_server_port
+                or int(db_identity.get("url_port", 0)) != database_host_port
+                or db_identity.get("url_source") != "HEXIS_DATABASE_URL"
+                or api_identity.get("status") != "ok"
+                or api_identity.get("checks", {}).get("db") is not True
+                or api_identity.get("url_host") != api_host
+                or int(api_identity.get("url_port", 0)) != api_port
+            ):
+                raise RuntimeError("Talk UI runtime identity does not match selected E1/API identities")
+            return identity
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+        time.sleep(0.25)
+    raise RuntimeError(f"Talk UI identity did not become ready within {timeout_seconds:g}s ({last_error})")
+
+
+def _start_talk_ui(args: argparse.Namespace) -> None:
+    environment_id = validate_environment_id(args.env_id)
+    _, record = _read_environment_record(args.cache_root, environment_id)
+    if record.get("status") != "ready" or not record.get("source_clone", {}).get("agent_status_matches"):
+        raise ValueError("the isolated source clone and both database scopes must be verified before Talk UI startup")
+    profile = load_profile(args.profile)
+    _, api_start = _selected_api_start_identity(record, profile)
+    public_url = urlparse(profile["ui_url"])
+    if public_url.scheme != "http" or public_url.hostname != "127.0.0.1":
+        raise ValueError("Talk UI must use the explicitly selected loopback profile URL")
+    port = args.port if args.port is not None else (public_url.port or 3477)
+    actual_ui_origin = selected_ui_origin(profile, f"{public_url.scheme}://{public_url.hostname}:{port}")
+    if api_start.get("ui_origin") != actual_ui_origin:
+        raise ValueError("selected API UI origin does not match this actual Talk UI port; restart API with the matching --ui-origin before continuing")
+    registration = _register_selected_acceptance_session(profile, api_start)
+    browser_api_url = validate_api_start_endpoint(profile, api_start)
+    api_url = urlparse(browser_api_url)
+    health_url = f"{browser_api_url}/health"
+    with urlopen(health_url, timeout=5) as response:
+        health = json.loads(response.read())
+    expected_api_identity = health.get("voice_barge_in") or {}
+    if (
+        health.get("status") != "ok"
+        or health.get("checks", {}).get("db") is not True
+        or expected_api_identity.get("environment_id") != environment_id
+        or expected_api_identity.get("database") != record["owned_resources"]["talk_database"]
+        or expected_api_identity.get("start_id") != api_start["start_id"]
+        or expected_api_identity.get("session_execution_policy") != session_execution_policy(profile)
+        or expected_api_identity.get("acceptance_session_id") != registration["session_id"]
+        or expected_api_identity.get("acceptance_session_registered") is not True
+        or expected_api_identity.get("migration_verification") != api_start["migration_verification"]
+        or expected_api_identity.get("browser_api_url") != browser_api_url
+        or expected_api_identity.get("ui_origin") != actual_ui_origin
+    ):
+        raise ValueError("selected API health does not match the owned E1 and api-start identities")
+
+    _assert_port_available(port)
+    output_record = args.output_record.resolve()
+    ui_runs_root = (args.cache_root / "voice-barge-in" / "ui-runs").resolve()
+    if not output_record.is_relative_to(ui_runs_root) or output_record == ui_runs_root:
+        raise ValueError("U1 output must be inside the selected cache root's ui-runs directory")
+    if not output_record.name.endswith("-talk.json"):
+        raise ValueError("Talk UI output record filename must end in -talk.json")
+    if output_record.exists():
+        raise FileExistsError(f"refusing to overwrite existing UI run record: {output_record}")
+    run_id = output_record.stem
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", run_id):
+        raise ValueError("Talk UI run id derived from output filename contains unsupported characters")
+    log_path = output_record.with_suffix(".log")
+    if log_path.exists():
+        raise FileExistsError(f"refusing to overwrite existing Talk UI log: {log_path}")
+    dist_dir = f".next/voice-barge-in-{hashlib.sha256(run_id.encode()).hexdigest()[:12]}"
+    ui_environment = build_talk_ui_environment(
+        os.environ.copy(),
+        environment_id=environment_id,
+        environment_record_path=_environment_record_path(args.cache_root, environment_id),
+        environment_record=record,
+        profile=profile,
+        port=port,
+        dist_dir=dist_dir,
+        api_start=api_start,
+    )
+    fingerprints = _talk_ui_fingerprints()
+    build_fingerprint = hashlib.sha256(
+        json.dumps({"source_fingerprints": fingerprints, "target": "talk-dev", "api_start_id": api_start["start_id"]}, sort_keys=True).encode()
+    ).hexdigest()
+    run_record: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "talk_ui_run",
+        "run_id": run_id,
+        "env_id": environment_id,
+        "mode": "talk",
+        "target": "dev",
+        "ui_port": port,
+        "ui_url": f"http://127.0.0.1:{port}/chat",
+        "browser_api_url": browser_api_url,
+        "ui_origin": actual_ui_origin,
+        "runtime_flag": "HEXIS_UI_TEST_TARGET=talk",
+        "source_root": str(REPOSITORY_ROOT),
+        "source_head": _run(["git", "rev-parse", "HEAD"]).stdout.strip(),
+        "source_fingerprints": fingerprints,
+        "build_fingerprint": build_fingerprint,
+        "api_start_id": api_start["start_id"],
+        "session_execution_policy": session_execution_policy(profile),
+        "migration_verification": api_start["migration_verification"],
+        "acceptance_session_id": registration["session_id"],
+        "api_start_record": str(_selected_api_start_identity(record, profile)[0]),
+        "credential_env_names": ["POSTGRES_USER", "POSTGRES_PASSWORD", "HEXIS_DATABASE_URL", "DATABASE_URL"],
+        "network_services": [
+            {"kind": "isolated_talk_database", "database": record["owned_resources"]["talk_database"], "port": record["owned_resources"]["talk_host_port"]},
+            {"kind": "selected_local_api", "host": api_url.hostname, "port": api_url.port or 80},
+        ],
+        "status": "starting",
+        "log_path": str(log_path),
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "dist_dir": dist_dir,
+    }
+    _atomic_json_write(output_record, run_record, refuse_existing=True)
+    process: subprocess.Popen[Any] | None = None
+    try:
+        log_descriptor = os.open(log_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(log_descriptor, "wb") as log_stream:
+            process = subprocess.Popen(
+                [str(REPOSITORY_ROOT / "hexis-ui/node_modules/.bin/next"), "dev", "--hostname", "127.0.0.1", "--port", str(port)],
+                cwd=REPOSITORY_ROOT / "hexis-ui",
+                env=ui_environment,
+                stdin=subprocess.DEVNULL,
+                stdout=log_stream,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        run_record["process"] = {"pid": process.pid, "process_group_id": process.pid}
+        _atomic_json_write(output_record, run_record)
+        _wait_for_worker_page(run_record["ui_url"], process=process, container_id=None)
+        identity_url = f"http://127.0.0.1:{port}/api/voice-barge-in/runtime-identity"
+        runtime_identity = _wait_for_talk_runtime_identity(
+            identity_url,
+            process=process,
+            environment_id=environment_id,
+            database=record["owned_resources"]["talk_database"],
+            database_host_port=record["owned_resources"]["talk_host_port"],
+            database_server_port=record["db_identity"]["talk"]["server_port"],
+            api_host=api_url.hostname or "",
+            api_port=api_url.port or 80,
+        )
+        actual_api = runtime_identity.get("api", {})
+        if (actual_api.get("session_execution_policy") != session_execution_policy(profile)
+                or actual_api.get("acceptance_session_id") != registration["session_id"]
+                or actual_api.get("acceptance_session_registered") is not True
+                or actual_api.get("start_id") != api_start["start_id"]):
+            raise ValueError("Talk UI live acceptance session/policy does not match selected API/C6")
+        if actual_api.get("migration_verification") != api_start["migration_verification"]:
+            raise ValueError("Talk UI live migration provenance does not match selected API")
+        if (runtime_identity.get("browser_api_url") != browser_api_url
+                or actual_api.get("browser_api_url") != browser_api_url):
+            raise ValueError("Talk UI live browser URL does not match selected C6")
+        if runtime_identity.get("ui_origin") != actual_ui_origin or actual_api.get("ui_origin") != actual_ui_origin:
+            raise ValueError("Talk UI live origin does not match the owned API origin selection")
+        run_record["runtime_identity"] = runtime_identity
+        run_record["status"] = "ready"
+        run_record["ready_at_utc"] = datetime.now(timezone.utc).isoformat()
+        _atomic_json_write(output_record, run_record)
+        print(f"Talk UI identity verified for {environment_id} at {run_record['ui_url']}; U1: {output_record}")
+    except Exception:
+        run_record["status"] = "identity_failed_process_left_for_explicit_recovery" if process else "start_failed"
+        _atomic_json_write(output_record, run_record)
+        raise
+
+
 def _stop_worker_ui(args: argparse.Namespace) -> None:
     environment_id = validate_environment_id(args.env_id)
     run_path = args.run_record.resolve()
@@ -1320,6 +1973,61 @@ def _stop_worker_ui(args: argparse.Namespace) -> None:
     print(f"Stopped only the Worker UI owned by W1 run {record['run_id']}")
 
 
+def _stop_talk_ui(args: argparse.Namespace) -> None:
+    environment_id = validate_environment_id(args.env_id)
+    run_path = args.run_record.resolve()
+    ui_runs_root = (args.cache_root / "voice-barge-in" / "ui-runs").resolve()
+    if not run_path.is_relative_to(ui_runs_root):
+        raise ValueError("Talk UI stop requires an explicit U1 record under the selected cache root")
+    try:
+        record = json.loads(run_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read selected U1 record: {exc}") from exc
+    if record.get("env_id") != environment_id or record.get("mode") != "talk" or record.get("kind") != "talk_ui_run":
+        raise ValueError("selected U1 record does not own a Talk UI for this env-id")
+    if record.get("status") == "stopped":
+        print(f"Talk UI run {record['run_id']} is already stopped")
+        return
+    process = record.get("process", {})
+    pid = int(process.get("pid", 0))
+    group_id = int(process.get("process_group_id", 0))
+    if pid <= 0 or group_id != pid:
+        raise ValueError("selected U1 has no verified owned process group")
+    command = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, check=False).stdout.strip()
+    if not command:
+        record["status"] = "stopped"
+        record["stopped_at_utc"] = datetime.now(timezone.utc).isoformat()
+        _atomic_json_write(run_path, record)
+        print(f"Talk UI process for {record['run_id']} is already stopped")
+        return
+    if "next" not in command or "dev" not in command:
+        raise RuntimeError("recorded Talk UI PID now belongs to a different command; refusing to signal it")
+    environment_output = subprocess.run(["ps", "eww", "-p", str(pid), "-o", "command="], capture_output=True, text=True, check=False).stdout
+    expected_record = f"HEXIS_VOICE_BARGE_IN_ENV={_environment_record_path(args.cache_root, environment_id)}"
+    if (
+        "HEXIS_UI_TEST_TARGET=talk" not in environment_output
+        or f"PORT={record.get('ui_port')}" not in environment_output
+        or expected_record not in environment_output
+        or os.getpgid(pid) != group_id
+    ):
+        raise RuntimeError("recorded Talk UI process does not match the selected U1 identity; refusing to signal it")
+    os.killpg(group_id, signal.SIGTERM)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.2)
+    else:
+        raise RuntimeError(f"Talk UI process group {group_id} did not stop after SIGTERM; inspect the private U1 log")
+    _assert_port_available(int(record["ui_port"]))
+    record["status"] = "stopped"
+    record["stopped_at_utc"] = datetime.now(timezone.utc).isoformat()
+    _atomic_json_write(run_path, record)
+    print(f"Stopped only the Talk UI owned by U1 run {record['run_id']}")
+
+
 def _run_pytest(args: argparse.Namespace) -> None:
     _, record = _read_environment_record(args.cache_root, args.env_id)
     identity = record.get("db_identity", {}).get("pytest")
@@ -1357,6 +2065,14 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--cache-root", type=Path, default=cache_default)
     check.set_defaults(handler=_check_db)
 
+    rebind = subparsers.add_parser("rebind-profile", help="explicitly rebind an inactive verified E1 to the current repository C6 without database access")
+    rebind.add_argument("--env-id", required=True)
+    rebind.add_argument("--profile", type=Path, default=PROFILE_DEFAULT)
+    rebind.add_argument("--expected-profile-fingerprint", required=True)
+    rebind.add_argument("--expected-clone-fingerprint", required=True)
+    rebind.add_argument("--cache-root", type=Path, default=cache_default)
+    rebind.set_defaults(handler=_rebind_profile)
+
     verify_clone = subparsers.add_parser("verify-clone-identity", help="read-only source/target data and agent identity comparison")
     verify_clone.add_argument("--env-id", required=True)
     verify_clone.add_argument("--source-container", required=True)
@@ -1369,10 +2085,13 @@ def build_parser() -> argparse.ArgumentParser:
     start_api.add_argument("--env-id", required=True)
     start_api.add_argument("--profile", type=Path, default=PROFILE_DEFAULT)
     start_api.add_argument("--output-start-record", type=Path, required=True)
+    start_api.add_argument("--provider-key-env", help="explicitly pass only the environment variable named by C5; omitted by default")
+    start_api.add_argument("--ui-origin", help="explicit loopback UI origin when its actual port overrides C6 ui_url")
+    start_api.add_argument("--api-port", type=int, help="explicit owned loopback API port when C6 api_url is already occupied")
     start_api.add_argument("--cache-root", type=Path, default=cache_default)
     start_api.set_defaults(handler=_start_api)
 
-    start_ui = subparsers.add_parser("start-ui", help="start the API/database-free W1 Worker test page")
+    start_ui = subparsers.add_parser("start-ui", help="start the selected W1 Worker page or isolated U1 Talk UI")
     start_ui.add_argument("--env-id", required=True)
     start_ui.add_argument("--profile", type=Path, default=PROFILE_DEFAULT)
     start_ui.add_argument("--mode", choices=("worker", "talk"), required=True)
@@ -1380,14 +2099,14 @@ def build_parser() -> argparse.ArgumentParser:
     start_ui.add_argument("--port", type=int)
     start_ui.add_argument("--output-record", type=Path, required=True)
     start_ui.add_argument("--cache-root", type=Path, default=cache_default)
-    start_ui.set_defaults(handler=_start_worker_ui)
+    start_ui.set_defaults(handler=lambda parsed: _start_worker_ui(parsed) if parsed.mode == "worker" else _start_talk_ui(parsed))
 
     stop = subparsers.add_parser("stop", help="stop one explicitly selected owned API process")
     stop.add_argument("--env-id", required=True)
-    stop.add_argument("--target", choices=("api", "worker-ui"), required=True)
+    stop.add_argument("--target", choices=("api", "worker-ui", "talk-ui"), required=True)
     stop.add_argument("--run-record", type=Path, required=True)
     stop.add_argument("--cache-root", type=Path, default=cache_default)
-    stop.set_defaults(handler=lambda parsed: _stop_api(parsed) if parsed.target == "api" else _stop_worker_ui(parsed))
+    stop.set_defaults(handler=lambda parsed: _stop_api(parsed) if parsed.target == "api" else (_stop_worker_ui(parsed) if parsed.target == "worker-ui" else _stop_talk_ui(parsed)))
 
     run_tests = subparsers.add_parser("run-pytest", help="run tests only against the owned pytest database")
     run_tests.add_argument("--env-id", required=True)

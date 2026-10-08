@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "configuration_id": "voice-barge-in-audio-cases-v1",
-  "dataset_status": "incomplete",
+  "dataset_status": "partial_synthetic_only",
   "notes": [
     "长期场景规范在仓库；实际音频及单次验证证据在运行时显式绑定。",
     "noise.wav是带噪人声正例，interrupt.wav是长句，不能冒充纯噪音或单字停。",
@@ -13,8 +13,8 @@
       "category": "non_speech",
       "expected_input": false,
       "expected_barge_in": false,
-      "audio_source_status": "to_be_bound",
-      "audio_asset": null
+      "audio_source_status": "bound_tuning_synthetic_noise_only",
+      "audio_asset": "/Users/itboybob/.cache/hexis/voice-barge-in/audio/d1-20261008-a/manifest-v2.json#pure_environment_noise"
     },
     {
       "id": "ordinary_chinese_speech",
@@ -22,23 +22,23 @@
       "expected_input": true,
       "expected_barge_in": true,
       "audio_source_status": "bound_tuning_and_acceptance_tts_only",
-      "audio_asset": "/Users/itboybob/.cache/hexis/voice-barge-in/audio/manifest.json#ordinary_chinese_speech"
+      "audio_asset": "/Users/itboybob/.cache/hexis/voice-barge-in/audio/d1-20261008-a/manifest-v2.json#ordinary_chinese_speech"
     },
     {
       "id": "short_stop_instruction",
       "category": "short_speech",
       "expected_input": true,
       "expected_barge_in": true,
-      "audio_source_status": "to_be_bound",
-      "audio_asset": null
+      "audio_source_status": "bound_tuning_and_acceptance_tts_only",
+      "audio_asset": "/Users/itboybob/.cache/hexis/voice-barge-in/audio/d1-20261008-a/manifest-v2.json#short_stop_instruction"
     },
     {
       "id": "quiet_speech",
       "category": "speech",
       "expected_input": true,
       "expected_barge_in": true,
-      "audio_source_status": "to_be_bound",
-      "audio_asset": null
+      "audio_source_status": "bound_tuning_tts_attenuated_only",
+      "audio_asset": "/Users/itboybob/.cache/hexis/voice-barge-in/audio/d1-20261008-a/manifest-v2.json#quiet_speech"
     },
     {
       "id": "speech_with_noise",
@@ -46,15 +46,15 @@
       "expected_input": true,
       "expected_barge_in": true,
       "audio_source_status": "bound_tuning_only",
-      "audio_asset": "/Users/itboybob/.cache/hexis/voice-barge-in/audio/manifest.json#speech_with_noise"
+      "audio_asset": "/Users/itboybob/.cache/hexis/voice-barge-in/audio/d1-20261008-a/manifest-v2.json#speech_with_noise"
     },
     {
       "id": "rejected_candidate_then_speech",
       "category": "sequence",
       "expected_input": true,
       "expected_barge_in": true,
-      "audio_source_status": "to_be_bound",
-      "audio_asset": null
+      "audio_source_status": "bound_tuning_synthetic_sequence_only",
+      "audio_asset": "/Users/itboybob/.cache/hexis/voice-barge-in/audio/d1-20261008-a/manifest-v2.json#rejected_candidate_then_speech"
     }
   ],
   "split_policy": "by_original_recording",

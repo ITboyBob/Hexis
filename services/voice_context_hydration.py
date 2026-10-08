@@ -52,6 +52,7 @@ async def hydrate_voice_context(
     stable_instructions_hash: str,
     memory_limit: int = 10,
     instruction_bundle: M4InstructionBundle | None = None,
+    database_only_no_recall: bool = False,
 ) -> VoiceHydrationResult:
     """Hydrate and render the per-response context without inventing fallbacks."""
     if not isinstance(stable_instructions_hash, str) or not re.fullmatch(
@@ -62,6 +63,11 @@ async def hydrate_voice_context(
         raise ValueError("message must not be empty")
     if isinstance(memory_limit, bool) or not isinstance(memory_limit, int) or not 1 <= memory_limit <= 10:
         raise ValueError("memory_limit must be an integer between 1 and 10")
+    if database_only_no_recall:
+        return await _hydrate_database_only_context(
+            pool, session_id=session_id, stable_instructions_hash=stable_instructions_hash,
+            instruction_bundle=instruction_bundle,
+        )
 
     loop = asyncio.get_running_loop()
     started = loop.time()
@@ -137,5 +143,54 @@ async def hydrate_voice_context(
         temporal_context=temporal.removeprefix("Current date and time: "),
         token_count=rendered.token_count,
         tokenizer=rendered.tokenizer,
+        tokenizer_is_model_exact=rendered.tokenizer_is_model_exact,
+    )
+
+
+async def _hydrate_database_only_context(
+    pool: Any, *, session_id: UUID, stable_instructions_hash: str,
+    instruction_bundle: M4InstructionBundle | None,
+) -> VoiceHydrationResult:
+    """只读取当前新会话历史、数据库身份和时间；不调用语义/HTTP 召回。"""
+    started = asyncio.get_running_loop().time()
+    try:
+        async with pool.acquire() as conn:
+            temporal_raw = await conn.fetchval("SELECT get_temporal_context()")
+            profile_raw = await conn.fetchval("SELECT get_agent_profile_context()")
+            profile = json.loads(profile_raw) if isinstance(profile_raw, str) else profile_raw
+            persona = profile.get("persona") if isinstance(profile, dict) else None
+            if not isinstance(persona, dict) or not persona:
+                raise HydrationUnavailable("active persona is unavailable")
+            persona_raw = await conn.fetchval("SELECT render_active_persona($1::jsonb)", json.dumps(persona))
+            messages = await conn.fetch(
+                "SELECT role, content FROM chat_messages WHERE session_id=$1::uuid ORDER BY created_at DESC, id DESC LIMIT 8",
+                session_id,
+            )
+    except Exception as exc:
+        raise HydrationUnavailable("restricted database-only voice context hydration failed") from exc
+    if not isinstance(persona_raw, str) or not persona_raw.strip():
+        raise HydrationUnavailable("active persona renderer returned no required identity content")
+    temporal = _temporal_line(temporal_raw)
+    continuity = "## Conversation Continuity Packet\n" + (
+        "\n".join(f"{row['role']}: {row['content']}" for row in reversed(messages))
+        or "No messages exist in this selected new acceptance session."
+    )
+    if len(continuity) > 8000:
+        raise HydrationUnavailable("restricted session continuity exceeds the 8000-character M4 budget")
+    memory = "## Memory Context\nMemory recall was not performed: the selected M6 C5-only acceptance policy denies recall and embedding."
+    if instruction_bundle is None:
+        from services.voice_instructions import load_m4_instructions
+
+        instruction_bundle = load_m4_instructions()
+    rendered = render_per_turn(
+        instruction_bundle, now=temporal.removeprefix("Current date and time: "),
+        persona=persona_raw.strip(), continuity=continuity, memory=memory,
+    )
+    return VoiceHydrationResult(
+        per_response_instructions=rendered.text, instructions_hash=stable_instructions_hash,
+        hydrate_ms=(asyncio.get_running_loop().time() - started) * 1000,
+        memory_count=0, persona_context=persona_raw.strip(), continuity_context=continuity,
+        memory_context=memory, temporal_context=temporal.removeprefix("Current date and time: "),
+        token_count=rendered.token_count, tokenizer=rendered.tokenizer,
         tokenizer_is_model_exact=rendered.tokenizer_is_model_exact,
     )

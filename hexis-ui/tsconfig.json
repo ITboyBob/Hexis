@@ -1,7 +1,11 @@
 {
   "compilerOptions": {
     "target": "ES2017",
-    "lib": ["dom", "dom.iterable", "esnext"],
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
     "allowJs": true,
     "skipLibCheck": true,
     "strict": true,
@@ -12,7 +16,10 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "jsx": "react-jsx",
-    "types": ["vitest/globals", "@testing-library/jest-dom"],
+    "types": [
+      "vitest/globals",
+      "@testing-library/jest-dom"
+    ],
     "incremental": true,
     "plugins": [
       {
@@ -20,7 +27,9 @@
       }
     ],
     "paths": {
-      "@/*": ["./*"]
+      "@/*": [
+        "./*"
+      ]
     }
   },
   "include": [
@@ -29,7 +38,35 @@
     "**/*.tsx",
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts",
-    "**/*.mts"
+    "**/*.mts",
+    ".next/voice-barge-in-f88b6c0eed40/types/**/*.ts",
+    ".next/voice-barge-in-f88b6c0eed40/dev/types/**/*.ts",
+    ".next/voice-barge-in-f632d981656d/types/**/*.ts",
+    ".next/voice-barge-in-f632d981656d/dev/types/**/*.ts",
+    ".next/voice-barge-in-7e2fa1c6cf1d/types/**/*.ts",
+    ".next/voice-barge-in-7e2fa1c6cf1d/dev/types/**/*.ts",
+    ".next/voice-barge-in-7a6ae79847ca/types/**/*.ts",
+    ".next/voice-barge-in-7a6ae79847ca/dev/types/**/*.ts",
+    ".next/voice-barge-in-a88962211ef7/types/**/*.ts",
+    ".next/voice-barge-in-a88962211ef7/dev/types/**/*.ts",
+    ".next/voice-barge-in-99fc9907bb4b/types/**/*.ts",
+    ".next/voice-barge-in-99fc9907bb4b/dev/types/**/*.ts",
+    ".next/voice-barge-in-308270467d79/types/**/*.ts",
+    ".next/voice-barge-in-308270467d79/dev/types/**/*.ts",
+    ".next/voice-barge-in-ae7f50b1661b/types/**/*.ts",
+    ".next/voice-barge-in-ae7f50b1661b/dev/types/**/*.ts",
+    ".next/voice-barge-in-81b13bdbeb68/types/**/*.ts",
+    ".next/voice-barge-in-81b13bdbeb68/dev/types/**/*.ts",
+    ".next/voice-barge-in-9f6c4bb12dcc/types/**/*.ts",
+    ".next/voice-barge-in-9f6c4bb12dcc/dev/types/**/*.ts",
+    ".next/voice-barge-in-c4fc27237c23/types/**/*.ts",
+    ".next/voice-barge-in-c4fc27237c23/dev/types/**/*.ts",
+    ".next/voice-barge-in-bf5828d0d7ab/types/**/*.ts",
+    ".next/voice-barge-in-bf5828d0d7ab/dev/types/**/*.ts",
+    ".next/voice-barge-in-068f1a843622/types/**/*.ts",
+    ".next/voice-barge-in-068f1a843622/dev/types/**/*.ts"
   ],
-  "exclude": ["node_modules"]
+  "exclude": [
+    "node_modules"
+  ]
 }

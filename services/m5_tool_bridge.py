@@ -12,6 +12,7 @@ from services.m5_tool_contracts import (
     M5ToolContractError,
     build_receipt,
     parse_tool_arguments,
+    decode_tool_arguments_object,
 )
 
 
@@ -156,6 +157,7 @@ async def execute_bound_tool(
     call: BoundToolCall,
     *,
     handlers: dict[str, ToolHandler] | None = None,
+    deny_business_effects: bool = False,
 ) -> str:
     """Validate the bound input before parsing or invoking a real handler."""
     session.validate_voice_tool_call(call)
@@ -177,6 +179,9 @@ async def execute_bound_tool(
             else "INVALID_ARGUMENTS"
         )
         return _failed_receipt(call, code=code, message=message)
+
+    if deny_business_effects:
+        return permission_denied_receipt(call)
 
     handler = (handlers or {}).get(call.name)
     if handler is None:
@@ -212,3 +217,27 @@ async def execute_bound_tool(
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def permission_denied_receipt(call: BoundToolCall) -> str:
+    """保留真实供应商 call 身份，不创建或假称已接受任何业务操作。"""
+    return _failed_receipt(
+        call,
+        code="PERMISSION_DENIED",
+        message="The selected M6 C5-only acceptance policy does not authorize this operation.",
+    )
+
+
+async def execute_restricted_bound_tool(session: Any, call: BoundToolCall) -> str:
+    """核验真实授权与参数后拒绝副作用；不构造业务 service 或 executor。"""
+    if call.name != "voice_recall":
+        return await execute_bound_tool(session, call, deny_business_effects=True)
+    session.validate_voice_tool_call(call)
+    try:
+        arguments = decode_tool_arguments_object(call.raw_arguments)
+    except M5ToolContractError as exc:
+        return _failed_receipt(call, code="INVALID_JSON", message=str(exc))
+    if (set(arguments) != {"query"} or not isinstance(arguments["query"], str)
+            or not arguments["query"].strip() or len(arguments["query"]) > 2000):
+        return _failed_receipt(call, code="INVALID_ARGUMENTS", message="voice_recall requires only a query string with 1 to 2000 characters.")
+    return permission_denied_receipt(call)

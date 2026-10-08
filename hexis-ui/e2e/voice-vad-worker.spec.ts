@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { expect, test } from "@playwright/test";
 import assetManifest from "../lib/voice-realtime/vad-assets-manifest.json";
+import speechConfig from "../lib/voice-realtime/speech-detection-config.json";
 
 type WorkerRunRecord = {
   kind: "worker_ui_run";
@@ -15,6 +16,8 @@ type WorkerRunRecord = {
 };
 
 const runPath = process.env.VOICE_BARGE_IN_WORKER_RUN;
+const wavPath = process.env.VOICE_BARGE_IN_WORKER_WAV;
+if (wavPath && !path.isAbsolute(wavPath)) throw new Error("VOICE_BARGE_IN_WORKER_WAV must name an explicitly selected absolute existing WAV path.");
 if (!runPath || !path.isAbsolute(runPath)) {
   throw new Error("VOICE_BARGE_IN_WORKER_RUN must name an explicit absolute W1 JSON path; start a worker UI first.");
 }
@@ -51,6 +54,47 @@ test.use({
 });
 
 test.describe("real Worker/WASM standalone component", () => {
+  test("records actual probabilities for an explicitly selected existing WAV", async ({ page }, testInfo) => {
+    test.skip(!wavPath, "Select an existing local WAV explicitly with VOICE_BARGE_IN_WORKER_WAV.");
+    const sourceBytes = readFileSync(wavPath!);
+    const unexpectedRequests: string[] = [];
+    const pageErrors: string[] = [];
+    const localOrigin = new URL(workerRun.ui_url).origin;
+    page.on("pageerror", (error) => pageErrors.push(error.message));
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (url.origin !== localOrigin || url.pathname.startsWith("/api/")) unexpectedRequests.push(request.url());
+    });
+    await page.goto(workerRun.ui_url);
+    await page.getByRole("button", { name: "Start Worker" }).click();
+    await expect(page.getByText("Capture gate: open")).toBeVisible({ timeout: 30000 });
+    await page.getByLabel("Local WAV file").setInputFiles(wavPath!);
+    await page.getByRole("button", { name: "Run selected WAV" }).click();
+    await expect(page.getByTestId("wav-run-status")).toContainText("completed", { timeout: 90000 });
+    const result = JSON.parse((await page.getByTestId("wav-probability-trajectory").textContent())!);
+    expect(result.file_name).toBe(path.basename(wavPath!));
+    expect(result.file_bytes).toBe(sourceBytes.length);
+    expect(result.sample_rate).toBe(speechConfig.audio.sample_rate);
+    expect(result.real_samples).toBeGreaterThan(0);
+    const frameSamples = speechConfig.audio.model_frame_samples;
+    expect(result.frames.length).toBe(Math.ceil(result.real_samples / frameSamples));
+    for (const [index, frame] of result.frames.entries()) {
+      expect(frame.start_sample).toBe(index * frameSamples);
+      expect(frame.end_sample).toBe((index + 1) * frameSamples);
+      expect(Number.isFinite(frame.probability)).toBe(true);
+      expect(frame.probability).toBeGreaterThanOrEqual(0);
+      expect(frame.probability).toBeLessThanOrEqual(1);
+    }
+    expect(pageErrors).toEqual([]);
+    expect(unexpectedRequests).toEqual([]);
+    await testInfo.attach("existing-wav-worker-probabilities", {
+      contentType: "application/json",
+      body: Buffer.from(JSON.stringify({ source_path: wavPath, source_sha256: createHash("sha256").update(sourceBytes).digest("hex"), ...result }, null, 2)),
+    });
+    await page.getByRole("button", { name: "Close Worker" }).click();
+    await expect(page.getByText("Capture gate: closed")).toBeVisible();
+  });
+
   test("loads the pinned v6/ORT assets and runs a deterministic frame", async ({ page }) => {
     const assetResponses = new Map<string, number>();
     const pageErrors: string[] = [];

@@ -9,11 +9,21 @@ export const dynamic = "force-dynamic";
 type EnvironmentRecord = {
   env_id?: string;
   status?: string;
-  owned_resources?: { talk_host_port?: number };
-  db_identity?: { talk?: { database?: string; server_port?: number } };
+  repository_root?: string;
+  owned_resources?: { talk_host_port?: number; api_process?: {
+    start_id?: string; start_record_path?: string; api_url?: string; status?: string; pid?: number;
+  } };
+  db_identity?: { talk?: { database?: string; server_port?: number; server_address?: string } };
+};
+
+type ApiStartRecord = {
+  environment_id?: string; start_id?: string; status?: string; pid?: number;
+  browser_api_url?: string; api_url_source?: string; ui_origin?: string;
+  endpoints?: { api_host?: string; api_port?: number };
 };
 
 class ForbiddenEnvironmentPathError extends Error {}
+class MismatchedStartupIdentityError extends Error {}
 
 function cacheRoot(): string {
   const cacheHome = process.env.XDG_CACHE_HOME || path.join(homedir(), ".cache");
@@ -32,7 +42,7 @@ function parseUrl(value: string | undefined, name: string): URL {
   return parsed;
 }
 
-async function readSelectedEnvironment(): Promise<{ path: string; record: EnvironmentRecord }> {
+async function readSelectedEnvironment(): Promise<{ path: string; record: EnvironmentRecord; ownedCacheRoot: string }> {
   const selectedPath = process.env.HEXIS_VOICE_BARGE_IN_ENV;
   if (!selectedPath) throw new Error("no E1 environment was explicitly selected");
   const resolvedPath = path.resolve(selectedPath);
@@ -40,7 +50,8 @@ async function readSelectedEnvironment(): Promise<{ path: string; record: Enviro
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     throw new ForbiddenEnvironmentPathError("selected E1 record is outside the Hexis cache directory");
   }
-  const parts = relative.split(path.sep);
+  const allParts = relative.split(path.sep);
+  const parts = allParts.slice(-4);
   if (parts.length !== 4 || parts[0] !== "voice-barge-in" || parts[1] !== "environments" || parts[3] !== "environment.json") {
     throw new Error("selected E1 path does not match the explicit environment-record layout");
   }
@@ -51,7 +62,38 @@ async function readSelectedEnvironment(): Promise<{ path: string; record: Enviro
   if (record.status !== "ready" || record.owned_resources?.talk_host_port === undefined || !record.db_identity?.talk) {
     throw new Error("selected E1 talk database has not passed its identity check");
   }
-  return { path: resolvedPath, record };
+  return { path: resolvedPath, record, ownedCacheRoot: path.resolve(cacheRoot(), ...allParts.slice(0, -4)) };
+}
+
+async function readSelectedApiStart(record: EnvironmentRecord, ownedCacheRoot: string, profileApiUrl: string | undefined): Promise<ApiStartRecord> {
+  const processIdentity = record.owned_resources?.api_process;
+  if (!processIdentity?.start_record_path || processIdentity.status !== "healthy") {
+    throw new MismatchedStartupIdentityError("E1 has no selected healthy API startup record.");
+  }
+  const selectedPath = path.resolve(processIdentity.start_record_path);
+  const relative = path.relative(path.join(ownedCacheRoot, "voice-barge-in", "api-runs"), selectedPath);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new MismatchedStartupIdentityError("API startup record is outside this E1's owned api-runs directory.");
+  }
+  const start = JSON.parse(await readFile(selectedPath, "utf8")) as ApiStartRecord;
+  const profile = new URL(profileApiUrl || "");
+  const source = start.api_url_source || "C6_api_url";
+  const port = source === "C6_api_url" ? Number(profile.port || 80) : start.endpoints?.api_port;
+  if (profile.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(profile.hostname)
+    || profile.username || profile.password || profile.pathname !== "/" || profile.search || profile.hash
+    || !["C6_api_url", "start_api_cli"].includes(source)
+    || typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new MismatchedStartupIdentityError("API startup has no valid explicit loopback endpoint selection.");
+  }
+  profile.port = port === 80 ? "" : String(port);
+  const expectedBrowserUrl = profile.origin;
+  if (start.status !== "started" || start.environment_id !== record.env_id
+    || !start.start_id || start.start_id !== processIdentity.start_id || start.pid !== processIdentity.pid
+    || start.browser_api_url !== expectedBrowserUrl || processIdentity.api_url?.replace(/\/$/, "") !== expectedBrowserUrl
+    || start.endpoints?.api_host !== "127.0.0.1" || start.endpoints.api_port !== port) {
+    throw new MismatchedStartupIdentityError("API endpoint does not match this E1's owned startup identity.");
+  }
+  return start;
 }
 
 export async function GET() {
@@ -60,10 +102,19 @@ export async function GET() {
   }
 
   try {
-    const { record } = await readSelectedEnvironment();
+    const { record, ownedCacheRoot } = await readSelectedEnvironment();
     const databaseUrlSource = process.env.HEXIS_DATABASE_URL ? "HEXIS_DATABASE_URL" : "DATABASE_URL";
     const databaseUrl = parseUrl(process.env.HEXIS_DATABASE_URL || process.env.DATABASE_URL, databaseUrlSource);
     const apiUrl = parseUrl(process.env.HEXIS_API_URL, "HEXIS_API_URL");
+    if (!record.repository_root || !path.isAbsolute(record.repository_root)) throw new Error("E1 has no repository root for C6 verification.");
+    const profile = JSON.parse(await readFile(path.join(record.repository_root, "config/voice-barge-in/run-profile.json"), "utf8")) as { session_execution_policy?: Record<string, unknown>; api_url?: string };
+    const apiStart = await readSelectedApiStart(record, ownedCacheRoot, profile.api_url);
+    const selectedApiUrl = new URL(apiStart.browser_api_url!);
+    if (apiUrl.protocol !== selectedApiUrl.protocol || ![selectedApiUrl.hostname, "hexis-api"].includes(apiUrl.hostname)
+      || Number(apiUrl.port || 80) !== Number(selectedApiUrl.port || 80) || apiUrl.username || apiUrl.password
+      || apiUrl.pathname !== "/" || apiUrl.search || apiUrl.hash) {
+      throw new MismatchedStartupIdentityError("UI API upstream does not match the selected startup endpoint.");
+    }
     const databaseName = decodeURIComponent(databaseUrl.pathname.replace(/^\//, ""));
     const expectedTalk = record.db_identity?.talk;
     const urlPort = Number(databaseUrl.port || (databaseUrl.protocol === "postgres:" || databaseUrl.protocol === "postgresql:" ? "5432" : ""));
@@ -76,19 +127,49 @@ export async function GET() {
       SELECT current_database() AS database, inet_server_port() AS port, inet_server_addr()::text AS address
     `;
     const actualDatabase = databaseRows[0];
-    if (!actualDatabase || actualDatabase.database !== expectedTalk?.database || Number(actualDatabase.port) !== Number(expectedTalk.server_port)) {
+    if (!actualDatabase || actualDatabase.database !== expectedTalk?.database || Number(actualDatabase.port) !== Number(expectedTalk.server_port)
+      || expectedTalk.server_address && actualDatabase.address !== expectedTalk.server_address.split("/")[0]) {
       return NextResponse.json({ error: "The UI's live database identity does not match the selected E1 talk database." }, { status: 409 });
     }
 
     const healthUrl = new URL("/health", apiUrl);
     const healthResponse = await fetch(healthUrl, { cache: "no-store", signal: AbortSignal.timeout(5000) });
-    const health = await healthResponse.json().catch(() => null) as { status?: string; checks?: { db?: boolean } } | null;
+    const health = await healthResponse.json().catch(() => null) as {
+      status?: string; checks?: { db?: boolean };
+      voice_barge_in?: {
+        environment_id?: string; start_id?: string; database?: string;
+        session_execution_policy?: Record<string, unknown>;
+        acceptance_session_id?: string; acceptance_session_registered?: boolean;
+        migration_verification?: { status?: string; mode?: string; [key: string]: unknown };
+        browser_api_url?: string;
+        api_url_source?: string;
+        ui_origin?: string;
+      };
+    } | null;
     if (!healthResponse.ok || health?.status !== "ok" || health.checks?.db !== true) {
       return NextResponse.json({ error: "The selected API upstream is not healthy or has no database connection." }, { status: 503 });
+    }
+    const policy = profile.session_execution_policy;
+    const selected = health.voice_barge_in;
+    if (!policy || policy.policy_id !== "m6-c5-realtime-only-v1" || !selected
+      || selected.environment_id !== record.env_id || selected.database !== actualDatabase.database
+      || !selected.start_id || selected.start_id !== record.owned_resources?.api_process?.start_id
+      || selected.acceptance_session_registered !== true || !selected.acceptance_session_id
+      || selected.migration_verification?.status !== "verified_read_only" || selected.migration_verification.mode !== "committed_applied_only"
+      || selected.browser_api_url !== apiStart.browser_api_url
+      || (selected.api_url_source || "C6_api_url") !== (apiStart.api_url_source || "C6_api_url")
+      || process.env.HEXIS_BROWSER_API_URL !== selected.browser_api_url
+      || !selected.ui_origin || process.env.HEXIS_UI_ORIGIN !== selected.ui_origin || apiStart.ui_origin !== selected.ui_origin
+      || !selected.session_execution_policy
+      || Object.keys(policy).length !== Object.keys(selected.session_execution_policy).length
+      || Object.entries(policy).some(([key, value]) => selected.session_execution_policy?.[key] !== value)) {
+      return NextResponse.json({ error: "The selected API acceptance policy or registered session does not match E1/C6." }, { status: 409 });
     }
 
     return NextResponse.json({
       env_id: record.env_id,
+      browser_api_url: process.env.HEXIS_BROWSER_API_URL,
+      ui_origin: process.env.HEXIS_UI_ORIGIN,
       database: {
         database: actualDatabase.database,
         server_port: Number(actualDatabase.port),
@@ -102,9 +183,20 @@ export async function GET() {
         checks: health.checks,
         url_host: apiUrl.hostname,
         url_port: Number(apiUrl.port || (apiUrl.protocol === "https:" ? 443 : 80)),
+        start_id: selected.start_id,
+        session_execution_policy: selected.session_execution_policy,
+        acceptance_session_id: selected.acceptance_session_id,
+        acceptance_session_registered: selected.acceptance_session_registered,
+        migration_verification: selected.migration_verification,
+        browser_api_url: selected.browser_api_url,
+        api_url_source: selected.api_url_source || "C6_api_url",
+        ui_origin: selected.ui_origin,
       },
     });
   } catch (error) {
+    if (error instanceof MismatchedStartupIdentityError) {
+      return NextResponse.json({ error: error.message }, { status: 409 });
+    }
     if (error instanceof ForbiddenEnvironmentPathError) {
       return NextResponse.json({ error: error.message }, { status: 403 });
     }
