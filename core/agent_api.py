@@ -22,6 +22,11 @@ def db_dsn_from_env(instance: str | None = None) -> str:
     Returns:
         PostgreSQL DSN string.
     """
+    if os.getenv("HEXIS_BOB107_RUNNER") == "1":
+        if not is_bob107_runtime_env():
+            raise RuntimeError("invalid isolated BOB-107 database identity")
+        return _postgres_env_dsn()
+
     if instance:
         from core.instance import InstanceRegistry
         return InstanceRegistry().dsn_for(instance)
@@ -48,12 +53,35 @@ def db_dsn_from_env(instance: str | None = None) -> str:
         pass
 
     # Fall back to env vars
+    return _postgres_env_dsn()
+
+
+def _postgres_env_dsn() -> str:
     host = os.getenv("POSTGRES_HOST", "localhost")
     port = int(os.getenv("POSTGRES_PORT", "43815"))
     database = os.getenv("POSTGRES_DB", "hexis_memory")
     user = os.getenv("POSTGRES_USER", "hexis_user")
     password = os.getenv("POSTGRES_PASSWORD", "hexis_password")
     return f"postgresql://{user}:{password}@{host}:{port}/{database}"
+
+
+def is_bob107_runtime_env() -> bool:
+    """Validate the explicit local BOB-107 runtime marker before bypassing registry state."""
+    expected_port = os.getenv("HEXIS_BOB107_EXPECTED_PORT", "")
+    try:
+        port = int(expected_port)
+    except ValueError:
+        return False
+    source_root = Path(__file__).resolve().parents[1]
+    expected_database = os.getenv("HEXIS_BOB107_EXPECTED_DATABASE")
+    return (
+        os.getenv("HEXIS_BOB107_SOURCE_ROOT") == str(source_root)
+        and expected_database == "bob107_runtime"
+        and os.getenv("POSTGRES_HOST") == "127.0.0.1"
+        and os.getenv("POSTGRES_DB") == expected_database
+        and os.getenv("POSTGRES_PORT") == str(port)
+        and 43861 <= port <= 43868
+    )
 
 
 def resolve_instance() -> str | None:

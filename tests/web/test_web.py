@@ -12,6 +12,7 @@ import hmac
 import time
 import urllib.parse
 import uuid
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -170,12 +171,50 @@ async def client(db_pool):
     web_module._pool = original_pool
 
 
-async def test_health(client):
+async def test_health(client, db_pool, monkeypatch):
     """Health endpoint returns 200 with status ok."""
+    monkeypatch.delenv("HEXIS_RUNTIME_IDENTITY_STATUS", raising=False)
+    default_response = await client.get("/health")
+    assert "database_identity" not in default_response.json()
+
+    monkeypatch.setenv("HEXIS_RUNTIME_IDENTITY_STATUS", "1")
     resp = await client.get("/health")
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "ok"
+    assert data["database_identity"]["database"]
+    assert data["database_identity"]["server_port"] > 0
+    async with db_pool.acquire() as connection:
+        assert data["database_identity"]["database"] == await connection.fetchval(
+            "SELECT current_database()"
+        )
+
+
+async def test_bob107_report_runner_can_only_be_disabled_for_its_isolated_database(
+    monkeypatch,
+):
+    monkeypatch.setenv("HEXIS_M5_REPORT_RUNNER_MODE", "disabled")
+    for name in (
+        "HEXIS_BOB107_RUNNER",
+        "HEXIS_BOB107_SOURCE_ROOT",
+        "HEXIS_BOB107_EXPECTED_DATABASE",
+        "HEXIS_BOB107_EXPECTED_PORT",
+        "POSTGRES_HOST",
+        "POSTGRES_DB",
+        "POSTGRES_PORT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(RuntimeError, match="isolated BOB-107 runtime"):
+        web_module._m5_report_runner_enabled()
+
+    monkeypatch.setenv("HEXIS_BOB107_RUNNER", "1")
+    monkeypatch.setenv("HEXIS_BOB107_SOURCE_ROOT", str(Path(__file__).resolve().parents[2]))
+    monkeypatch.setenv("HEXIS_BOB107_EXPECTED_DATABASE", "bob107_runtime")
+    monkeypatch.setenv("HEXIS_BOB107_EXPECTED_PORT", "43861")
+    monkeypatch.setenv("POSTGRES_HOST", "127.0.0.1")
+    monkeypatch.setenv("POSTGRES_DB", "bob107_runtime")
+    monkeypatch.setenv("POSTGRES_PORT", "43861")
+    assert web_module._m5_report_runner_enabled() is False
 
 
 async def test_node_pairing_api_approves_exact_pending_identity(

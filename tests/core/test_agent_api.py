@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -16,6 +18,56 @@ async def test_db_dsn_from_env(monkeypatch):
     monkeypatch.setenv("POSTGRES_PASSWORD", "secret")
     dsn = agent_api.db_dsn_from_env()
     assert dsn == "postgresql://user1:secret@example.com:5555/hexis_tmp"
+
+
+async def test_bob107_runner_dsn_bypasses_ambient_instance_registry(monkeypatch):
+    source_root = str(Path(agent_api.__file__).resolve().parents[1])
+    for name, value in {
+        "HEXIS_BOB107_RUNNER": "1",
+        "HEXIS_BOB107_SOURCE_ROOT": source_root,
+        "HEXIS_BOB107_EXPECTED_DATABASE": "bob107_runtime",
+        "HEXIS_BOB107_EXPECTED_PORT": "43861",
+        "POSTGRES_HOST": "127.0.0.1",
+        "POSTGRES_PORT": "43861",
+        "POSTGRES_DB": "bob107_runtime",
+        "POSTGRES_USER": "hexis_user",
+        "POSTGRES_PASSWORD": "runtime-only",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    with patch("core.instance.InstanceRegistry", side_effect=AssertionError("ambient registry read")):
+        assert agent_api.db_dsn_from_env() == (
+            "postgresql://hexis_user:runtime-only@127.0.0.1:43861/bob107_runtime"
+        )
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("POSTGRES_HOST", "localhost"),
+        ("POSTGRES_DB", "hexis_memory"),
+        ("POSTGRES_PORT", "43815"),
+        ("HEXIS_BOB107_SOURCE_ROOT", "/Users/itboybob/Hexis"),
+    ],
+)
+async def test_bob107_runner_dsn_rejects_nonisolated_identity(monkeypatch, name, value):
+    source_root = str(Path(agent_api.__file__).resolve().parents[1])
+    for key, item in {
+        "HEXIS_BOB107_RUNNER": "1",
+        "HEXIS_BOB107_SOURCE_ROOT": source_root,
+        "HEXIS_BOB107_EXPECTED_DATABASE": "bob107_runtime",
+        "HEXIS_BOB107_EXPECTED_PORT": "43861",
+        "POSTGRES_HOST": "127.0.0.1",
+        "POSTGRES_PORT": "43861",
+        "POSTGRES_DB": "bob107_runtime",
+        "POSTGRES_USER": "hexis_user",
+        "POSTGRES_PASSWORD": "runtime-only",
+    }.items():
+        monkeypatch.setenv(key, item)
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(RuntimeError, match="isolated BOB-107 database identity"):
+        agent_api.db_dsn_from_env()
 
 
 async def test_connect_with_retry_times_out():

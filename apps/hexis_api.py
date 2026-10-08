@@ -52,7 +52,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from channels.presentation import citations_from_tool_output, presentation_from_text
-from core.agent_api import db_dsn_from_env, pool_sizes_from_env
+from core.agent_api import db_dsn_from_env, is_bob107_runtime_env, pool_sizes_from_env
 from core.agent_loop import AgentEvent, AgentEventData, describe_exception
 from core.auth.ui_flow import AuthFlowError, auth_flow_coordinator
 from core.cli_api import status_payload_rich
@@ -84,6 +84,23 @@ _voice_barge_in_start_record: dict[str, Any] | None = None
 
 def _should_start_m5_background_workers(voice_barge_in_selected: bool) -> bool:
     return not voice_barge_in_selected
+
+
+def _is_bob107_runtime_config_valid() -> bool:
+    return os.environ.get("HEXIS_BOB107_RUNNER") == "1" and is_bob107_runtime_env()
+
+
+def _m5_report_runner_enabled() -> bool:
+    mode = os.environ.get("HEXIS_M5_REPORT_RUNNER_MODE", "enabled")
+    if mode == "enabled":
+        return True
+    if mode != "disabled":
+        raise RuntimeError("HEXIS_M5_REPORT_RUNNER_MODE must be enabled or disabled")
+    if not _is_bob107_runtime_config_valid():
+        raise RuntimeError(
+            "disabling the M5 report runner requires the isolated BOB-107 runtime"
+        )
+    return False
 
 
 def _dsn() -> str:
@@ -181,6 +198,9 @@ def _write_voice_barge_in_api_start_record(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _pool, _m5_task_worker, _m5_lightweight_executor, _m5_acceptance_runtime_fingerprints, _voice_barge_in_start_record
+    if os.environ.get("HEXIS_BOB107_RUNNER") == "1" and not _is_bob107_runtime_config_valid():
+        raise RuntimeError("invalid isolated BOB-107 runtime identity")
+    report_runner_enabled = _m5_report_runner_enabled()
     dsn = _dsn()
     selected_run = os.environ.get("HEXIS_M5_ACCEPTANCE_RUN")
     selected_voice_run = os.environ.get("HEXIS_VOICE_BARGE_IN_ENV")
@@ -257,16 +277,21 @@ async def lifespan(app: FastAPI):
                     interrupted,
                 )
             selected_run = os.environ.get("HEXIS_M5_ACCEPTANCE_RUN")
-            if selected_run:
+            if not report_runner_enabled:
+                report_runner = None
+                report_config_provider = None
+            elif selected_run:
                 from apps.m5_acceptance_probe import acceptance_report_request
 
                 report_runner = M5ReportRunner(_pool, model_request=acceptance_report_request(selected_run))
+                report_config_provider = lambda: load_selected_report_config(_pool)
             else:
                 report_runner = M5ReportRunner(_pool)
+                report_config_provider = lambda: load_selected_report_config(_pool)
             _m5_task_worker = M5TaskWorker(
                 _pool,
                 report_runner=report_runner,
-                report_config_provider=lambda: load_selected_report_config(_pool),
+                report_config_provider=report_config_provider,
             )
             _m5_task_worker.start()
 
@@ -937,11 +962,19 @@ async def init_openai_codex_models():
 @app.get("/health")
 async def health():
     checks = {"db": False}
+    database_identity = None
     acceptance = None
     try:
         if _pool:
             async with _pool.acquire() as conn:
                 await conn.fetchval("SELECT 1")
+                if os.environ.get("HEXIS_RUNTIME_IDENTITY_STATUS") == "1":
+                    identity_row = await conn.fetchrow(
+                        """SELECT current_database() AS database,
+                                  inet_server_addr()::text AS server_address,
+                                  inet_server_port() AS server_port"""
+                    )
+                    database_identity = dict(identity_row)
                 selected_run = os.environ.get("HEXIS_M5_ACCEPTANCE_RUN")
                 if selected_run:
                     from apps.m5_acceptance_probe import load_run
@@ -969,6 +1002,15 @@ async def health():
     ok = all(checks.values())
     return JSONResponse(
         {"status": "ok" if ok else "degraded", "checks": checks,
+         **({"database_identity": database_identity} if database_identity is not None else {}),
+         **({"bob107_runtime": {
+             "run_id": os.environ.get("HEXIS_BOB107_RUN_ID"),
+             "source_root": os.environ.get("HEXIS_BOB107_SOURCE_ROOT"),
+             "source_head": os.environ.get("HEXIS_BOB107_SOURCE_HEAD"),
+             "m5_task_worker_running": bool(_m5_task_worker and _m5_task_worker.running),
+             "m5_report_runner_enabled": _m5_report_runner_enabled(),
+             "m5_lightweight_worker_running": bool(_m5_lightweight_executor and _m5_lightweight_executor.running),
+         }} if _is_bob107_runtime_config_valid() else {}),
          **({"voice_barge_in": voice_barge_in} if voice_barge_in is not None else {}),
          **({"m5_acceptance": acceptance} if acceptance is not None else {})},
         status_code=200 if ok else 503,
