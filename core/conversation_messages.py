@@ -12,7 +12,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 
 _ROLES = {"system", "user", "assistant", "toolResult"}
@@ -26,6 +26,38 @@ class ConversationMessageError(ValueError):
     def __init__(self, category: str, message: str):
         super().__init__(message)
         self.category = category
+
+
+def resolve_chat_request_identity(
+    session_id: str | UUID,
+    client_message_id: str | UUID | None,
+) -> dict[str, Any]:
+    """Resolve the stable source identity for one logical text-chat submission."""
+    if session_id is None:
+        raise ConversationMessageError("invalid_session_identity", "chat session identity is required")
+    try:
+        normalized_session = str(UUID(str(session_id)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ConversationMessageError("invalid_session_identity", "chat session identity must be a UUID") from exc
+
+    legacy = client_message_id is None
+    if legacy:
+        normalized_client = str(uuid4())
+    else:
+        try:
+            normalized_client = str(UUID(str(client_message_id)))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ConversationMessageError("invalid_client_message_id", "client_message_id must be a UUID") from exc
+
+    source_identity = f"chat:{normalized_session}:{normalized_client}"
+    return {
+        "session_id": normalized_session,
+        "client_message_id": normalized_client,
+        "source_identity": source_identity,
+        "user_source_message_id": f"{source_identity}:user",
+        "assistant_source_message_id": f"{source_identity}:assistant",
+        "legacy_client_message_id": legacy,
+    }
 
 
 def _is_json_value(value: Any) -> bool:

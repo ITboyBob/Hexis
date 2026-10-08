@@ -3,8 +3,13 @@ from __future__ import annotations
 import logging
 import json
 import inspect
+import hashlib
 from typing import Any, AsyncIterator, Awaitable, Callable
 from uuid import UUID
+
+from core.conversation_messages import (
+    resolve_chat_request_identity,
+)
 
 from core.agent_api import (
     db_dsn_from_env,
@@ -28,6 +33,96 @@ from services.connector_setup import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ChatRequestIdentityError(ValueError):
+    """A submission identity was reused with conflicting or unfinished data."""
+
+
+async def _persist_chat_user_source(
+    pool: Any,
+    *,
+    user_message: str,
+    session_id: str,
+    client_message_id: str | None,
+    surface: str,
+    attachments: list[dict[str, Any]] | None = None,
+    visual_attachments: list[dict[str, Any]] | None = None,
+    prompt_addenda: list[str] | None = None,
+) -> dict[str, Any]:
+    """Persist one user submission before any chat runtime or tool side effect."""
+    identity = resolve_chat_request_identity(session_id, client_message_id)
+    identity_context = {
+        "attachments": attachments or [],
+        "visual_attachments": visual_attachments or [],
+        "prompt_addenda": prompt_addenda or [],
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(identity_context, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    metadata = {"submission_fingerprint": fingerprint}
+    if attachments:
+        metadata["attachments"] = attachments
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.fetchval(
+                "SELECT pg_advisory_xact_lock(hashtext($1))",
+                identity["session_id"],
+            )
+            await conn.fetchval(
+                "SELECT get_or_create_chat_session($1::uuid,$2,NULL,'{}'::jsonb)",
+                identity["session_id"],
+                surface,
+            )
+            existing = await conn.fetchrow(
+                "SELECT role,content,metadata FROM chat_messages "
+                "WHERE session_id=$1::uuid AND source_message_id=$2",
+                identity["session_id"],
+                identity["user_source_message_id"],
+            )
+            if existing is not None:
+                existing_metadata = existing["metadata"]
+                if isinstance(existing_metadata, str):
+                    existing_metadata = json.loads(existing_metadata)
+                if (
+                    existing["role"] != "user"
+                    or existing["content"] != user_message
+                    or (existing_metadata or {}) != metadata
+                ):
+                    raise ChatRequestIdentityError(
+                        "client_message_id conflicts with an already accepted submission"
+                    )
+                assistant = await conn.fetchrow(
+                    "SELECT content FROM chat_messages "
+                    "WHERE session_id=$1::uuid AND source_message_id=$2",
+                    identity["session_id"],
+                    identity["assistant_source_message_id"],
+                )
+                if assistant is None:
+                    raise ChatRequestIdentityError(
+                        "submission was already accepted; completion status is unknown"
+                    )
+                return {
+                    **identity,
+                    "submission_fingerprint": fingerprint,
+                    "replayed": True,
+                    "assistant": assistant["content"],
+                }
+            await conn.fetchval(
+                "SELECT append_chat_message_blocks($1::uuid,'user',$2,$3::jsonb,$4::jsonb,$5,TRUE)",
+                identity["session_id"],
+                user_message,
+                json.dumps([{"type": "text", "text": user_message}]),
+                json.dumps(metadata),
+                identity["user_source_message_id"],
+            )
+            await conn.fetchval("SELECT mark_user_contact()")
+    return {
+        **identity,
+        "submission_fingerprint": fingerprint,
+        "replayed": False,
+        "assistant": None,
+    }
 
 # Checkbox ids the UI settings panel may send as prompt addenda; they render
 # the corresponding DB prompt module. Anything else is literal addendum text
@@ -275,6 +370,8 @@ async def _hydrate_chat_history(
     pool: Any,
     session_id: str | None,
     fallback_history: list[dict[str, Any]] | None = None,
+    *,
+    exclude_source_message_id: str | None = None,
 ) -> list[dict[str, Any]]:
     parsed = _uuid_text_or_none(session_id)
     if not parsed:
@@ -288,7 +385,14 @@ async def _hydrate_chat_history(
             and isinstance(payload.get("messages"), list)
             and payload["messages"]
         ):
-            return _message_history_only(payload["messages"])
+            messages = payload["messages"]
+            if exclude_source_message_id:
+                messages = [
+                    item for item in messages
+                    if not isinstance(item, dict)
+                    or item.get("source_message_id") != exclude_source_message_id
+                ]
+            return _message_history_only(messages)
     except Exception:
         logger.debug(
             "DB chat-session hydration failed; falling back to caller history",
@@ -331,6 +435,9 @@ async def _remember_conversation(
     assistant_message: str,
     session_id: str | None = None,
     source_identity: str | None = None,
+    user_source_message_id: str | None = None,
+    assistant_source_message_id: str | None = None,
+    submission_fingerprint: str | None = None,
     user_label: str | None = None,
     background_dsn: str | None = None,
     emotional_state: dict[str, Any] | None = None,
@@ -345,8 +452,13 @@ async def _remember_conversation(
     # Files the user attached ride the stored message so a reloaded
     # conversation still shows what came with it (the text itself lives in
     # the turn's addenda and, durably, in the filing cabinet).
+    user_metadata: dict[str, Any] = {}
     if attachments:
-        context["user_metadata"] = {"attachments": attachments}
+        user_metadata["attachments"] = attachments
+    if submission_fingerprint:
+        user_metadata["submission_fingerprint"] = submission_fingerprint
+    if user_metadata:
+        context["user_metadata"] = user_metadata
     if user_label and user_label.strip():
         context["user_label"] = user_label.strip()
     # This turn's appraisal, so the stored turn carries the moment's feeling
@@ -366,6 +478,10 @@ async def _remember_conversation(
     context["surface"] = surface
     if source_identity:
         context["source_identity"] = source_identity
+    if user_source_message_id:
+        context["user_source_message_id"] = user_source_message_id
+    if assistant_source_message_id:
+        context["assistant_source_message_id"] = assistant_source_message_id
     parsed_session = _uuid_text_or_none(session_id)
     if parsed_session:
         return await mem_client.record_chat_session_turn(
@@ -544,6 +660,7 @@ async def chat_turn(
     memory_limit: int = 10,
     max_tool_iterations: int = 5,
     session_id: str | None = None,
+    client_message_id: str | None = None,
     pool: Any | None = None,
     user_label: str | None = None,
     is_group: bool = False,
@@ -551,6 +668,7 @@ async def chat_turn(
     operator_context: dict[str, Any] | None = None,
     surface: str = "chat",
     visual_attachments: list[dict[str, Any]] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
     on_event: Callable[[AgentEventData], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     dsn = dsn or db_dsn_from_env()
@@ -566,6 +684,25 @@ async def chat_turn(
         pool = await asyncpg.create_pool(dsn, min_size=_min, max_size=_max)
 
     try:
+        request_identity = None
+        if surface in {"chat", "api", "cli"} and session_id:
+            request_identity = await _persist_chat_user_source(
+                pool,
+                user_message=user_message,
+                session_id=session_id,
+                client_message_id=client_message_id,
+                surface=surface,
+                attachments=attachments,
+                visual_attachments=visual_attachments,
+            )
+            session_id = request_identity["session_id"]
+            if request_identity["replayed"]:
+                hydrated = await _hydrate_chat_history(pool, session_id, history)
+                return {
+                    "assistant": request_identity["assistant"],
+                    "history": hydrated,
+                    "client_message_id": request_identity["client_message_id"],
+                }
         is_operator = _trusted_operator_turn(
             surface=surface,
             is_group=is_group,
@@ -584,7 +721,14 @@ async def chat_turn(
         agent_user_message = "\n\n".join(
             part for part in (capture_notice, user_message) if part
         )
-        history = await _hydrate_chat_history(pool, session_id, history)
+        history = await _hydrate_chat_history(
+            pool,
+            session_id,
+            history,
+            exclude_source_message_id=(
+                request_identity["user_source_message_id"] if request_identity else None
+            ),
+        )
 
         # Check if RLM is enabled for chat
         use_rlm = False
@@ -635,6 +779,11 @@ async def chat_turn(
                 user_label=user_label,
                 background_dsn=dsn,
                 surface=surface,
+                attachments=attachments,
+                source_identity=request_identity["source_identity"] if request_identity else None,
+                user_source_message_id=request_identity["user_source_message_id"] if request_identity else None,
+                assistant_source_message_id=request_identity["assistant_source_message_id"] if request_identity else None,
+                submission_fingerprint=request_identity["submission_fingerprint"] if request_identity else None,
             )
             await _apply_chat_energy_effects(
                 pool,
@@ -646,7 +795,11 @@ async def chat_turn(
             new_history = await _hydrate_after_persist(
                 mem_client, session_id, fallback_history
             )
-            return {"assistant": assistant_text, "history": new_history}
+            return {
+                "assistant": assistant_text,
+                "history": new_history,
+                **({"client_message_id": request_identity["client_message_id"]} if request_identity else {}),
+            }
 
         registry = await create_full_registry(pool)
         agent_profile = await get_agent_profile_context(pool=pool)
@@ -666,6 +819,9 @@ async def chat_turn(
             dsn=dsn,
             max_iterations=max_tool_iterations,
             visual_attachments=visual_attachments,
+            chat_message_projection=request_identity is not None,
+            chat_source_identity=request_identity["source_identity"] if request_identity else None,
+            chat_work_execution_id=None,
             on_event=on_event,
         )
         assistant_text = loop_result.text
@@ -703,6 +859,11 @@ async def chat_turn(
             action_receipts=action_receipts,
             agent_turn_id=agent_turn_id,
             surface=surface,
+            attachments=attachments,
+            source_identity=request_identity["source_identity"] if request_identity else None,
+            user_source_message_id=request_identity["user_source_message_id"] if request_identity else None,
+            assistant_source_message_id=request_identity["assistant_source_message_id"] if request_identity else None,
+            submission_fingerprint=request_identity["submission_fingerprint"] if request_identity else None,
         )
         await _apply_chat_energy_effects(
             pool,
@@ -716,7 +877,11 @@ async def chat_turn(
         new_history = await _hydrate_after_persist(
             mem_client, session_id, fallback_history
         )
-        return {"assistant": assistant_text, "history": new_history}
+        return {
+            "assistant": assistant_text,
+            "history": new_history,
+            **({"client_message_id": request_identity["client_message_id"]} if request_identity else {}),
+        }
     finally:
         if own_pool:
             await pool.close()
@@ -825,6 +990,7 @@ async def stream_chat_events(
     memory_limit: int = 10,
     max_tool_iterations: int | None = None,
     session_id: str | None = None,
+    client_message_id: str | None = None,
     pool: Any | None = None,
     user_label: str | None = None,
     is_group: bool = False,
@@ -937,6 +1103,46 @@ async def stream_chat_events(
                 )
                 return
 
+        request_identity = None
+        if surface in {"chat", "api", "cli"} and session_id:
+            try:
+                request_identity = await _persist_chat_user_source(
+                    pool,
+                    user_message=user_message,
+                    session_id=session_id,
+                    client_message_id=client_message_id,
+                    surface=surface,
+                    attachments=attachments,
+                    visual_attachments=visual_attachments,
+                    prompt_addenda=prompt_addenda,
+                )
+            except ChatRequestIdentityError as exc:
+                yield AgentEventData(
+                    event=AgentEvent.ERROR,
+                    data={"error": str(exc), "error_type": "ChatRequestIdentityError"},
+                )
+                yield AgentEventData(
+                    event=AgentEvent.LOOP_END,
+                    data={"stopped_reason": "error"},
+                )
+                return
+            session_id = request_identity["session_id"]
+            if request_identity["replayed"]:
+                yield AgentEventData(
+                    event=AgentEvent.LOOP_START,
+                    data={"phase": "conscious_final", "runtime": "replay"},
+                )
+                if request_identity["assistant"]:
+                    yield AgentEventData(
+                        event=AgentEvent.TEXT_DELTA,
+                        data={"text": request_identity["assistant"], "runtime": "replay"},
+                    )
+                yield AgentEventData(
+                    event=AgentEvent.LOOP_END,
+                    data={"stopped_reason": "completed", "runtime": "replay"},
+                )
+                return
+
         is_operator = _trusted_operator_turn(
             surface=surface,
             is_group=is_group,
@@ -967,7 +1173,14 @@ async def stream_chat_events(
             except Exception:
                 logger.debug("Gateway record failed (non-fatal)", exc_info=True)
 
-        history = await _hydrate_chat_history(pool, session_id, history)
+        history = await _hydrate_chat_history(
+            pool,
+            session_id,
+            history,
+            exclude_source_message_id=(
+                request_identity["user_source_message_id"] if request_identity else None
+            ),
+        )
 
         setup_intent = await detect_connector_setup_intent(
             pool, user_message, session_id=session_id
@@ -1017,6 +1230,10 @@ async def stream_chat_events(
                     background_dsn=dsn,
                     surface=surface,
                     attachments=attachments,
+                    source_identity=request_identity["source_identity"] if request_identity else None,
+                    user_source_message_id=request_identity["user_source_message_id"] if request_identity else None,
+                    assistant_source_message_id=request_identity["assistant_source_message_id"] if request_identity else None,
+                    submission_fingerprint=request_identity["submission_fingerprint"] if request_identity else None,
                 )
                 yield AgentEventData(
                     event=AgentEvent.PHASE_CHANGE,
@@ -1105,6 +1322,10 @@ async def stream_chat_events(
                         background_dsn=dsn,
                         surface=surface,
                         attachments=attachments,
+                        source_identity=request_identity["source_identity"] if request_identity else None,
+                        user_source_message_id=request_identity["user_source_message_id"] if request_identity else None,
+                        assistant_source_message_id=request_identity["assistant_source_message_id"] if request_identity else None,
+                        submission_fingerprint=request_identity["submission_fingerprint"] if request_identity else None,
                     )
                     yield AgentEventData(
                         event=AgentEvent.PHASE_CHANGE,
@@ -1176,6 +1397,9 @@ async def stream_chat_events(
             temperature=temperature,
             on_approval=on_approval,
             visual_attachments=visual_attachments,
+            chat_message_projection=request_identity is not None,
+            chat_source_identity=request_identity["source_identity"] if request_identity else None,
+            chat_work_execution_id=None,
         ):
             event_turn_id = _uuid_text_or_none(
                 str(event.data.get("turn_id") or "") or None
@@ -1244,6 +1468,10 @@ async def stream_chat_events(
                 agent_turn_id=agent_turn_id,
                 surface=surface,
                 attachments=attachments,
+                source_identity=request_identity["source_identity"] if request_identity else None,
+                user_source_message_id=request_identity["user_source_message_id"] if request_identity else None,
+                assistant_source_message_id=request_identity["assistant_source_message_id"] if request_identity else None,
+                submission_fingerprint=request_identity["submission_fingerprint"] if request_identity else None,
             )
             yield AgentEventData(
                 event=AgentEvent.PHASE_CHANGE,

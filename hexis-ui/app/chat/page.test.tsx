@@ -181,6 +181,8 @@ describe("ChatPage attachments", () => {
       expect(chatBodies.length).toBe(1);
     });
     const body = chatBodies[0];
+    expect(body.client_message_id).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(body.session_id).toMatch(/^[0-9a-f-]{36}$/i);
     const visualAttachments = body.visual_attachments as Record<string, unknown>[];
     expect(visualAttachments).toHaveLength(1);
     expect(visualAttachments[0].data_url).toMatch(/^data:image\/png;base64,/);

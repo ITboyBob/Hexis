@@ -888,6 +888,9 @@ async def run_agent(
     max_tokens: int | None = None,
     max_iterations: int | None = None,
     visual_attachments: list[dict[str, Any]] | None = None,
+    chat_message_projection: bool = False,
+    chat_source_identity: str | None = None,
+    chat_work_execution_id: str | None = None,
 ) -> "AgentLoopResult":
     """
     Unified entry point for both chat and heartbeat agent invocations.
@@ -904,6 +907,14 @@ async def run_agent(
 
     if tool_context is None:
         tool_context = ToolContext.CHAT if mode == "chat" else ToolContext.HEARTBEAT
+    if chat_message_projection and (
+        mode != "chat"
+        or tool_context != ToolContext.CHAT
+        or surface not in {"chat", "api", "cli"}
+        or not session_id
+        or not chat_source_identity
+    ):
+        raise ValueError("chat message projection requires an explicitly bound chat host and source identity")
 
     # 1. Load LLM configs
     async with pool.acquire() as conn:
@@ -1144,6 +1155,9 @@ async def run_agent(
             surface=surface,
             tool_surface_input_hash=hash_input_text(skill_query),
             available_skill_count=len(skill_selection.available),
+            chat_message_projection=chat_message_projection,
+            chat_source_identity=chat_source_identity,
+            chat_work_execution_id=chat_work_execution_id,
         )
     else:
         effective_timeout = (
@@ -1219,6 +1233,9 @@ async def stream_agent(
     on_approval: "Callable[[str, dict[str, Any]], Awaitable[bool | dict[str, Any]]] | None" = None,
     prompt_addenda: list[str] | None = None,
     visual_attachments: list[dict[str, Any]] | None = None,
+    chat_message_projection: bool = False,
+    chat_source_identity: str | None = None,
+    chat_work_execution_id: str | None = None,
 ) -> AsyncIterator[AgentEventData]:
     """
     Streaming variant of run_agent(). Yields AgentEventData as they happen.
@@ -1237,6 +1254,14 @@ async def stream_agent(
 
     if tool_context is None:
         tool_context = ToolContext.CHAT if mode == "chat" else ToolContext.HEARTBEAT
+    if chat_message_projection and (
+        mode != "chat"
+        or tool_context != ToolContext.CHAT
+        or surface not in {"chat", "api", "cli"}
+        or not session_id
+        or not chat_source_identity
+    ):
+        raise ValueError("chat message projection requires an explicitly bound chat host and source identity")
 
     # 1. Load LLM config and run pre-phases
     async with pool.acquire() as conn:
@@ -1423,6 +1448,9 @@ async def stream_agent(
         surface=surface,
         tool_surface_input_hash=hash_input_text(user_message),
         available_skill_count=len(skill_selection.available),
+        chat_message_projection=chat_message_projection,
+        chat_source_identity=chat_source_identity,
+        chat_work_execution_id=chat_work_execution_id,
     )
 
     agent = AgentLoop(loop_config)

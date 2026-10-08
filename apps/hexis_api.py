@@ -432,6 +432,9 @@ class ChatRequest(BaseModel):
     # turn's `done` event to keep one conversation as one session; omit and
     # the server mints one (returned in `done`).
     session_id: str | None = None
+    # Stable identity for retrying one logical submission. Server-owned turn
+    # IDs are deliberately not accepted from public callers.
+    client_message_id: uuid.UUID | None = None
 
 
 class InboxReplyRequest(BaseModel):
@@ -5163,6 +5166,7 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
             session_id = None
     if session_id is None:
         session_id = str(uuid.uuid4())
+    client_message_id = req.client_message_id or uuid.uuid4()
 
     full_text = ""
     conscious_started = False
@@ -5175,7 +5179,11 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
     citation_sources = {}
 
     def build_done_payload() -> dict[str, Any]:
-        payload: dict[str, Any] = {"assistant": full_text, "session_id": session_id}
+        payload: dict[str, Any] = {
+            "assistant": full_text,
+            "session_id": session_id,
+            "client_message_id": str(client_message_id),
+        }
         if full_text:
             payload["presentation"] = presentation_from_text(
                 full_text, citation_sources.values()
@@ -5186,6 +5194,7 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
         return {
             "assistant": full_text,
             "session_id": session_id,
+            "client_message_id": str(client_message_id),
             "message": failure_message,
             "incomplete": True,
         }
@@ -5209,6 +5218,7 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
             user_message=user_message,
             history=history,
             session_id=session_id,
+            client_message_id=str(client_message_id),
             dsn=dsn,
             pool=pool,
             prompt_addenda=addenda,

@@ -2230,9 +2230,15 @@ export default function ChatPage() {
     let finalAssistantText: string | null = null;
 
     try {
-      const currentSessionId = sessionId || loadSessionId();
+      const priorSessionId = sessionId || loadSessionId();
+      const currentSessionId = priorSessionId || crypto.randomUUID();
+      if (!priorSessionId) {
+        saveSessionId(currentSessionId);
+        setSessionId(currentSessionId);
+      }
       const chatBody: {
         message: string;
+        client_message_id: string;
         prompt_addenda: string[];
         visual_attachments?: ChatVisualAttachmentPayload[];
         attachments?: ChatAttachmentPayload[];
@@ -2240,6 +2246,7 @@ export default function ChatPage() {
         history?: { role: string; content: string }[];
       } = {
         message: userMessage.content,
+        client_message_id: userMessage.id,
         prompt_addenda: [...promptAddenda, ...attachmentAddenda],
         session_id: currentSessionId,
       };
@@ -2249,7 +2256,7 @@ export default function ChatPage() {
       if (attachmentPayload.length > 0) {
         chatBody.attachments = attachmentPayload;
       }
-      if (!currentSessionId && historyPayload.length > 0) {
+      if (!priorSessionId && historyPayload.length > 0) {
         chatBody.history = historyPayload;
       }
 

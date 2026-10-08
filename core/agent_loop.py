@@ -274,6 +274,11 @@ class AgentLoopConfig:
     is_group: bool = False
     is_operator: bool = False
     heartbeat_id: str | None = None
+    # Durable chat-message projection is opt-in and is set only by the
+    # services.chat host after it has persisted the real user source identity.
+    chat_message_projection: bool = False
+    chat_source_identity: str | None = None
+    chat_work_execution_id: str | None = None
 
     # Callbacks
     on_event: Callable[[AgentEventData], Awaitable[None]] | None = None
@@ -961,6 +966,7 @@ class AgentLoop:
                         ),
                         "energy_spent": result.energy_spent,
                         "duration_seconds": result.duration_seconds,
+                        "metadata": result.metadata,
                     },
                 )
                 self._energy_spent = int(
@@ -1262,6 +1268,11 @@ class AgentLoop:
                         "max_iterations": self.config.max_iterations,
                         "max_continuations": self.config.max_continuations,
                         "heartbeat_id": self.config.heartbeat_id,
+                        "runtime_state": {
+                            "chat_message_projection": self.config.chat_message_projection,
+                            "chat_source_identity": self.config.chat_source_identity,
+                            "chat_work_execution_id": self.config.chat_work_execution_id,
+                        },
                     }
                 ),
             )

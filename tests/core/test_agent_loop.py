@@ -249,6 +249,105 @@ class TestToolCalls:
         assert result.tool_calls_made[0]["success"] is True
 
     @patch("core.agent_loop.chat_completion")
+    async def test_chat_tool_result_is_durable_before_followup_provider_call(
+        self, mock_llm
+    ):
+        session_id = str(uuid.uuid4())
+        source_identity = f"chat:{session_id}:{uuid.uuid4()}"
+        call_id = f"call_{uuid.uuid4().hex}"
+        registry = _mock_registry(
+            execute_results={"read_file": ToolResult.success_result({"text": "contents"})}
+        )
+        provider_calls = 0
+
+        async def provider(**_kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            if provider_calls == 1:
+                return _tool_response(
+                    "", [_tool_call("read_file", {"path": "README.md"}, call_id)]
+                )
+            async with _DB_POOL.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT role,metadata FROM chat_messages "
+                    "WHERE session_id=$1::uuid AND source_message_id=$2",
+                    session_id,
+                    f"tool:{agent._turn_id}:{call_id}:result",
+                )
+            assert row is not None
+            assert row["role"] == "toolResult"
+            raise RuntimeError("follow-up provider failed")
+
+        mock_llm.side_effect = provider
+        config = _make_config(
+            registry=registry,
+            session_id=session_id,
+            chat_message_projection=True,
+            chat_source_identity=source_identity,
+        )
+        agent = AgentLoop(config)
+        result = await agent.run("Read README")
+
+        assert result.stopped_reason == "error"
+        assert provider_calls == 2
+        assert registry.execute.await_count == 1
+        async with _DB_POOL.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT count(*) FROM chat_messages WHERE session_id=$1::uuid AND role='toolResult'",
+                session_id,
+            ) == 1
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_chat_result_write_failure_stops_before_next_provider_call(
+        self, mock_llm, monkeypatch
+    ):
+        session_id = str(uuid.uuid4())
+        client_message_id = str(uuid.uuid4())
+        source_identity = f"chat:{session_id}:{client_message_id}"
+        side_effect_count = 0
+        registry = _mock_registry(
+            execute_results={"write_file": ToolResult.success_result({"written": True})}
+        )
+
+        async def execute_once(name, arguments, context):
+            nonlocal side_effect_count
+            side_effect_count += 1
+            return ToolResult.success_result({"written": True})
+
+        registry.execute = AsyncMock(side_effect=execute_once)
+        mock_llm.return_value = _tool_response(
+            "Writing.", [_tool_call("write_file", {"path": "notes.txt"})]
+        )
+        config = _make_config(
+            registry=registry,
+            session_id=session_id,
+            chat_message_projection=True,
+            chat_source_identity=source_identity,
+        )
+        agent = AgentLoop(config)
+
+        async def fail_result_write(*_args, **_kwargs):
+            raise RuntimeError("simulated durable result write failure")
+
+        monkeypatch.setattr(agent, "_record_tool_result", fail_result_write)
+        with pytest.raises(RuntimeError, match="durable result write failure"):
+            await agent.run("Write a note")
+
+        assert side_effect_count == 1
+        assert mock_llm.await_count == 1
+        async with _DB_POOL.acquire() as conn:
+            call_count = await conn.fetchval(
+                "SELECT count(*) FROM chat_messages WHERE session_id=$1::uuid AND role='assistant'",
+                session_id,
+            )
+            result_count = await conn.fetchval(
+                "SELECT count(*) FROM chat_messages WHERE session_id=$1::uuid AND role='toolResult'",
+                session_id,
+            )
+        assert call_count == 1
+        assert result_count == 0
+
+    @patch("core.agent_loop.chat_completion")
     async def test_multiple_tool_calls_in_one_response(self, mock_llm):
         """LLM makes two tool calls in a single response."""
         recall_result = ToolResult.success_result({"data": "recalled"})

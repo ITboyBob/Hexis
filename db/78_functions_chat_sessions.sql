@@ -731,14 +731,26 @@ BEGIN
     );
 
     IF NULLIF(COALESCE(p_user_text, ''), '') IS NOT NULL THEN
-        user_message := append_chat_message(
-            p_session_id,
-            'user',
-            p_user_text,
-            COALESCE(ctx->'user_metadata', '{}'::jsonb),
-            NULLIF(ctx->>'user_source_message_id', ''),
-            TRUE
-        );
+        IF NULLIF(ctx->>'user_source_message_id', '') IS NOT NULL THEN
+            user_message := append_chat_message_blocks(
+                p_session_id,
+                'user',
+                p_user_text,
+                jsonb_build_array(jsonb_build_object('type', 'text', 'text', p_user_text)),
+                COALESCE(ctx->'user_metadata', '{}'::jsonb),
+                NULLIF(ctx->>'user_source_message_id', ''),
+                TRUE
+            );
+        ELSE
+            user_message := append_chat_message(
+                p_session_id,
+                'user',
+                p_user_text,
+                COALESCE(ctx->'user_metadata', '{}'::jsonb),
+                NULL,
+                TRUE
+            );
+        END IF;
         -- Every chat surface (web, CLI, API) funnels here, so this is the one
         -- choke point that can mark real user contact (#112). Without it,
         -- last_user_contact only ever moved via the RabbitMQ inbox poller,
@@ -747,14 +759,26 @@ BEGIN
     END IF;
 
     IF NULLIF(COALESCE(p_assistant_text, ''), '') IS NOT NULL THEN
-        assistant_message := append_chat_message(
-            p_session_id,
-            'assistant',
-            p_assistant_text,
-            COALESCE(ctx->'assistant_metadata', '{}'::jsonb),
-            NULLIF(ctx->>'assistant_source_message_id', ''),
-            TRUE
-        );
+        IF NULLIF(ctx->>'assistant_source_message_id', '') IS NOT NULL THEN
+            assistant_message := append_chat_message_blocks(
+                p_session_id,
+                'assistant',
+                p_assistant_text,
+                jsonb_build_array(jsonb_build_object('type', 'text', 'text', p_assistant_text)),
+                COALESCE(ctx->'assistant_metadata', '{}'::jsonb),
+                NULLIF(ctx->>'assistant_source_message_id', ''),
+                TRUE
+            );
+        ELSE
+            assistant_message := append_chat_message(
+                p_session_id,
+                'assistant',
+                p_assistant_text,
+                COALESCE(ctx->'assistant_metadata', '{}'::jsonb),
+                NULL,
+                TRUE
+            );
+        END IF;
     END IF;
 
     IF COALESCE(p_user_text, '') <> '' OR COALESCE(p_assistant_text, '') <> '' THEN

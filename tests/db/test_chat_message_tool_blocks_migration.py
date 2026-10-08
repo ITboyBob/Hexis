@@ -11,7 +11,7 @@ pytestmark = [pytest.mark.asyncio(loop_scope="session")]
 
 @pytest.fixture(scope="module", autouse=True)
 async def apply_repo_migrations():
-    """Keep the survivor clone at its recorded 0267 schema until this test applies 0268."""
+    """Keep the survivor clone at 0267 until this test applies 0268 and 0269."""
     yield
 
 
@@ -38,7 +38,7 @@ def _migration_digest(rows):
     return digest.hexdigest()
 
 
-async def test_0268_preserves_old_rows_and_adds_block_aware_chat_messages(db_pool):
+async def test_0268_and_0269_preserve_old_rows_and_add_block_aware_chat_messages(db_pool):
     from core.migrations import apply_pending_migrations
 
     session_id = uuid4()
@@ -91,10 +91,11 @@ async def test_0268_preserves_old_rows_and_adds_block_aware_chat_messages(db_poo
         after_rows_digest = await _legacy_chat_digest(connection)
         after_ledger = await connection.fetch(
             "SELECT version,checksum FROM schema_migrations "
-            "WHERE version <> '0268_chat_message_tool_blocks' ORDER BY version"
+            "WHERE version NOT IN ('0268_chat_message_tool_blocks', '0269_agent_chat_tool_projection') "
+            "ORDER BY version"
         )
 
-    assert latest_migration == "0268_chat_message_tool_blocks"
+    assert latest_migration == "0269_agent_chat_tool_projection"
     assert after_rows_digest == before_rows_digest
     assert _migration_digest(after_ledger) == _migration_digest(before_ledger)
     assert str(after["id"]) == str(before["id"])

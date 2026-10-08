@@ -1,5 +1,7 @@
 from contextlib import asynccontextmanager
 import asyncio
+import json
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -655,15 +657,35 @@ async def test_stream_chat_events_keeps_token_streaming_when_rlm_streaming_disab
     assert not any(event.data.get("runtime") == "rlm" for event in events)
 
 
-async def test_stream_chat_events_persists_successful_tool_receipt(monkeypatch):
+async def test_stream_chat_events_persists_successful_tool_receipt(monkeypatch, db_pool):
     turn_id = str(uuid4())
     memory_id = str(uuid4())
+    session_id = str(uuid4())
+    client_message_id = str(uuid4())
+    source_identity = f"chat:{session_id}:{client_message_id}"
     captured: dict[str, object] = {}
 
     async def fake_agent_profile(*_args, **_kwargs):
         return {}
 
     async def fake_stream_agent(*_args, **_kwargs):
+        assert _kwargs["chat_message_projection"] is True
+        assert _kwargs["chat_source_identity"] == source_identity
+        assert not any(
+            item.get("role") == "user" and item.get("content") == "Please remember this"
+            for item in _kwargs["history"]
+        )
+        async with db_pool.acquire() as connection:
+            user = await connection.fetchrow(
+                "SELECT role,content,source_message_id FROM chat_messages "
+                "WHERE session_id=$1::uuid AND source_message_id=$2",
+                session_id,
+                f"{source_identity}:user",
+            )
+        assert user is not None
+        assert user["role"] == "user"
+        assert user["content"] == "Please remember this"
+        assert user["source_message_id"] == f"{source_identity}:user"
         yield AgentEventData(
             event=AgentEvent.LOOP_START,
             data={"turn_id": turn_id},
@@ -699,6 +721,12 @@ async def test_stream_chat_events_persists_successful_tool_receipt(monkeypatch):
     async def fake_energy(*_args, **_kwargs):
         return {}
 
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO config (key, value, description) VALUES ('chat.use_rlm', 'false', 'test override') "
+            "ON CONFLICT (key) DO UPDATE SET value='false'"
+        )
+
     monkeypatch.setattr(chat_mod, "get_agent_profile_context", fake_agent_profile)
     monkeypatch.setattr(chat_mod, "stream_agent", fake_stream_agent)
     monkeypatch.setattr(chat_mod, "_remember_conversation", fake_remember)
@@ -711,8 +739,9 @@ async def test_stream_chat_events_persists_successful_tool_receipt(monkeypatch):
             history=[],
             llm_config={"provider": "openai", "model": "gpt-4o"},
             dsn="postgresql://unused",
-            pool=_ConfigPool({"chat.use_rlm": False}),
-            session_id=str(uuid4()),
+            pool=db_pool,
+            session_id=session_id,
+            client_message_id=client_message_id,
         )
     ]
 
@@ -721,3 +750,157 @@ async def test_stream_chat_events_persists_successful_tool_receipt(monkeypatch):
     receipts = captured["action_receipts"]
     assert receipts[0]["name"] == "remember"
     assert receipts[0]["result"]["memory_id"] == memory_id
+
+
+async def test_chat_turn_persists_user_before_agent_and_reuses_client_identity(monkeypatch, db_pool):
+    session_id = str(uuid4())
+    client_message_id = str(uuid4())
+    source_identity = f"chat:{session_id}:{client_message_id}"
+    call_order = []
+    remembered = {}
+    async with db_pool.acquire() as connection:
+        await connection.execute(
+            "INSERT INTO config (key, value, description) VALUES ('chat.use_rlm', 'false', 'test override') "
+            "ON CONFLICT (key) DO UPDATE SET value='false'"
+        )
+
+    async def fake_capture(*_args, **_kwargs):
+        return {}
+
+    async def fake_agent_profile(*_args, **_kwargs):
+        return {}
+
+    async def fake_run_agent(*_args, **kwargs):
+        call_order.append("agent")
+        assert kwargs["chat_message_projection"] is True
+        assert kwargs["chat_source_identity"] == source_identity
+        assert kwargs["chat_work_execution_id"] is None
+        async with db_pool.acquire() as connection:
+            user = await connection.fetchrow(
+                "SELECT role,content,content_blocks,source_message_id FROM chat_messages "
+                "WHERE session_id=$1::uuid AND source_message_id=$2",
+                session_id,
+                f"{source_identity}:user",
+            )
+            turns = await connection.fetchval(
+                "SELECT count(*) FROM agent_turns WHERE session_id=$1::uuid",
+                session_id,
+            )
+        assert user is not None
+        assert user["role"] == "user"
+        assert user["content"] == "Question with one source identity."
+        blocks = (
+            json.loads(user["content_blocks"])
+            if isinstance(user["content_blocks"], str)
+            else user["content_blocks"]
+        )
+        assert blocks == [
+            {"type": "text", "text": "Question with one source identity."}
+        ]
+        assert user["source_message_id"] == f"{source_identity}:user"
+        assert turns == 0
+        return SimpleNamespace(
+            text="Answer.", turn_id=str(uuid4()), tool_results=[], energy_spent=0
+        )
+
+    async def fake_remember(_client, **kwargs):
+        call_order.append("complete")
+        remembered.update(kwargs)
+        context = {
+            "source_identity": kwargs["source_identity"],
+            "user_source_message_id": kwargs["user_source_message_id"],
+            "assistant_source_message_id": kwargs["assistant_source_message_id"],
+            "user_metadata": {
+                "submission_fingerprint": kwargs["submission_fingerprint"],
+            },
+            "assistant_metadata": {"agent_turn_id": kwargs["agent_turn_id"]},
+            "surface": "api",
+        }
+        async with db_pool.acquire() as connection:
+            await connection.fetchval(
+                "SELECT record_chat_session_turn($1::uuid,$2,$3,'api',$4::jsonb)",
+                session_id,
+                kwargs["user_message"],
+                kwargs["assistant_message"],
+                json.dumps(context),
+            )
+        return {"memory": {"raw": {"status": "stored"}}}
+
+    async def fake_energy(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(chat_mod, "_capture_operator_policy_for_turn", fake_capture)
+    monkeypatch.setattr(chat_mod, "get_agent_profile_context", fake_agent_profile)
+    async def fake_registry(*_args, **_kwargs):
+        return object()
+
+    monkeypatch.setattr(chat_mod, "create_full_registry", fake_registry)
+    monkeypatch.setattr(chat_mod, "run_agent", fake_run_agent)
+    monkeypatch.setattr(chat_mod, "_remember_conversation", fake_remember)
+    monkeypatch.setattr(chat_mod, "_apply_chat_energy_effects", fake_energy)
+
+    result = await chat_mod.chat_turn(
+        user_message="Question with one source identity.",
+        history=[],
+        llm_config={"provider": "openai", "model": "gpt-4o"},
+        session_id=session_id,
+        client_message_id=client_message_id,
+        pool=db_pool,
+        surface="api",
+    )
+
+    assert result["assistant"] == "Answer."
+    assert result["client_message_id"] == client_message_id
+    assert call_order == ["agent", "complete"]
+    assert remembered["source_identity"] == source_identity
+    assert remembered["user_source_message_id"] == f"{source_identity}:user"
+    assert remembered["assistant_source_message_id"] == f"{source_identity}:assistant"
+    async with db_pool.acquire() as connection:
+        assert await connection.fetchval(
+            "SELECT count(*) FROM chat_messages WHERE session_id=$1::uuid "
+            "AND source_message_id=$2 AND role='user'",
+            session_id,
+            f"{source_identity}:user",
+        ) == 1
+        assert await connection.fetchval(
+            "SELECT count(*) FROM chat_messages WHERE session_id=$1::uuid "
+            "AND source_message_id=$2 AND role='assistant'",
+            session_id,
+            f"{source_identity}:assistant",
+        ) == 1
+
+    replay = await chat_mod.chat_turn(
+        user_message="Question with one source identity.",
+        history=[],
+        llm_config={"provider": "openai", "model": "gpt-4o"},
+        session_id=session_id,
+        client_message_id=client_message_id,
+        pool=db_pool,
+        surface="api",
+    )
+    assert replay["assistant"] == "Answer."
+    assert replay["client_message_id"] == client_message_id
+    assert call_order == ["agent", "complete"]
+
+    with pytest.raises(chat_mod.ChatRequestIdentityError, match="conflicts"):
+        await chat_mod.chat_turn(
+            user_message="Same identity with changed body.",
+            history=[],
+            llm_config={"provider": "openai", "model": "gpt-4o"},
+            session_id=session_id,
+            client_message_id=client_message_id,
+            pool=db_pool,
+            surface="api",
+        )
+    with pytest.raises(chat_mod.ChatRequestIdentityError, match="conflicts"):
+        await chat_mod.chat_turn(
+            user_message="Question with one source identity.",
+            history=[],
+            llm_config={"provider": "openai", "model": "gpt-4o"},
+            session_id=session_id,
+            client_message_id=client_message_id,
+            attachments=[{"name": "different.pdf"}],
+            pool=db_pool,
+            surface="api",
+        )
+    assert call_order == ["agent", "complete"]

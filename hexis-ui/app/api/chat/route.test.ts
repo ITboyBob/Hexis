@@ -86,4 +86,28 @@ describe("/api/chat", () => {
     expect(headers.get("Authorization")).toBe("Bearer dashboard-api-key");
     expect(headers.get("Accept")).toBe("text/event-stream");
   });
+
+  it("forwards the stable client submission identity unchanged", async () => {
+    const body = JSON.stringify({
+      message: "Hello",
+      session_id: "10000000-0000-4000-8000-000000000001",
+      client_message_id: "30000000-0000-4000-8000-000000000001",
+    });
+    const fetchMock = vi.fn(async () =>
+      new Response("event: done\\ndata: {}\\n\\n", {
+        headers: { "Content-Type": "text/event-stream" },
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      })
+    );
+
+    expect(fetchMock.mock.calls[0][1]?.body).toBe(body);
+  });
 });
