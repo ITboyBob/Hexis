@@ -898,6 +898,244 @@ def test_final_verifier_keeps_historical_lineage_even_when_case_validation_fails
     assert result["state"] == "verification_incomplete"
 
 
+def _resume_fixture(tmp_path, monkeypatch):
+    root, material = tmp_path / "repo", tmp_path / "material"
+    run = material / "runs/run-01"
+    (run / "evidence").mkdir(parents=True)
+    root.mkdir()
+    files = ("product.py", "apps/bob108_tool_activity_probe.py", "tests/services/test_bob108_tool_activity_probe.py", "hexis-ui/e2e/tool-activity.spec.ts")
+    hashes = {}
+    for relative in files:
+        source = root / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("original source")
+        hashes[relative] = probe._digest(source)
+    (root / files[1]).write_text("resume CLI")
+    (root / files[2]).write_text("resume regressions")
+    (root / files[3]).write_text("approved text E2E")
+    profile = {"provider": "openai-chat-completions-endpoint", "model": "qwen-plus", "endpoint": "https://provider.test/v1", "api_key_env": "DASHSCOPE_API_KEY"}
+    ports = {"pytest": 45816, "browser": 45815, "api": 44817, "ui": 3577, "embeddings": 45435}
+    runtime = {"database": "m5_acceptance_" + "a" * 32, "ports": ports, "provider_profile": profile,
+               "pytest": {"host": "127.0.0.1", "port": 45816, "database": "bob108_pytest", "user": "user"},
+               "target": {"host": "127.0.0.1", "port": 45815, "database": "m5_acceptance_" + "a" * 32, "admin_database": "postgres", "user": "user"},
+               "api_url": "http://127.0.0.1:44817", "ui_url": "http://127.0.0.1:3577", "embedding_url": "http://127.0.0.1:45435/api/embed"}
+    resources = {name: {"container_id": "id-" + name, "image_id": "image-" + name, "image_ref": "selected-image", "mounts": []} for name in ("pytest-db", "browser-db", "fake-embeddings")}
+    manifest = {"schema": "bob108-tool-activity-run-v1", "run_id": "a" * 32, "run_directory": str(run), "state": "stopped", "project": "owned-project", "services": list(resources), "ports": ports, "volumes": {"pytest": "pytest-data", "browser": "browser-data"},
+                "source_fingerprints": hashes, "runtime": runtime, "owned_resources": copy.deepcopy(resources), "api_process": None, "ui_process": None,
+                "consent": {"state": "consent", "operator_override": False, "consent_log_id": str(uuid4())},
+                "service_identities": {"pytest": {"database": "bob108_pytest", "system_identifier": "111"}, "browser_admin": {"database": "postgres", "system_identifier": "222"}, "target": {"database": runtime["database"], "system_identifier": "222"}}}
+    probe._atomic_json(run / "run-manifest.json", manifest)
+    old_voice = run / "evidence/add-evidence-voice-original.json"
+    probe._exclusive_json(old_voice, {"case": "add-evidence", "input_mode": "voice", "status": "FAIL"})
+    selected = {"run_id": manifest["run_id"], "selected_profile": profile, "configuration_hashes": {"config": "1" * 64}}
+    selection = {"_config_hashes": selected["configuration_hashes"], "credential_env_file": str(tmp_path / "credentials.env")}
+    values = {"POSTGRES_PASSWORD": "secret", "POSTGRES_USER": "user"}
+    monkeypatch.setattr(probe, "ROOT", root)
+    monkeypatch.setattr(probe, "MATERIAL_ROOT", material)
+    monkeypatch.setattr(probe, "load_run", lambda path: (run, json.loads((run / "run-manifest.json").read_text()), selected, selection, values))
+    monkeypatch.setattr(probe, "_process_command", lambda pid: None)
+    monkeypatch.setattr(probe, "_resume_configuration_hashes", lambda *args: {"compose": "same", "runtime.env": "same"}, raising=False)
+    statuses, operations = {name: "exited" for name in resources}, []
+    def inspect(*args, **kwargs):
+        return {"services": {name: {**record, "state": statuses[name]} for name, record in resources.items()}, "volumes": {"pytest": {"name": "owned-project_pytest-data"}, "browser": {"name": "owned-project_browser-data"}}}
+    monkeypatch.setattr(probe, "_inspect_resume_resources", inspect, raising=False)
+    def command(cmd, **kwargs):
+        operations.append(cmd)
+        if "start" in cmd:
+            statuses.update({name: "running" for name in resources})
+        elif cmd[:2] == ["docker", "stop"]:
+            for cid in cmd[2:]:
+                statuses[next(name for name in resources if resources[name]["container_id"] == cid)] = "exited"
+        else:
+            pytest.fail(f"unexpected resource command: {cmd}")
+        return type("Result", (), {"stdout": "", "returncode": 0})()
+    monkeypatch.setattr(probe.subprocess, "run", command)
+    async def live(*args):
+        return {"postgres": manifest["service_identities"], "real_consent_active": True, "embedding_healthy": True}
+    monkeypatch.setattr(probe, "_validate_resumed_runtime", live, raising=False)
+    def start_api(path):
+        m = json.loads((run / "run-manifest.json").read_text())
+        m["api_process"] = {"pid": 200, "run_id": m["run_id"]}
+        probe._atomic_json(run / "run-manifest.json", m)
+        operations.append(["serve-api"])
+        return {"api_pid": 200}
+    def start_ui(path):
+        m = json.loads((run / "run-manifest.json").read_text())
+        m["ui_process"] = {"pid": 201, "run_id": m["run_id"]}
+        probe._atomic_json(run / "run-manifest.json", m)
+        operations.append(["serve-ui"])
+        return {"ui_pid": 201}
+    def readiness(path):
+        m = json.loads((run / "run-manifest.json").read_text())
+        m["state"] = "ready"
+        probe._atomic_json(run / "run-manifest.json", m)
+        operations.append(["readiness"])
+        return {"state": "ready"}
+    monkeypatch.setattr(probe, "serve_api", start_api)
+    monkeypatch.setattr(probe, "serve_ui", start_ui)
+    monkeypatch.setattr(probe, "check_readiness", readiness)
+    monkeypatch.setattr(probe, "_stop_run_process", lambda process, **kwargs: operations.append(["stop-process", kwargs["role"]]) if process else None)
+    return run, manifest, resources, statuses, operations
+
+
+def test_resume_owned_starts_only_existing_containers_then_owned_services_and_two_readiness_checks(tmp_path, monkeypatch):
+    run, old, _resources, statuses, operations = _resume_fixture(tmp_path, monkeypatch)
+    before = (run / "run-manifest.json").read_bytes()
+    result = probe.resume_owned(run, source_files=["hexis-ui/e2e/tool-activity.spec.ts"], reason="用户批准text add_evidence，同一run恢复")
+    assert result["state"] == "ready" and result["provider_requested"] is False and result["consent_requested"] is False
+    assert operations[0][-4:] == ["start", "pytest-db", "browser-db", "fake-embeddings"]
+    assert operations[1:] == [["serve-api"], ["serve-ui"], ["readiness"], ["readiness"]]
+    assert all(status == "running" for status in statuses.values())
+    assert (run / "evidence/resume-owned-originals/run-manifest.json").read_bytes() == before
+    current = json.loads((run / "run-manifest.json").read_text())
+    assert current["acceptance_modes"]["add-evidence"] == "text_chat"
+    assert current["consent"] == old["consent"] and current["volumes"] == old["volumes"]
+    with pytest.raises(probe.ProbeError):
+        probe.resume_owned(run, source_files=["hexis-ui/e2e/tool-activity.spec.ts"], reason="禁止重复恢复")
+
+
+@pytest.mark.parametrize("invalid", ["state", "run-dir", "override", "consent", "unapproved-source", "missing-spec-approval", "product", "config", "container-id", "running-container", "pid"])
+def test_resume_owned_fail_closed_before_container_start(tmp_path, monkeypatch, invalid):
+    run, manifest, _resources, statuses, operations = _resume_fixture(tmp_path, monkeypatch)
+    sources = ["hexis-ui/e2e/tool-activity.spec.ts"]
+    if invalid == "state":
+        manifest["state"] = "ready"
+    elif invalid == "run-dir":
+        manifest["run_directory"] = str(tmp_path / "other")
+    elif invalid == "override":
+        manifest["consent"]["operator_override"] = True
+    elif invalid == "consent":
+        manifest["consent"]["state"] = "unknown"
+    elif invalid == "unapproved-source":
+        sources.append("product.py")
+    elif invalid == "missing-spec-approval":
+        sources = []
+    elif invalid == "product":
+        (probe.ROOT / "product.py").write_text("drift")
+    elif invalid == "config":
+        def deny(*args):
+            raise probe.ProbeError("selected config hash changed")
+        monkeypatch.setattr(probe, "_resume_configuration_hashes", deny)
+    elif invalid == "container-id":
+        manifest["owned_resources"]["browser-db"]["container_id"] = "unowned"
+    elif invalid == "running-container":
+        statuses["browser-db"] = "running"
+    elif invalid == "pid":
+        manifest["api_process"] = {"pid": 300, "run_id": manifest["run_id"]}
+        monkeypatch.setattr(probe, "_process_command", lambda pid: "unrelated process")
+    probe._atomic_json(run / "run-manifest.json", manifest)
+    before = (run / "run-manifest.json").read_bytes()
+    with pytest.raises(probe.ProbeError):
+        probe.resume_owned(run, source_files=sources, reason="严格恢复门禁")
+    assert operations == []
+    assert (run / "run-manifest.json").read_bytes() == before
+    assert not (run / "evidence/resume-owned-audit.json").exists()
+
+
+@pytest.mark.parametrize("failure", ["partial-start", "runtime-db", "api", "ui", "readiness"])
+def test_resume_owned_failure_stops_only_new_owned_resources_and_preserves_volumes(tmp_path, monkeypatch, failure):
+    run, manifest, resources, statuses, operations = _resume_fixture(tmp_path, monkeypatch)
+    if failure == "partial-start":
+        def command(cmd, **kwargs):
+            operations.append(cmd)
+            if "start" in cmd:
+                statuses["pytest-db"] = "running"
+                raise probe.subprocess.CalledProcessError(1, cmd)
+            assert cmd == ["docker", "stop", resources["pytest-db"]["container_id"]]
+            statuses["pytest-db"] = "exited"
+            return type("Result", (), {"stdout": "", "returncode": 0})()
+        monkeypatch.setattr(probe.subprocess, "run", command)
+    elif failure == "runtime-db":
+        async def deny(*args):
+            raise probe.ProbeError("real DB/consent/embedding mismatch")
+        monkeypatch.setattr(probe, "_validate_resumed_runtime", deny)
+    else:
+        def deny(*args):
+            raise probe.ProbeError("controlled startup failure")
+        monkeypatch.setattr(probe, {"api": "serve_api", "ui": "serve_ui", "readiness": "check_readiness"}[failure], deny)
+    with pytest.raises(probe.ProbeError):
+        probe.resume_owned(run, source_files=["hexis-ui/e2e/tool-activity.spec.ts"], reason="失败仅回滚本次资源")
+    assert all(status == "exited" for status in statuses.values())
+    current = json.loads((run / "run-manifest.json").read_text())
+    assert current["state"] == "stopped" and current["volumes"] == manifest["volumes"]
+    assert all(not any(part in cmd for part in ("up", "build", "down", "-v", "reset", "recreate")) for cmd in operations)
+    assert (run / "evidence/resume-owned-result.json").exists()
+
+
+def test_resumed_runtime_derives_missing_pytest_user_from_existing_selected_credentials(tmp_path, monkeypatch):
+    validator = probe._validate_resumed_runtime
+    _run, manifest, _resources, _statuses, _operations = _resume_fixture(tmp_path, monkeypatch)
+    manifest["runtime"]["pytest"].pop("user")
+    before = copy.deepcopy(manifest["runtime"])
+    async def ready(runtime, values):
+        assert runtime["pytest"]["user"] == values["POSTGRES_USER"] == "user"
+        return {"postgres": {"pytest": manifest["service_identities"]["pytest"], "target": manifest["service_identities"]["browser_admin"]}, "fake_embeddings_health": {"models": []}}
+    async def identity(*args):
+        return manifest["service_identities"]["target"]
+    async def consent(*args):
+        return {"real_consent_active": True}
+    monkeypatch.setattr(probe, "_wait_owned_postgres", ready)
+    monkeypatch.setattr(probe.control_runtime, "_pg_identity", identity)
+    monkeypatch.setattr(probe, "_validate_final_verification_target", consent)
+    result = asyncio.run(validator(manifest, {"POSTGRES_USER": "user", "POSTGRES_PASSWORD": "secret"}))
+    assert result["real_consent_active"] is True
+    assert manifest["runtime"] == before
+
+
+def test_resume_failure_records_safe_stage_and_cause_without_exception_text(tmp_path, monkeypatch):
+    run, _manifest, _resources, _statuses, _operations = _resume_fixture(tmp_path, monkeypatch)
+    async def failure(*args):
+        try:
+            raise KeyError("user")
+        except KeyError as cause:
+            raise probe.ProbeError("owned run-01 PostgreSQL or fake embedding service did not become ready") from cause
+    monkeypatch.setattr(probe, "_validate_resumed_runtime", failure)
+    with pytest.raises(probe.ProbeError):
+        probe.resume_owned(run, source_files=["hexis-ui/e2e/tool-activity.spec.ts"], reason="安全分类")
+    result = json.loads((run / "evidence/resume-owned-result.json").read_text())
+    assert result["error_stage"] == "runtime_check"
+    assert result["cause_type"] == "KeyError"
+    assert result["missing_binding_field"] == "user"
+    assert result["error_classification"] == "database_or_embedding_timeout"
+    assert "secret" not in (run / "evidence/resume-owned-result.json").read_text()
+
+
+@pytest.mark.parametrize("invalid", [None, "rollback-incomplete", "provider-requested", "first-audit-changed", "first-result-missing"])
+def test_resume_allows_exactly_one_audited_failed_attempt_retry_without_overwriting_history(tmp_path, monkeypatch, invalid):
+    run, _manifest, _resources, statuses, _operations = _resume_fixture(tmp_path, monkeypatch)
+    async def failure(*args):
+        raise probe.ProbeError("owned run-01 PostgreSQL or fake embedding service did not become ready")
+    monkeypatch.setattr(probe, "_validate_resumed_runtime", failure)
+    with pytest.raises(probe.ProbeError):
+        probe.resume_owned(run, source_files=["hexis-ui/e2e/tool-activity.spec.ts"], reason="首次受控失败")
+    originals = {p: p.read_bytes() for p in (run / "evidence").rglob("*") if p.is_file()}
+    result_path = run / "evidence/resume-owned-result.json"
+    if invalid in {"rollback-incomplete", "provider-requested"}:
+        result = json.loads(result_path.read_text())
+        result["rollback_failures" if invalid == "rollback-incomplete" else "provider_requested"] = ["identity_changed"] if invalid == "rollback-incomplete" else True
+        probe._atomic_json(result_path, result)
+    elif invalid == "first-audit-changed":
+        (run / "evidence/resume-owned-audit.json").write_text("{}")
+    elif invalid == "first-result-missing":
+        result_path.unlink()
+    async def recovered(*args):
+        return {"real_consent_active": True}
+    monkeypatch.setattr(probe, "_validate_resumed_runtime", recovered)
+    kwargs = {"source_files": ["hexis-ui/e2e/tool-activity.spec.ts"], "reason": "明确授权额外一次恢复", "retry_failed_once": True}
+    if invalid is not None:
+        with pytest.raises(probe.ProbeError):
+            probe.resume_owned(run, **kwargs)
+        assert all(status == "exited" for status in statuses.values())
+        assert not (run / "evidence/resume-owned-retry-audit.json").exists()
+    else:
+        assert probe.resume_owned(run, **kwargs)["state"] == "ready"
+        assert all(p.read_bytes() == raw for p, raw in originals.items())
+        assert (run / "evidence/resume-owned-retry-audit.json").exists()
+        assert (run / "evidence/resume-owned-retry-result.json").exists()
+        with pytest.raises(probe.ProbeError):
+            probe.resume_owned(run, **kwargs)
+
+
 def test_port_selection_reselects_each_conflict_without_sharing_ports(monkeypatch):
     requested = {"api": 44817, "ui": 3577, "pytest": 45816, "browser": 45815, "embeddings": 45435}
     occupied = {44817, 3577, 45816, 45815, 45435}
@@ -1558,6 +1796,56 @@ def test_snapshot_reads_only_authoritative_done_receipt_data_uuid_and_real_memor
     assert memory_queries == ([[memory_id]] if scenario in {"done", "missing-db-memory"} else [])
 
 
+@pytest.mark.parametrize("scenario", ["text-no-actions", "accepted", "unknown", "bad-uuid", "missing-memory"])
+def test_snapshot_explicit_memory_selection_is_readonly_without_inventing_done_actions(tmp_path, monkeypatch, scenario):
+    import asyncpg
+    from contextlib import asynccontextmanager
+    origin, memory = uuid4(), uuid4()
+    manifest = {"run_id": "a" * 32, "runtime": {"database": "owned", "target": {"host": "127.0.0.1", "port": 40000, "database": "owned", "user": "user"}}, "service_identities": {"target": {"system_identifier": "123"}}}
+    monkeypatch.setattr(probe, "load_run", lambda path: (tmp_path, manifest, {}, {}, {"POSTGRES_PASSWORD": "secret"}))
+    connections, selects = [], []
+    actions = [] if scenario == "text-no-actions" else [{"tool_name": "remember", "state": scenario, "result": {"state": scenario, "data": {"memory_id": str(memory)}}}]
+    class Connection:
+        async def set_type_codec(self, *args, **kwargs):
+            pass
+        @asynccontextmanager
+        async def transaction(self, **kwargs):
+            assert kwargs["readonly"] is True
+            yield
+        async def fetchrow(self, query):
+            return {"database": "owned", "system_identifier": "123"}
+        async def fetchval(self, *args):
+            return True
+        async def fetch(self, query, *args):
+            selects.append(query)
+            if "FROM m5_actions" in query:
+                return actions
+            if "FROM memories" in query:
+                assert args[0] == [memory]
+                return [] if scenario == "missing-memory" else [{"id": str(memory), "type": "semantic", "status": "active"}]
+            if "FROM belief_revision_audit" in query:
+                assert args[0] == [memory]
+                return [{"memory_id": str(memory), "evidence": {"source": "actual stored source"}}]
+            return []
+        async def close(self):
+            pass
+    async def connect(*args, **kwargs):
+        connections.append(True)
+        return Connection()
+    monkeypatch.setattr(asyncpg, "connect", connect)
+    if scenario in {"bad-uuid", "missing-memory"}:
+        with pytest.raises(probe.ProbeError):
+            asyncio.run(probe._snapshot_async(tmp_path, str(origin), memory_ids=["bad"] if scenario == "bad-uuid" else [str(memory)]))
+    else:
+        result = asyncio.run(probe._snapshot_async(tmp_path, str(origin), memory_ids=[str(memory), str(memory)]))
+        assert result["actions"] == actions
+        assert result["memories"][0]["id"] == str(memory)
+        assert result["belief_revision_audit"][0]["memory_id"] == str(memory)
+    if scenario == "bad-uuid":
+        assert connections == []
+    assert all(query.startswith("SELECT") for query in selects)
+
+
 def _prepared_case_evidence(tmp_path, monkeypatch):
     source_root = tmp_path / "sources"
     source_root.mkdir()
@@ -1759,6 +2047,76 @@ def test_verifier_checks_entire_accepted_event_with_schema_nullable_timestamp(tm
         (directory / f"{name}.json").write_text(json.dumps(case))
     result = probe.verify_run(tmp_path)
     assert result["cases"]["remember"]["status"] == ("PASS" if scenario == "both-null" else "FAIL")
+
+
+@pytest.mark.parametrize("invalid", [None, "voice-schema", "prompt-hash", "tool-failed", "wrong-memory", "wrong-session", "missing-chat-call", "missing-chat-result", "missing-revision", "revision-source", "revision-kind", "screenshot", "source-map"])
+def test_text_add_evidence_verifier_uses_persistent_call_result_and_memory_audit_without_m5_actions(tmp_path, monkeypatch, invalid):
+    manifest, cases, directory, _writes = _prepared_case_evidence(tmp_path, monkeypatch)
+    manifest["acceptance_modes"] = {"add-evidence": "text_chat"}
+    raw = cases["add-evidence"]
+    raw.update({"schema": "bob108-add-evidence-text-case-v1", "input_mode": "text_chat"})
+    evidence = raw["evidence"]
+    evidence.pop("receipt")
+    memory_id = evidence["bound_context"]["memory_id"]
+    source = {"kind": "repository_document", "ref": evidence["bound_context"]["source"]["ref"], "sha256": evidence["bound_context"]["source_sha256"]}
+    prompt = f"请实际调用 add_evidence 工具，不要只用文字回答。记忆 {memory_id} 使用来源 {source['ref']}。"
+    evidence.update({"memory_id": memory_id, "source": source, "text_request": prompt, "text_request_sha256": hashlib.sha256(prompt.encode()).hexdigest()})
+    start, result = evidence["activity_events"]
+    start["payload"]["arguments"] = {"memory_id": memory_id, "stance": "supports", "source": {"kind": source["kind"], "ref": source["ref"]}}
+    result["payload"].update({"success": True, "error": None, "output": {"prior": 0.5, "posterior": 0.7}})
+    evidence.update({"call_id": start["payload"]["call_id"], "tool_call": start, "tool_result": result})
+    snapshot = evidence["snapshot"]
+    snapshot["events"] = []
+    evidence["activity_events"] = []
+    evidence["api_cursor"] = {}
+    snapshot["actions"] = []
+    turn, evidence_uuid = str(uuid4()), str(uuid4())
+    origin = raw["origin_session_id"]
+    details = {"memory_id": memory_id, "evidence_memory_id": evidence_uuid, "prior": 0.5, "posterior": 0.7, "applied": True}
+    snapshot["chat_messages"] = [
+        {"id": str(uuid4()), "ordinal": 0, "session_id": origin, "role": "user", "content": prompt, "source_message_id": f"chat:{origin}:request:user"},
+        {"id": str(uuid4()), "ordinal": 1, "session_id": origin, "role": "assistant", "metadata": {"agent_turn_id": turn}, "content_blocks": [{"type": "toolCall", "id": evidence["call_id"], "name": "add_evidence", "arguments": start["payload"]["arguments"]}]},
+        {"id": str(uuid4()), "ordinal": 2, "session_id": origin, "role": "toolResult", "metadata": {"agent_turn_id": turn, "tool_result": {"toolCallId": evidence["call_id"], "toolName": "add_evidence", "isError": False, "details": details}}},
+        {"id": str(uuid4()), "ordinal": 3, "session_id": origin, "role": "assistant", "content": f"✅ add_evidence executed successfully. {memory_id} {evidence_uuid}", "metadata": {"agent_turn_id": turn}, "source_message_id": f"chat:{origin}:request:assistant"},
+    ]
+    evidence.update(dict(zip(("user_message", "tool_call_message", "tool_result_message", "assistant_response_message"), snapshot["chat_messages"])))
+    evidence["chat_dom"] = prompt + "\n" + snapshot["chat_messages"][-1]["content"]
+    evidence["browser_capture"] = {"browser": "chrome", "headed": True, "page_url": "http://127.0.0.1:3577/chat", "captured_at": "2026-10-09T00:00:00.9Z", "scope": "original_live_capture"}
+    revision = {"memory_id": memory_id, "evidence": {"kind": source["kind"], "ref": source["ref"], "observed_at": "2026-10-09T00:00:00.5Z", "trust": 0.9}, "prior_confidence": 0.5, "posterior_confidence": 0.7, "created_at": "2026-10-09T00:00:00.5Z"}
+    evidence["revision_audit"] = revision
+    snapshot["belief_revision_audit"] = [copy.deepcopy(revision)]
+    evidence["memory"] = snapshot["memories"][0]
+    if invalid == "voice-schema":
+        raw["schema"] = "bob108-tool-activity-case-v1"
+    elif invalid == "prompt-hash":
+        evidence["text_request_sha256"] = "0" * 64
+    elif invalid == "tool-failed":
+        evidence["tool_result_message"]["metadata"]["tool_result"]["isError"] = True
+    elif invalid == "wrong-memory":
+        snapshot["memories"][0]["id"] = str(uuid4())
+    elif invalid == "wrong-session":
+        evidence["tool_call_message"]["session_id"] = str(uuid4())
+    elif invalid == "missing-chat-call":
+        snapshot["chat_messages"].pop(1)
+    elif invalid == "missing-chat-result":
+        snapshot["chat_messages"].pop(2)
+    elif invalid == "missing-revision":
+        snapshot["belief_revision_audit"] = []
+    elif invalid == "revision-source":
+        evidence["revision_audit"]["evidence"]["ref"] = "wrong source"
+        snapshot["belief_revision_audit"] = [copy.deepcopy(evidence["revision_audit"])]
+    elif invalid == "revision-kind":
+        evidence["revision_audit"]["evidence"]["kind"] = "wrong_kind"
+        snapshot["belief_revision_audit"] = [copy.deepcopy(evidence["revision_audit"])]
+    elif invalid == "screenshot":
+        evidence["screenshot_sha256"] = "0" * 64
+    elif invalid == "source-map":
+        evidence["source_fingerprints"] = {}
+    for name, case in cases.items():
+        (directory / f"{name}.json").write_text(json.dumps(case))
+    outcome = probe.verify_run(tmp_path)
+    assert outcome["cases"]["add-evidence"]["status"] == ("PASS" if invalid is None else "FAIL")
+    assert outcome["state"] == "verification_incomplete"
 
 
 @pytest.mark.parametrize("db_ts,api_ts,expected", [(None, None, True), (None, "2026-10-09T00:00:00Z", False), ("2026-10-09T00:00:00Z", None, False), ("2026-10-09T00:00:00Z", "2026-10-09 08:00:00+08:00", True), ("bad", "bad", False)])

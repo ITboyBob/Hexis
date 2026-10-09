@@ -14,7 +14,7 @@ const callbackCode = ts.transpileModule(`const callback = ${registration.express
   compilerOptions: { target: ts.ScriptTarget.ES2022 },
 }).outputText;
 
-async function startup(injectionWorks = true, inspectorVisible = true) {
+async function startup(injectionWorks = true, inspectorVisible = true, evidenceMode?: string) {
   const events: string[] = [];
   let registered = false;
   let injected = false;
@@ -40,10 +40,10 @@ async function startup(injectionWorks = true, inspectorVisible = true) {
     toBeTruthy() { if (!value) throw new Error("WAV feed missing"); },
   });
   const callback = runInNewContext(callbackCode, {
-    test: { setTimeout() {} }, expect: assertion, run: { source_fingerprints: {}, runtime: { ui_url: "http://127.0.0.1:3577", database: "isolated" }, run_id: "run" },
+    test: { setTimeout() {} }, expect: assertion, run: { acceptance_modes: { "add-evidence": evidenceMode }, source_fingerprints: {}, runtime: { ui_url: "http://127.0.0.1:3577", database: "isolated" }, run_id: "run" },
     checkReadiness: () => ({}), mkdir: async () => {}, evidenceDir: "unused", realtimeFrames() {},
-    prewarmVoiceUI: async () => {}, audioById: new Map(["voice-recall", "remember", "add-evidence", "background-tools"].map((id) => [id, { path: id, sha256: "hash" }])),
-    readFile: async () => Buffer.from("wav"), digest: () => "hash", Buffer,
+    prewarmVoiceUI: async () => {}, audioById: new Map(["voice-recall", "remember", ...(evidenceMode === "text_chat" ? [] : ["add-evidence"]), "background-tools"].map((id) => [id, { path: id, sha256: "hash" }])),
+    readFile: async (path: string) => { events.push(`load:${path}`); return Buffer.from("wav"); }, digest: () => "hash", Buffer,
     installVoiceWavFeed: async () => { events.push("register-feed"); registered = true; },
     ensureActivityExpanded: async () => { events.push("activity-expanded"); },
   });
@@ -53,6 +53,11 @@ async function startup(injectionWorks = true, inspectorVisible = true) {
 }
 
 describe("真实 WAV E2E 启动边界", () => {
+  it("text_chat只加载三个WAV，不依赖或读取旧add-evidence素材", async () => {
+    const result = await startup(true, true, "text_chat");
+    expect(result.failure).toBe("STOP_TALK");
+    expect(result.events.filter((event) => event.startsWith("load:"))).toEqual(["load:voice-recall", "load:remember", "load:background-tools"]);
+  });
   it("在首次导航前注册 WAV，在 Talk 前检查当前 document 已注入", async () => {
     const result = await startup();
     expect(result.failure).toBe("STOP_TALK");
@@ -183,6 +188,36 @@ describe("PASS 证据的实际 Activity DOM 屏障", () => {
     const barrier = domHelper(() => { throw new Error("must not inspect DOM before pairing"); });
     await expect(barrier({}, { events: [events[0], { ...events[1], payload: { ...events[1].payload, call_id: "other-call" } }] }, ["voice_recall"]))
       .rejects.toThrow("terminal result");
+  });
+});
+
+describe("add_evidence canonical 验收入口", () => {
+  function evidenceBranch() {
+    const registration = parsed.statements.find((node): node is ts.ExpressionStatement => ts.isExpressionStatement(node)
+      && ts.isCallExpression(node.expression) && node.expression.expression.getText(parsed) === "test");
+    const callback = (registration!.expression as ts.CallExpression).arguments[1] as ts.ArrowFunction;
+    const outerTry = (callback.body as ts.Block).statements.find(ts.isTryStatement)!;
+    return outerTry.tryBlock.statements.find((node) => node.getText(parsed).includes('executeCase("add-evidence"'))!;
+  }
+  async function runEvidenceBranch(mode?: string) {
+    const registered: string[] = [], played: string[] = [];
+    const code = ts.transpileModule(`(async () => { ${evidenceBranch().getText(parsed)} })()`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+    try {
+      await runInNewContext(code, {
+        run: { acceptance_modes: { "add-evidence": mode } },
+        executeCase: async (name: string, _tools: string[], operation: () => Promise<void>) => { registered.push(name); await operation(); },
+        execFileSync: () => JSON.stringify({ memory_id: "actual-memory" }), python: "unused", dirname: () => "unused", manifestPath: "unused", repoRoot: "unused", process: { env: {} },
+        expect: () => ({ toBe() {} }), rememberMemoryId: "actual-memory", audioById: new Map([["add-evidence", {}]]), origin: "origin", page: {},
+        play: async (_page: unknown, name: string) => { played.push(name); throw new Error("STOP_AFTER_PLAY"); },
+      });
+    } catch (error) { if ((error as Error).message !== "STOP_AFTER_PLAY") throw error; }
+    return { registered, played };
+  }
+  it("text_chat模式不注册或播放voice add-evidence，canonical artifact留给独立text test", async () => {
+    expect(await runEvidenceBranch("text_chat")).toEqual({ registered: [], played: [] });
+  });
+  it("未选择text_chat时保留原voice入口", async () => {
+    expect(await runEvidenceBranch()).toEqual({ registered: ["add-evidence"], played: ["add-evidence"] });
   });
 });
 

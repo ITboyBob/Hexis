@@ -12,6 +12,7 @@ type RunManifest = {
   run_id: string;
   runtime: { database: string; api_url: string; ui_url: string; realtime_config: { path: string } };
   source_fingerprints: Record<string, string>;
+  acceptance_modes?: { "add-evidence"?: "text_chat" | "voice" };
 };
 type SelectedRuntime = { materials_manifest_sha256: string };
 type ActivityEvent = {
@@ -75,10 +76,12 @@ function digest(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-function snapshot(sessionId: string): Snapshot {
-  const output = execFileSync(python, [
+function snapshot(sessionId: string, memoryIds: string[] = []): Snapshot {
+  const args = [
     "-m", "apps.bob108_tool_activity_probe", "snapshot", "--run-dir", dirname(manifestPath!), "--session-id", sessionId,
-  ], { cwd: repoRoot, encoding: "utf8", timeout: 20_000, env: { ...process.env } });
+    ...memoryIds.flatMap((memoryId) => ["--memory-id", memoryId]),
+  ];
+  const output = execFileSync(python, args, { cwd: repoRoot, encoding: "utf8", timeout: 20_000, env: { ...process.env } });
   return JSON.parse(output) as Snapshot;
 }
 
@@ -492,7 +495,7 @@ async function saveCase(
   }, null, 2), "utf8");
 }
 
-test("BOB-108 四条固定 WAV 真实调用与 Tool Activity 生命周期", async ({ page, browser }, testInfo) => {
+test("BOB-108 固定 WAV 真实调用与 Tool Activity 生命周期", async ({ page, browser }, testInfo) => {
   test.setTimeout(900_000);
   for (const [relative, expected] of Object.entries(run.source_fingerprints)) {
     const sourcePath = join(repoRoot, relative);
@@ -512,7 +515,10 @@ test("BOB-108 四条固定 WAV 真实调用与 Tool Activity 生命周期", asyn
   page.on("requestfailed", (request) => requestFailures.push(`${request.method()} ${request.url()} ${request.failure()?.errorText ?? "failed"}`));
   realtimeFrames(page, sent, received);
   const wavs: Record<string, string> = {};
-  for (const id of ["voice-recall", "remember", "add-evidence", "background-tools"]) {
+  const wavIds = run.acceptance_modes?.["add-evidence"] === "text_chat"
+    ? ["voice-recall", "remember", "background-tools"]
+    : ["voice-recall", "remember", "add-evidence", "background-tools"];
+  for (const id of wavIds) {
     const asset = audioById.get(id);
     if (!asset) throw new Error(`Required WAV ${id} is missing from the selected material manifest.`);
     const bytes = await readFile(asset.path);
@@ -638,6 +644,7 @@ test("BOB-108 四条固定 WAV 真实调用与 Tool Activity 生命周期", asyn
     activeCase = null;
     });
 
+    if (run.acceptance_modes?.["add-evidence"] !== "text_chat") {
     await executeCase("add-evidence", ["add_evidence"], async () => {
     const bindOutput = execFileSync(python, ["-m", "apps.bob108_tool_activity_probe", "bind-evidence-context", "--run-dir", dirname(manifestPath!), "--origin-session-id", origin], {
       cwd: repoRoot, encoding: "utf8", timeout: 20_000, env: { ...process.env },
@@ -671,6 +678,7 @@ test("BOB-108 四条固定 WAV 真实调用与 Tool Activity 生命周期", asyn
     await waitForVoiceTurnComplete(page, origin, evidencePage, "add_evidence", overallDeadline(evidenceAsset.duration_seconds), received.slice(watch.frameStart));
     activeCase = null;
     }, rememberMemoryId ? undefined : "本轮 remember 没有真实 done memory UUID，add_evidence 依赖未满足。");
+    }
 
     await executeCase("background-tools", ["recall", "read_file"], async () => {
     startedAt = new Date().toISOString();
@@ -826,5 +834,122 @@ test("BOB-108 四条固定 WAV 真实调用与 Tool Activity 生命周期", asyn
       sent,
       received,
     }, null, 2), "utf8");
+  }
+});
+
+test("BOB-108 前台文本 Chat add_evidence 与真实 Activity", async ({ page, browser }, testInfo) => {
+  test.skip(run.acceptance_modes?.["add-evidence"] !== "text_chat", "当前 run 未显式选择 add-evidence text_chat 验收模式。");
+  test.setTimeout(240_000);
+  for (const [relative, expected] of Object.entries(run.source_fingerprints)) {
+    const sourcePath = join(repoRoot, relative);
+    if (!isAbsolute(sourcePath) || digest(readFileSync(sourcePath)) !== expected) {
+      throw new Error(`Run source fingerprint changed or is missing: ${relative}`);
+    }
+  }
+  expect(checkReadiness()).toMatchObject({ run_id: run.run_id, state: "ready", database: run.runtime.database });
+  await mkdir(evidenceDir, { recursive: true });
+  const pageErrors: string[] = [];
+  const requestFailures: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("requestfailed", (request) => requestFailures.push(`${request.method()} ${request.url()} ${request.failure()?.errorText ?? "failed"}`));
+
+  const contextPath = join(dirname(manifestPath!), "evidence-context.json");
+  const bound = JSON.parse(readFileSync(contextPath, "utf8")) as {
+    run_id: string; memory_id: string; memory_content: string; source: { kind: string; ref: string; label: string };
+    source_sha256: string; source_content: string; target_memory: { id: string; status: string; type: string };
+  };
+  expect(bound.run_id).toBe(run.run_id);
+  expect(bound.memory_id).toBe(bound.target_memory.id);
+  expect(bound.target_memory.status).toBe("active");
+  const sourceBytes = await readFile(bound.source.ref);
+  expect(digest(sourceBytes)).toBe(bound.source_sha256);
+  expect(sourceBytes.toString("utf8")).toBe(bound.source_content);
+
+  await prewarmVoiceUI(run.runtime.ui_url);
+  await page.goto("/chat");
+  await expect(page.getByRole("button", { name: "Start new conversation" })).toBeVisible({ timeout: 30_000 });
+  const sessionResponse = page.waitForResponse((response) => response.url().endsWith("/api/chat/session") && response.request().method() === "POST");
+  await page.getByRole("button", { name: "Start new conversation" }).click();
+  const origin = String((await (await sessionResponse).json()).session_id);
+  expect(origin).toMatch(/^[0-9a-f-]{36}$/i);
+  await ensureActivityExpanded(page);
+
+  const prompt = [
+    "请实际调用 add_evidence 工具，不要只用文字回答。",
+    `要支持的现有语义记忆 UUID 是 ${bound.memory_id}，记忆内容为：${bound.memory_content}`,
+    `来源类型是 repository_document，来源路径 ref 必须是 ${bound.source.ref}，来源名称是 ${bound.source.label}。`,
+    `来源正文为：${bound.source_content.trim()}`,
+    "请将该来源作为支持证据关联到上面的记忆，note 简要说明正式日程也记载每周六上午九点开始。只根据工具真实回执报告结果，不创建新的记忆，不修改来源文件，不联网。",
+  ].join("\n");
+  const requestSha256 = digest(Buffer.from(prompt, "utf8"));
+  const startedAt = new Date().toISOString();
+  const failed = (reason: string, apiPage: ActivityPage | null, db: Snapshot | null, dom: string, screenshot: string | null) => ({
+    schema: "bob108-add-evidence-text-case-v1", case: "add-evidence", input_mode: "text_chat", status: "FAIL", reason,
+    run_id: run.run_id, origin_session_id: origin, started_at: startedAt, ended_at: new Date().toISOString(), expected_tools: ["add_evidence"],
+    evidence: {
+      source_fingerprints: run.source_fingerprints, source_case: "用户授权：add_evidence 不再要求 voice WAV，改用前台 text Chat。",
+      memory_id: bound.memory_id, source: { ...bound.source, sha256: bound.source_sha256 },
+      text_request: prompt, text_request_sha256: requestSha256, activity_session_id: apiPage?.session_id ?? origin,
+      activity_events: apiPage?.events ?? [], api_cursor: apiPage?.cursor ?? {}, snapshot: db,
+      activity_dom: dom, screenshot, screenshot_sha256: screenshot ? digest(readFileSync(screenshot)) : null,
+      page_errors: pageErrors, request_failures: requestFailures,
+    },
+  });
+  let apiPage: ActivityPage | null = null;
+  let dbSnapshot: Snapshot | null = null;
+  let dom = "";
+  let screenshot: string | null = null;
+  try {
+    await page.getByRole("textbox", { name: "Message Hexis" }).fill(prompt);
+    await page.getByRole("button", { name: "Send message" }).click();
+    apiPage = await pollActivity(
+      page, origin,
+      (events) => events.some((event) => event.event_type === "TOOL_RESULT" && event.payload.tool_name === "add_evidence"),
+      150_000,
+    );
+    const pair = apiPage.events.filter((event) => event.payload.tool_name === "add_evidence");
+    expect(pair.some((event) => event.event_type === "TOOL_START")).toBeTruthy();
+    expect(pair.some((event) => event.event_type === "TOOL_RESULT")).toBeTruthy();
+    const callIds = [...new Set(pair.map((event) => String(event.payload.call_id ?? "")).filter(Boolean))];
+    expect(callIds).toHaveLength(1);
+    const toolStart = pair.find((event) => event.event_type === "TOOL_START")!;
+    const toolResult = pair.find((event) => event.event_type === "TOOL_RESULT")!;
+    expect(toolStart.payload.arguments).toMatchObject({
+      memory_id: bound.memory_id,
+      stance: "supports",
+      source: { kind: "repository_document", ref: bound.source.ref },
+    });
+    expect(toolResult.payload.success).toBe(true);
+
+    dbSnapshot = snapshot(origin, [bound.memory_id]);
+    expect(dbSnapshot.database).toBe(run.runtime.database);
+    expect(dbSnapshot.memories.some((memory) => memory.id === bound.memory_id && memory.status === "active")).toBe(true);
+    const audit = dbSnapshot.belief_revision_audit.find((item) => item.memory_id === bound.memory_id);
+    expect(audit, "The exact remembered UUID must have a real persisted evidence revision.").toBeTruthy();
+    await ensureActivityExpanded(page);
+    const activityPane = page.locator("aside").filter({ has: page.getByRole("heading", { name: "Activity", exact: true }) });
+    await expect(page.getByText(/add_evidence/).first()).toBeVisible({ timeout: 30_000 });
+    dom = await activityPane.innerText();
+    expect(dom).toContain("add_evidence");
+    screenshot = join(evidenceDir, "add-evidence-text.png");
+    await page.screenshot({ path: screenshot, fullPage: true });
+    const evidence = failed("", apiPage, dbSnapshot, dom, screenshot);
+    const passCase = {
+      ...evidence, status: "PASS", reason: null, ended_at: new Date().toISOString(),
+      evidence: {
+        ...evidence.evidence,
+        call_id: callIds[0], event_ids: pair.map((event) => event.event_id),
+        tool_call: toolStart, tool_result: toolResult,
+        memory: dbSnapshot.memories.find((memory) => memory.id === bound.memory_id),
+        revision_audit: audit,
+      },
+    };
+    await writeFile(join(evidenceDir, "add-evidence.json"), JSON.stringify(passCase, null, 2), "utf8");
+    expect(pageErrors).toEqual([]);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    const failedCase = failed(reason, apiPage, dbSnapshot, dom, screenshot);
+    await writeFile(join(evidenceDir, "add-evidence.json"), JSON.stringify(failedCase, null, 2), "utf8");
+    throw error;
   }
 });

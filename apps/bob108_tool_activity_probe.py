@@ -38,6 +38,8 @@ FINAL_VERIFICATION_SOURCE_PATHS = (
     "hexis-ui/e2e/tool-activity.spec.ts",
     "hexis-ui/lib/tool-activity-startup.test.ts",
 )
+RESUME_HARNESS_FILES = {"hexis-ui/e2e/tool-activity.spec.ts", "hexis-ui/lib/tool-activity-startup.test.ts"}
+RESUME_INTRINSIC_FILES = {"apps/bob108_tool_activity_probe.py", "tests/services/test_bob108_tool_activity_probe.py"}
 PROFILE_KEYS = ("agent.init_profile", "agent.mode", "agent.timezone", "llm.chat", "llm.heartbeat", "llm.subconscious")
 SECRET_NAMES = {"POSTGRES_PASSWORD", "DASHSCOPE_API_KEY"}
 PROFILE_REQUIRED = ("provider", "model", "endpoint", "api_key_env")
@@ -690,6 +692,7 @@ async def _wait_owned_postgres(
     import urllib.request
 
     deadline = time.monotonic() + timeout_seconds
+    last_error: Exception | None = None
     while time.monotonic() < deadline:
         identities: dict[str, Any] = {}
         try:
@@ -707,9 +710,10 @@ async def _wait_owned_postgres(
             if not isinstance(embedding, dict):
                 raise ProbeError("fake embedding health returned a non-object")
             return {"postgres": identities, "fake_embeddings_health": embedding}
-        except Exception:
+        except Exception as exc:
+            last_error = exc
             await asyncio.sleep(1)
-    raise ProbeError("owned run-01 PostgreSQL or fake embedding service did not become ready")
+    raise ProbeError("owned run-01 PostgreSQL or fake embedding service did not become ready") from last_error
 
 
 async def _prepare_real_async(
@@ -1514,7 +1518,11 @@ def serve_api(run_dir: str | Path) -> dict[str, Any]:
     process = subprocess.Popen(command, cwd=ROOT, env=environment, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     log.close()
     manifest["api_process"] = {"pid": process.pid, "run_id": manifest["run_id"], "command": command, "log": str(log_path)}
-    _atomic_json(path / "run-manifest.json", manifest)
+    try:
+        _atomic_json(path / "run-manifest.json", manifest)
+    except BaseException:
+        _stop_run_process(manifest["api_process"], run_dir=path, role="api")
+        raise
     return {"run_id": manifest["run_id"], "api_pid": process.pid, "api_url": manifest["runtime"]["api_url"]}
 
 
@@ -1568,7 +1576,11 @@ def serve_ui(run_dir: str | Path) -> dict[str, Any]:
     process = subprocess.Popen(command, cwd=ui_root, env=environment, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     log.close()
     manifest["ui_process"] = {"pid": process.pid, "run_id": manifest["run_id"], "command": command, "log": str(log_path), "source_root": str(ui_root)}
-    _atomic_json(path / "run-manifest.json", manifest)
+    try:
+        _atomic_json(path / "run-manifest.json", manifest)
+    except BaseException:
+        _stop_run_process(manifest["ui_process"], run_dir=path, role="ui")
+        raise
     return {"run_id": manifest["run_id"], "ui_pid": process.pid, "ui_url": manifest["runtime"]["ui_url"]}
 
 
@@ -1616,14 +1628,14 @@ async def _session_belongs_to_target(
         await conn.close()
 
 
-def _write_readiness_record(evidence_dir: Path, name: str, value: dict[str, Any], *, launcher_repaired: bool, e2e_repaired: bool = False, harness_retried: bool = False, cases_refreshed: bool = False, evidence_replayed: bool = False, final_verification_refreshed: bool = False) -> Path:
+def _write_readiness_record(evidence_dir: Path, name: str, value: dict[str, Any], *, launcher_repaired: bool, e2e_repaired: bool = False, harness_retried: bool = False, cases_refreshed: bool = False, evidence_replayed: bool = False, final_verification_refreshed: bool = False, owned_resumed: bool = False) -> Path:
     output = evidence_dir / f"{name}.json"
     if output.exists():
         if json.loads(output.read_text(encoding="utf-8")) == value:
             return output
         if not launcher_repaired:
             raise ProbeError("readiness evidence changed without an audited launcher repair")
-        suffix = "after-final-verification" if final_verification_refreshed else ("after-evidence-replay" if evidence_replayed else ("after-case-refresh" if cases_refreshed else ("after-harness-retry" if harness_retried else ("after-e2e-repair" if e2e_repaired else "after-launcher-repair"))))
+        suffix = "after-resume-owned" if owned_resumed else ("after-final-verification" if final_verification_refreshed else ("after-evidence-replay" if evidence_replayed else ("after-case-refresh" if cases_refreshed else ("after-harness-retry" if harness_retried else ("after-e2e-repair" if e2e_repaired else "after-launcher-repair")))))
         output = evidence_dir / f"{name}-{suffix}.json"
         if output.exists():
             if json.loads(output.read_text(encoding="utf-8")) == value:
@@ -1708,6 +1720,7 @@ def check_readiness(run_dir: str | Path) -> dict[str, Any]:
                     if expected_sources.get(relative) != change["previous"]:
                         raise ProbeError("final verification refresh does not preserve its prior source hash")
                     expected_sources[relative] = change["current"]
+            expected_sources = _sources_after_owned_resume(manifest, expected_sources)
             if expected_sources != manifest["source_fingerprints"]:
                 raise ProbeError("E2E repair audit does not bind current sources")
         elif launcher_hash != manifest["source_fingerprints"].get("apps/bob108_tool_activity_probe.py"):
@@ -1741,8 +1754,8 @@ def check_readiness(run_dir: str | Path) -> dict[str, Any]:
     }
     ui_start = {"run_id": manifest["run_id"], "database_identity": observed_ui, "origin_session_id": session_id}
     launcher_repaired = bool(manifest.get("launcher_repair"))
-    _write_readiness_record(path / "evidence", "api-start", api_start, launcher_repaired=launcher_repaired, e2e_repaired=bool(manifest.get("e2e_repair")), harness_retried=bool(manifest.get("harness_retry")), cases_refreshed=bool(manifest.get("case_refresh")), evidence_replayed=bool(manifest.get("evidence_replay")), final_verification_refreshed=bool(manifest.get("final_verification_refresh")))
-    _write_readiness_record(path / "evidence", "ui-start", ui_start, launcher_repaired=launcher_repaired, e2e_repaired=bool(manifest.get("e2e_repair")), harness_retried=bool(manifest.get("harness_retry")), cases_refreshed=bool(manifest.get("case_refresh")), evidence_replayed=bool(manifest.get("evidence_replay")), final_verification_refreshed=bool(manifest.get("final_verification_refresh")))
+    _write_readiness_record(path / "evidence", "api-start", api_start, launcher_repaired=launcher_repaired or bool(manifest.get("resume_owned")), e2e_repaired=bool(manifest.get("e2e_repair")), harness_retried=bool(manifest.get("harness_retry")), cases_refreshed=bool(manifest.get("case_refresh")), evidence_replayed=bool(manifest.get("evidence_replay")), final_verification_refreshed=bool(manifest.get("final_verification_refresh")), owned_resumed=bool(manifest.get("resume_owned")))
+    _write_readiness_record(path / "evidence", "ui-start", ui_start, launcher_repaired=launcher_repaired or bool(manifest.get("resume_owned")), e2e_repaired=bool(manifest.get("e2e_repair")), harness_retried=bool(manifest.get("harness_retry")), cases_refreshed=bool(manifest.get("case_refresh")), evidence_replayed=bool(manifest.get("evidence_replay")), final_verification_refreshed=bool(manifest.get("final_verification_refresh")), owned_resumed=bool(manifest.get("resume_owned")))
     manifest["origin_session_id"] = session_id
     manifest["readiness"] = {"api": api_start, "ui": ui_start}
     manifest["state"] = "ready"
@@ -2448,6 +2461,270 @@ def refresh_final_verification(run_dir: str | Path, *, expected_source_hashes: d
     return result
 
 
+def _resume_configuration_hashes(path: Path, manifest: dict[str, Any], selected: dict[str, Any], selection: dict[str, Any]) -> dict[str, Any]:
+    if selected.get("run_id") != manifest["run_id"] or selected.get("configuration_hashes") != selection.get("_config_hashes"):
+        raise ProbeError("resume selected configuration hashes or run identity differ")
+    profile = manifest["runtime"]["provider_profile"]
+    if any(selected.get("selected_profile", {}).get(key) != profile.get(key) for key in PROFILE_REQUIRED):
+        raise ProbeError("resume selected provider profile differs")
+    compose = path / "compose.yml"
+    expected_compose = compose_text(manifest["project"], manifest["run_id"], manifest["ports"], manifest["volumes"]).encode()
+    if not compose.is_file() or _digest(compose) != hashlib.sha256(expected_compose).hexdigest():
+        raise ProbeError("resume original Compose configuration is missing or changed")
+    runtime = manifest["runtime"]
+    expected_env = {"POSTGRES_HOST": runtime["target"]["host"], "POSTGRES_PORT": str(runtime["target"]["port"]), "POSTGRES_USER": runtime["target"]["user"], "POSTGRES_DB": runtime["target"]["database"], "POSTGRES_ADMIN_DB": runtime["target"]["admin_database"], "POSTGRES_PASSWORD_ENV": "POSTGRES_PASSWORD", "DASHSCOPE_API_KEY_ENV": profile["api_key_env"], "HEXIS_API_URL": runtime["api_url"], "HEXIS_UI_ORIGIN": runtime["ui_url"], "EMBEDDING_SERVICE_URL": runtime["embedding_url"]}
+    env_file = path / "runtime.env"
+    if not env_file.is_file() or dict(dotenv_values(env_file)) != expected_env:
+        raise ProbeError("resume original runtime.env bindings are missing or changed")
+    summary = path / "evidence/consent-summary.json"
+    if not summary.is_file():
+        raise ProbeError("resume original real consent summary is missing")
+    consent = json.loads(summary.read_text())
+    if consent.get("run_id") != manifest["run_id"] or consent.get("decision") != "consent" or consent.get("operator_override") is not False or consent.get("consent_log_id") != manifest["consent"].get("consent_log_id") or any(consent.get(key) != profile.get(key) for key in ("provider", "model", "endpoint")):
+        raise ProbeError("resume original consent UUID/provider/profile differ")
+    for relative, sha in manifest["source_fingerprints"].items():
+        if relative.startswith("hexis-ui/") and relative not in RESUME_HARNESS_FILES:
+            copied = path / "ui-src" / relative.removeprefix("hexis-ui/")
+            if not copied.is_file() or _digest(copied) != sha:
+                raise ProbeError("resume isolated UI runtime copy changed")
+    return {"selected_configuration": selected["configuration_hashes"], "compose_sha256": _digest(compose), "runtime_env_sha256": _digest(env_file), "consent_summary_sha256": _digest(summary)}
+
+
+def _sources_after_owned_resume(manifest: dict[str, Any], previous: dict[str, str]) -> dict[str, str]:
+    if not manifest.get("resume_owned"):
+        return previous
+    audit = _verified_repair_audit(manifest, "resume_owned")
+    explicit = set(audit["source_files"])
+    if explicit - RESUME_HARNESS_FILES or audit["previous_source_fingerprints"] != previous or audit.get("acceptance_modes") != {"add-evidence": "text_chat"}:
+        raise ProbeError("resume-owned prior source/acceptance identity differs")
+    expected = dict(previous)
+    for relative, change in audit["changes"].items():
+        if relative not in explicit | RESUME_INTRINSIC_FILES or expected.get(relative) != change["previous"]:
+            raise ProbeError("resume-owned source refresh exceeds its approved exact scope")
+        expected[relative] = change["current"]
+    return expected
+
+
+def _inspect_resume_resources(path: Path, manifest: dict[str, Any], values: dict[str, str], *, service_names: list[str] | None = None, include_volumes: bool = True) -> dict[str, Any]:
+    expected = manifest["owned_resources"]
+    names = manifest["services"] if service_names is None else service_names
+    ids = [expected[name]["container_id"] for name in names]
+    rows = json.loads(subprocess.run(["docker", "inspect", *ids], cwd=ROOT, check=True, capture_output=True, text=True).stdout)
+    if len(rows) != len(names):
+        raise ProbeError("resume original container set is incomplete")
+    services = {}
+    for row in rows:
+        labels = row.get("Config", {}).get("Labels") or {}
+        name = labels.get("com.docker.compose.service")
+        original = expected.get(name, {})
+        if name in services or name not in names or row.get("Id") != original.get("container_id") or labels.get("com.docker.compose.project") != manifest["project"] or labels.get("hexis.bob108.run_id") != manifest["run_id"] or row.get("Image") != original.get("image_id") or row.get("Config", {}).get("Image") != original.get("image_ref"):
+            raise ProbeError("resume container ID/image/project/run identity changed")
+        config_hash = labels.get("com.docker.compose.config-hash")
+        if not isinstance(config_hash, str) or not config_hash:
+            raise ProbeError("resume container has no original Compose configuration identity")
+        mounts = [{"name": mount.get("Name"), "destination": mount.get("Destination")} for mount in row.get("Mounts", []) if mount.get("Type") == "volume"]
+        if mounts != original.get("mounts", []):
+            raise ProbeError("resume container original volume mounts changed")
+        if name in {"pytest-db", "browser-db"}:
+            logical = "pytest" if name == "pytest-db" else "browser"
+            physical = f"{manifest['project']}_{manifest['volumes'][logical]}"
+            if {"name": physical, "destination": "/var/lib/postgresql/data"} not in mounts:
+                raise ProbeError("resume PostgreSQL is not mounted on its original owned volume")
+            env = dict(value.split("=", 1) for value in row.get("Config", {}).get("Env", []) if "=" in value)
+            if env.get("POSTGRES_USER") != values["POSTGRES_USER"] or env.get("POSTGRES_PASSWORD") != values["POSTGRES_PASSWORD"] or env.get("POSTGRES_DB") != ("bob108_pytest" if logical == "pytest" else "postgres"):
+                raise ProbeError("resume PostgreSQL container credentials/database binding changed")
+        port_name = {"pytest-db": "pytest", "browser-db": "browser", "fake-embeddings": "embeddings"}[name]
+        internal = "5432/tcp" if name != "fake-embeddings" else "45435/tcp"
+        bindings = row.get("HostConfig", {}).get("PortBindings", {}).get(internal)
+        if bindings != [{"HostIp": "127.0.0.1", "HostPort": str(manifest["ports"][port_name])}]:
+            raise ProbeError("resume original loopback container port binding changed")
+        services[name] = {**original, "state": row.get("State", {}).get("Status"), "config_hash": config_hash}
+    volume_names = [f"{manifest['project']}_{manifest['volumes'][name]}" for name in ("pytest", "browser")]
+    if not include_volumes:
+        return {"services": services, "volumes": {}}
+    volumes = json.loads(subprocess.run(["docker", "volume", "inspect", *volume_names], cwd=ROOT, check=True, capture_output=True, text=True).stdout)
+    if {row.get("Name") for row in volumes} != set(volume_names):
+        raise ProbeError("resume original PostgreSQL volume set changed")
+    for row in volumes:
+        labels = row.get("Labels") or {}
+        if labels.get("hexis.bob108.run_id") != manifest["run_id"] or labels.get("com.docker.compose.project") != manifest["project"] or not row.get("CreatedAt"):
+            raise ProbeError("resume original PostgreSQL volume ownership differs")
+    return {"services": services, "volumes": {row["Name"]: {key: row.get(key) for key in ("Name", "Driver", "CreatedAt", "Labels")} for row in volumes}}
+
+
+async def _validate_resumed_runtime(manifest: dict[str, Any], values: dict[str, str]) -> dict[str, Any]:
+    runtime = manifest["runtime"]
+    # 与 prepare-real 相同，pytest 用户来自原已选配置；不写入或改造 manifest/config。
+    pytest_binding = {**runtime["pytest"], "user": values["POSTGRES_USER"]}
+    ready = await _wait_owned_postgres({**runtime, "pytest": pytest_binding}, values)
+    for observed_name, expected_name in (("pytest", "pytest"), ("target", "browser_admin")):
+        actual, expected = ready["postgres"][observed_name], manifest["service_identities"][expected_name]
+        if any(actual.get(key) != expected.get(key) for key in ("database", "system_identifier")):
+            raise ProbeError("resume original PostgreSQL database/system identifier changed")
+    control_runtime.validate_embedding_health(ready["fake_embeddings_health"])
+    target = runtime["target"]
+    actual = await control_runtime._pg_identity(target["host"], target["port"], target["database"], target["user"], values["POSTGRES_PASSWORD"])
+    expected = manifest["service_identities"]["target"]
+    if any(actual.get(key) != expected.get(key) for key in ("database", "system_identifier")):
+        raise ProbeError("resume actual target database/system identifier changed")
+    consent = await _validate_final_verification_target(manifest, values)
+    return {"postgres": ready["postgres"], "target": actual, "embedding_healthy": True, "consent": consent, "real_consent_active": True}
+
+
+def _safe_resume_failure(exc: BaseException, stage: str) -> dict[str, Any]:
+    result: dict[str, Any] = {"error_stage": stage, "error_classification": "controlled_operation_failed"}
+    if isinstance(exc, ProbeError) and str(exc) == "owned run-01 PostgreSQL or fake embedding service did not become ready":
+        result["error_classification"] = "database_or_embedding_timeout"
+    cause = exc.__cause__
+    if cause is not None:
+        result["cause_type"] = type(cause).__name__
+        if isinstance(cause, KeyError) and cause.args and cause.args[0] in {"host", "port", "database", "admin_database", "user"}:
+            result["missing_binding_field"] = cause.args[0]
+    return result
+
+
+def _failed_resume_retry_evidence(path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    first = _verified_repair_audit(manifest, "resume_owned")
+    first_ref = manifest["resume_owned"]
+    result_path = path / "evidence/resume-owned-result.json"
+    if Path(first_ref["path"]).resolve() != (path / "evidence/resume-owned-audit.json").resolve() or not result_path.is_file():
+        raise ProbeError("resume retry requires the original first failed resume audit/result")
+    result = json.loads(result_path.read_text())
+    if result.get("run_id") != manifest["run_id"] or result.get("state") != "stopped" or result.get("error_type") != "ProbeError" or result.get("rollback_failures") != [] or result.get("provider_requested") is not False or result.get("consent_requested") is not False or result.get("volumes_deleted") is not False:
+        raise ProbeError("resume retry requires a fully rolled-back first failure without provider/consent activity")
+    return {"first_audit": first_ref, "first_result": {"path": str(result_path), "sha256": _digest(result_path)}, "first_original_manifest": first["original_manifest"], "max_total_resume_attempts": 2}
+
+
+def resume_owned(run_dir: str | Path, *, source_files: list[str] = (), reason: str, expected_e2e_sha256: str | None = None, expected_startup_sha256: str | None = None, retry_failed_once: bool = False) -> dict[str, Any]:
+    path, original, selected, selection, values = load_run(run_dir)
+    if path.resolve() != (MATERIAL_ROOT / "runs/run-01").resolve() or original.get("run_directory") != str(path) or original.get("state") != "stopped":
+        raise ProbeError("resume-owned accepts only this exact stopped run-01 directory")
+    if not reason.strip() or any(secret and secret in reason for key, secret in values.items() if key in SECRET_NAMES):
+        raise ProbeError("resume-owned requires a credential-free recorded reason")
+    requested = set(source_files)
+    if requested - RESUME_HARNESS_FILES:
+        raise ProbeError("resume-owned explicit source-file is outside the exact approved E2E harness paths")
+    consent = original.get("consent", {})
+    try:
+        UUID(consent["consent_log_id"])
+    except (KeyError, ValueError, TypeError) as exc:
+        raise ProbeError("resume-owned original real consent UUID is invalid") from exc
+    if consent.get("state") != "consent" or consent.get("operator_override") is not False or original["runtime"]["provider_profile"].get("model") != "qwen-plus":
+        raise ProbeError("resume-owned requires original non-override qwen-plus consent")
+    record_name = "resume-owned-retry" if retry_failed_once else "resume-owned"
+    audit_path, archive = path / f"evidence/{record_name}-audit.json", path / f"evidence/{record_name}-originals"
+    prior_failure = _failed_resume_retry_evidence(path, original) if retry_failed_once else None
+    if audit_path.exists() or archive.exists() or (not retry_failed_once and original.get("resume_owned")):
+        raise ProbeError("resume-owned is single use; prior attempt evidence is preserved")
+    identities = original["service_identities"]
+    runtime = original["runtime"]
+    if runtime["target"]["host"] != "127.0.0.1" or runtime["pytest"]["host"] != "127.0.0.1" or runtime["target"]["port"] != original["ports"]["browser"] or runtime["pytest"]["port"] != original["ports"]["pytest"] or runtime["target"]["database"] != runtime["database"] or identities["target"].get("database") != runtime["database"] or identities["pytest"].get("database") != runtime["pytest"]["database"] or not identities["target"].get("system_identifier") or identities["target"]["system_identifier"] != identities["browser_admin"].get("system_identifier") or identities["pytest"].get("system_identifier") == identities["target"]["system_identifier"]:
+        raise ProbeError("resume-owned target/two original PostgreSQL identity bindings differ")
+    for role in ("api", "ui"):
+        process = original.get(f"{role}_process")
+        if process is not None and (process.get("run_id") != original["run_id"] or not isinstance(process.get("pid"), int) or _process_command(process["pid"])):
+            raise ProbeError("resume-owned recorded PID is running or has changed identity")
+    configuration = _resume_configuration_hashes(path, original, selected, selection)
+    old = dict(original["source_fingerprints"])
+    changes = {}
+    for relative in set(old) | requested | RESUME_INTRINSIC_FILES:
+        source = ROOT / relative
+        if not source.is_file():
+            raise ProbeError("resume-owned required selected source is missing")
+        current = _digest(source)
+        if relative not in requested | RESUME_INTRINSIC_FILES and current != old.get(relative):
+            raise ProbeError(f"resume-owned refuses product/unapproved test source drift: {relative}")
+        if relative in requested | RESUME_INTRINSIC_FILES:
+            changes[relative] = {"previous": old.get(relative), "current": current}
+    for relative, expected_sha in (("hexis-ui/e2e/tool-activity.spec.ts", expected_e2e_sha256), ("hexis-ui/lib/tool-activity-startup.test.ts", expected_startup_sha256)):
+        if expected_sha is not None and _digest(ROOT / relative) != expected_sha:
+            raise ProbeError("resume-owned exact selected E2E hash differs")
+    before = _inspect_resume_resources(path, original, values)
+    if set(before["services"]) != {"pytest-db", "browser-db", "fake-embeddings"} or any(row.get("container_id") != original["owned_resources"].get(name, {}).get("container_id") or row.get("state") not in {"exited", "created"} for name, row in before["services"].items()):
+        raise ProbeError("resume-owned original container identity/state is not fully stopped")
+    files = {"run-manifest.json": path / "run-manifest.json", **{f"evidence/{file.relative_to(path / 'evidence')}": file for file in (path / "evidence").rglob("*") if file.is_file()}}
+    frozen = {name: file.read_bytes() for name, file in files.items()}
+    archive.mkdir()
+    retained = {}
+    for name, raw in frozen.items():
+        dest = archive / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("xb") as stream:
+            os.chmod(dest, 0o600)
+            stream.write(raw)
+        retained[name] = {"path": str(dest), "sha256": hashlib.sha256(raw).hexdigest()}
+    voice_refs = [ref for name, ref in retained.items() if name.endswith("cases/add-evidence.json") or name.endswith("add-evidence-voice-original.json")]
+    voice_refs = [ref for ref in voice_refs if json.loads(Path(ref["path"]).read_text()).get("schema") != "bob108-add-evidence-text-case-v1"]
+    if not voice_refs:
+        raise ProbeError("resume-owned immutable prior voice add_evidence artifact is missing")
+    audit = {"run_id": original["run_id"], "reason": reason.strip(), "changes": changes, "source_files": sorted(requested), "previous_source_fingerprints": old,
+             "original_manifest": retained["run-manifest.json"], "retained_original_evidence": retained, "configuration_hashes": configuration, "original_resources": before,
+             "acceptance_modes": {"add-evidence": "text_chat"}, "prior_voice_attempts": voice_refs, "provider_requested": False, "consent_requested": False, "volumes_deleted": False,
+             "说明": "用户将add_evidence验收改为前台Text Chat；仅start原停止容器，保留全部历史voice证据，禁止provider/consent调用或容器重建。"}
+    if prior_failure is not None:
+        audit["prior_failed_resume"] = prior_failure
+        audit["attempt_number"] = 2
+    _exclusive_json(audit_path, audit)
+    manifest = json.loads(json.dumps(original))
+    manifest["resume_owned"] = {"path": str(audit_path), "sha256": _digest(audit_path)}
+    start_invoked = False
+    stage = "compose_start"
+    try:
+        command = _compose_command(path, original, _compose_environment_file(selection))
+        start_invoked = True
+        subprocess.run([*command, "start", "pytest-db", "browser-db", "fake-embeddings"], cwd=ROOT, check=True, capture_output=True, text=True)
+        stage = "container_check"
+        after = _inspect_resume_resources(path, original, values)
+        if before["volumes"] != after["volumes"] or any({key: value for key, value in after["services"][name].items() if key != "state"} != {key: value for key, value in row.items() if key != "state"} or after["services"][name].get("state") != "running" for name, row in before["services"].items()):
+            raise ProbeError("resume-owned original container/volume configuration changed during start")
+        stage = "runtime_check"
+        runtime_check = asyncio.run(_validate_resumed_runtime(manifest, values))
+        for relative, change in changes.items():
+            manifest["source_fingerprints"][relative] = change["current"]
+        manifest["state"] = "consent_accepted"
+        manifest["api_process"] = None
+        manifest["ui_process"] = None
+        manifest["acceptance_modes"] = {**manifest.get("acceptance_modes", {}), "add-evidence": "text_chat"}
+        _atomic_json(path / "run-manifest.json", manifest)
+        stage = "api_start"
+        api = serve_api(path)
+        stage = "ui_start"
+        ui = serve_ui(path)
+        stage = "readiness_1"
+        first_ready = check_readiness(path)
+        stage = "readiness_2"
+        readiness = [first_ready, check_readiness(path)]
+        result = {"run_id": manifest["run_id"], "state": "ready", "api": api, "ui": ui, "readiness": readiness, "runtime_check": runtime_check, "provider_requested": False, "consent_requested": False, "volumes_deleted": False}
+        _exclusive_json(path / f"evidence/{record_name}-result.json", result)
+        return result
+    except BaseException as exc:
+        failures = []
+        current = json.loads((path / "run-manifest.json").read_text())
+        for role in ("ui", "api"):
+            process = current.get(f"{role}_process")
+            if process is not None and process != original.get(f"{role}_process"):
+                try:
+                    _stop_run_process(process, run_dir=path, role=role)
+                except Exception:
+                    failures.append(f"{role}_identity_or_stop")
+        if start_invoked:
+            for name in before["services"]:
+                try:
+                    observed = _inspect_resume_resources(path, original, values, service_names=[name], include_volumes=False)
+                    row = observed["services"][name]
+                    if row.get("state") in {"running", "restarting", "paused"} and row["container_id"] == before["services"][name]["container_id"]:
+                        subprocess.run(["docker", "stop", row["container_id"]], cwd=ROOT, check=True, capture_output=True, text=True)
+                except Exception:
+                    failures.append(f"{name}_identity_or_stop")
+        stopped = json.loads(json.dumps(original))
+        stopped["resume_owned"] = manifest["resume_owned"]
+        stopped["state"] = "resume_failed" if failures else "stopped"
+        _atomic_json(path / "run-manifest.json", stopped)
+        failure = {"run_id": original["run_id"], "state": stopped["state"], "error_type": type(exc).__name__, **_safe_resume_failure(exc, stage), "rollback_failures": failures, "provider_requested": False, "consent_requested": False, "volumes_deleted": False}
+        _exclusive_json(path / f"evidence/{record_name}-result.json", failure)
+        raise ProbeError("resume-owned failed; only newly started verified owned resources were stopped, volumes and audit were retained") from exc
+
+
 def pytest_command(run_dir: str | Path, pytest_args: list[str]) -> int:
     path, manifest, _selected, _selection, values = load_run(run_dir)
     if manifest.get("state") not in {"awaiting_consent", "consent_error", "consent_accepted", "ready"}:
@@ -2670,6 +2947,7 @@ def _historical_case_lineage(path: Path, manifest: dict[str, Any], name: str, ra
         if expected_current.get(relative) != change["previous"]:
             raise ProbeError("historical assessment prior source baseline differs")
         expected_current[relative] = change["current"]
+    expected_current = _sources_after_owned_resume(manifest, expected_current)
     if expected_current != manifest["source_fingerprints"]:
         raise ProbeError("historical assessment current source map differs from its audit")
     _assert_current_source_fingerprints(manifest)
@@ -2694,7 +2972,8 @@ def _historical_case_lineage(path: Path, manifest: dict[str, Any], name: str, ra
 
 def _case_source_error(path: Path, manifest: dict[str, Any], name: str, raw: dict[str, Any]) -> str | None:
     fingerprints = raw.get("evidence", {}).get("source_fingerprints")
-    if manifest.get("final_verification_refresh"):
+    current_text = name == "add-evidence" and manifest.get("acceptance_modes", {}).get(name) == "text_chat" and raw.get("schema") == "bob108-add-evidence-text-case-v1" and raw.get("input_mode") == "text_chat"
+    if manifest.get("final_verification_refresh") and not current_text:
         try:
             _historical_case_lineage(path, manifest, name, raw)
             return None
@@ -2709,8 +2988,132 @@ def _case_source_error(path: Path, manifest: dict[str, Any], name: str, raw: dic
     return None
 
 
+def _passing_text_add_evidence_error(path: Path, manifest: dict[str, Any], raw: dict[str, Any]) -> str | None:
+    if raw.get("schema") != "bob108-add-evidence-text-case-v1" or raw.get("input_mode") != "text_chat":
+        return "text add_evidence cannot reuse a voice WAV artifact"
+    evidence = raw.get("evidence")
+    if not isinstance(evidence, dict):
+        return "text add_evidence lacks actual tool evidence"
+    error = _case_source_error(path, manifest, "add-evidence", raw)
+    if error:
+        return error
+    snapshot = evidence.get("snapshot")
+    identity = manifest["service_identities"]["target"]
+    origin = raw.get("origin_session_id")
+    if not origin or not isinstance(snapshot, dict) or snapshot.get("run_id") != manifest["run_id"] or snapshot.get("origin_session_id") != origin or snapshot.get("database") != manifest["runtime"]["database"] or snapshot.get("system_identifier") != identity.get("system_identifier") or evidence.get("activity_session_id") != origin:
+        return "text add_evidence DB/API session ownership differs"
+    prompt = evidence.get("text_request")
+    if not isinstance(prompt, str) or not prompt.strip() or hashlib.sha256(prompt.encode("utf-8")).hexdigest() != evidence.get("text_request_sha256"):
+        return "text add_evidence original UTF-8 request hash differs"
+    try:
+        memory_id = str(UUID(evidence["memory_id"]))
+        source = evidence["source"]
+        if source.get("kind") != "repository_document":
+            return "text add_evidence source kind is not repository_document"
+        _verify_file_ref({"path": source["ref"], "sha256": source["sha256"]})
+        screenshot = _absolute(evidence["screenshot"])
+        if not screenshot.resolve().is_relative_to((path / "evidence").resolve()):
+            return "text add_evidence screenshot is outside its owned evidence directory"
+        _verify_file_ref({"path": str(screenshot), "sha256": evidence["screenshot_sha256"]})
+    except (ProbeError, KeyError, TypeError, ValueError):
+        return "text add_evidence UUID/source/screenshot hash is invalid"
+    if memory_id not in prompt or source["ref"] not in prompt or "add_evidence" not in str(evidence.get("activity_dom", "")):
+        return "text add_evidence request or Activity DOM lacks the actual target tool/source"
+    events = evidence.get("activity_events")
+    if not isinstance(events, list):
+        return "text add_evidence API events are missing"
+    call_id = evidence.get("call_id")
+    if not call_id:
+        return "text add_evidence lacks a persisted request/result call pair"
+    if events:
+        pair = [row for row in events if row.get("payload", {}).get("tool_name") == "add_evidence"]
+        if len(pair) != 2 or {row.get("event_type") for row in pair} != {"TOOL_START", "TOOL_RESULT"} or any(row.get("session_id") != origin or row["payload"].get("call_id") != call_id for row in pair):
+            return "text add_evidence persisted request/result call pair differs"
+        db_events = {row.get("event_id"): row for row in snapshot.get("events", [])}
+        cursor = evidence.get("api_cursor", {})
+        for event in pair:
+            if not _persisted_event_matches(db_events.get(event.get("event_id")), event) or not isinstance(event.get("seq"), int) or isinstance(event.get("seq"), bool) or not isinstance(cursor.get(event.get("stream_id")), int) or cursor[event["stream_id"]] < event["seq"]:
+                return "text add_evidence API/DB event identity or cursor differs"
+        start = next(row for row in pair if row["event_type"] == "TOOL_START")
+        result = next(row for row in pair if row["event_type"] == "TOOL_RESULT")
+    else:
+        start = evidence.get("tool_call")
+        result = evidence.get("tool_result")
+        if not isinstance(start, dict) or not isinstance(result, dict):
+            return "text add_evidence lacks its declared persisted tool call/result"
+        if start.get("session_id") != origin or start.get("event_type") != "TOOL_START" or start.get("payload", {}).get("call_id") != call_id:
+            return "text add_evidence persisted toolCall identity differs"
+        if result.get("session_id") != origin or result.get("event_type") != "TOOL_RESULT" or result.get("payload", {}).get("call_id") != call_id:
+            return "text add_evidence persisted toolResult identity differs"
+        if result.get("payload", {}).get("tool_name") != "add_evidence":
+            return "text add_evidence persisted toolResult tool name differs"
+    if evidence.get("tool_call") != start or evidence.get("tool_result") != result or (events and evidence.get("event_ids") != [row["event_id"] for row in pair]):
+        return "text add_evidence declared raw call/result/event IDs differ"
+    persisted_result = evidence.get("tool_result_message")
+    persisted_tool_result = persisted_result.get("metadata", {}).get("tool_result") if isinstance(persisted_result, dict) else None
+    if not isinstance(persisted_tool_result, dict) or persisted_tool_result.get("isError") is not False:
+        return "text add_evidence persisted toolResult is missing or failed"
+    arguments = start["payload"].get("arguments", {})
+    if (
+        arguments.get("memory_id") != memory_id
+        or arguments.get("stance") != "supports"
+        or arguments.get("source") != {"kind": source["kind"], "ref": source["ref"]}
+        or result["payload"].get("success") is not True
+        or result["payload"].get("error") is not None
+        or result["payload"].get("state") in {"accepted", "unknown", "failed"}
+    ):
+        return "text add_evidence tool target/source or real success result differs"
+    messages = [row for row in snapshot.get("chat_messages", []) if row.get("session_id") == origin]
+    call_messages = [
+        row for row in messages
+        if row.get("role") == "assistant"
+        and any(
+            block.get("type") == "toolCall"
+            and block.get("id") == call_id
+            and block.get("name") == "add_evidence"
+            for block in row.get("content_blocks", [])
+        )
+    ]
+    if len(call_messages) != 1 or call_messages[0] != evidence.get("tool_call_message"):
+        return "text add_evidence lacks its actual persisted toolCall chat message"
+    chat_call_blocks = [
+        block for block in call_messages[0].get("content_blocks", [])
+        if block.get("type") == "toolCall" and block.get("id") == call_id
+    ]
+    if len(chat_call_blocks) != 1 or chat_call_blocks[0].get("arguments") != arguments:
+        return "text add_evidence persisted toolCall arguments differ"
+    result_messages = [
+        row for row in messages
+        if row.get("role") == "toolResult"
+        and row.get("metadata", {}).get("tool_result", {}).get("toolCallId") == call_id
+        and row.get("metadata", {}).get("tool_result", {}).get("toolName") == "add_evidence"
+    ]
+    if len(result_messages) != 1 or result_messages[0] != evidence.get("tool_result_message"):
+        return "text add_evidence lacks its actual persisted toolResult chat message"
+    persisted_tool_result = result_messages[0]["metadata"]["tool_result"]
+    if persisted_tool_result.get("isError") is not False:
+        return "text add_evidence persisted toolResult is failed"
+    memory = evidence.get("memory")
+    if not isinstance(memory, dict) or memory.get("id") != memory_id or memory.get("type") != "semantic" or memory.get("status") != "active" or memory not in snapshot.get("memories", []):
+        return "text add_evidence UUID does not identify the actual active semantic DB memory"
+    revision = evidence.get("revision_audit")
+    revision_evidence = revision.get("evidence") if isinstance(revision, dict) else None
+    if (
+        not isinstance(revision, dict)
+        or revision.get("memory_id") != memory_id
+        or revision not in snapshot.get("belief_revision_audit", [])
+        or not isinstance(revision_evidence, dict)
+        or revision_evidence.get("kind") != source["kind"]
+        or revision_evidence.get("ref") != source["ref"]
+    ):
+        return "text add_evidence actual memory/source revision row is missing or differs"
+    return None
+
+
 def _passing_case_evidence_error(path: Path, manifest: dict[str, Any], name: str, raw: dict[str, Any]) -> str | None:
     """Cross-check persisted identities and artifacts before accepting a case claim."""
+    if name == "add-evidence" and manifest.get("acceptance_modes", {}).get(name) == "text_chat":
+        return _passing_text_add_evidence_error(path, manifest, raw)
     evidence = raw.get("evidence")
     if not isinstance(evidence, dict):
         return "passing case lacks evidence"
@@ -3317,10 +3720,9 @@ def verify_run(
                 "reason": "case evidence file is not valid JSON",
             }
             continue
-        if (
-            not isinstance(raw, dict)
-            or raw.get("schema") != "bob108-tool-activity-case-v1"
-        ):
+        text_mode = name == "add-evidence" and manifest.get("acceptance_modes", {}).get(name) == "text_chat"
+        expected_schema = "bob108-add-evidence-text-case-v1" if text_mode else "bob108-tool-activity-case-v1"
+        if not isinstance(raw, dict) or raw.get("schema") != expected_schema or (text_mode and raw.get("input_mode") != "text_chat"):
             cases[name] = {
                 "status": "FAIL",
                 "reason": "case evidence schema is invalid",
@@ -3340,12 +3742,14 @@ def verify_run(
             "status": status,
             **({"reason": raw.get("reason")} if raw.get("reason") else {}),
         }
-        if manifest.get("final_verification_refresh"):
+        if manifest.get("final_verification_refresh") and not text_mode:
             try:
                 cases[name]["source_lineage"] = _historical_case_lineage(path, manifest, name, raw)
             except (ProbeError, KeyError, TypeError, ValueError, OSError):
                 cases[name] = {"status": "FAIL", "reason": "historical case immutable bytes, source lineage or ownership differs"}
                 continue
+        if text_mode:
+            cases[name]["input_mode"] = "text_chat"
         if status == "PASS":
             try:
                 reason = _passing_case_evidence_error(path, manifest, name, raw)
@@ -3388,6 +3792,9 @@ def verify_run(
         "case_evidence_files": {name: str(cases_dir / f"{name}.json") for name in expected_cases if (cases_dir / f"{name}.json").is_file()},
         "coverage": coverage, "coverage_inputs": coverage_inputs,
     }
+    if manifest.get("resume_owned"):
+        resume_audit = _verified_repair_audit(manifest, "resume_owned")
+        result["archived_voice_add_evidence_attempts"] = resume_audit["prior_voice_attempts"]
     manifest["verification"] = result
     if (
         all(case["status"] == "PASS" for case in cases.values())
@@ -3405,10 +3812,14 @@ def verify_run(
     return result
 
 
-async def _snapshot_async(run_dir: str | Path, session_id: str) -> dict[str, Any]:
+async def _snapshot_async(run_dir: str | Path, session_id: str, *, memory_ids: list[str] = ()) -> dict[str, Any]:
     import asyncpg
 
     path, manifest, _selected, _selection, values = load_run(run_dir)
+    try:
+        explicit_memory_ids = {UUID(value) for value in memory_ids}
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ProbeError("snapshot explicit memory_id must be a UUID") from exc
     try:
         origin_id = UUID(session_id)
     except ValueError as exc:
@@ -3454,7 +3865,7 @@ async def _snapshot_async(run_dir: str | Path, session_id: str) -> dict[str, Any
                 origin_id,
             )]
             memories: list[dict[str, Any]] = []
-            memory_ids = sorted({memory_id for action in actions if (memory_id := _done_receipt_memory_uuid(action)) is not None})
+            memory_ids = sorted(explicit_memory_ids | {memory_id for action in actions if (memory_id := _done_receipt_memory_uuid(action)) is not None})
             if memory_ids:
                 memories = [dict(row) for row in await conn.fetch(
                     "SELECT id::text,type,status,content,metadata,created_at,updated_at FROM memories WHERE id=ANY($1::uuid[]) ORDER BY created_at",
@@ -3484,8 +3895,8 @@ async def _snapshot_async(run_dir: str | Path, session_id: str) -> dict[str, Any
         await conn.close()
 
 
-def snapshot(run_dir: str | Path, session_id: str) -> dict[str, Any]:
-    return asyncio.run(_snapshot_async(run_dir, session_id))
+def snapshot(run_dir: str | Path, session_id: str, *, memory_ids: list[str] = ()) -> dict[str, Any]:
+    return asyncio.run(_snapshot_async(run_dir, session_id, memory_ids=memory_ids))
 
 
 async def _refresh_launcher_fingerprints_async(
@@ -3645,6 +4056,13 @@ def _parser() -> argparse.ArgumentParser:
     final_refresh.add_argument("--expected-e2e-sha256", required=True)
     final_refresh.add_argument("--expected-startup-sha256", required=True)
     final_refresh.add_argument("--trace-path", required=True)
+    resume = commands.add_parser("resume-owned")
+    resume.add_argument("--run-dir", required=True)
+    resume.add_argument("--reason", required=True)
+    resume.add_argument("--source-file", action="append", default=[])
+    resume.add_argument("--expected-e2e-sha256", required=True)
+    resume.add_argument("--expected-startup-sha256", required=True)
+    resume.add_argument("--retry-failed-once", action="store_true")
     verify = commands.add_parser("verify")
     verify.add_argument("--run-dir", required=True)
     verify.add_argument("--coverage-run-dir", action="append", default=[])
@@ -3652,6 +4070,7 @@ def _parser() -> argparse.ArgumentParser:
     snapshot_parser = commands.add_parser("snapshot", help="只读回读本轮 session/task/Activity/receipt/memory 状态")
     snapshot_parser.add_argument("--run-dir", required=True)
     snapshot_parser.add_argument("--session-id", required=True)
+    snapshot_parser.add_argument("--memory-id", action="append", default=[])
     bind = commands.add_parser("bind-evidence-context")
     bind.add_argument("--run-dir", required=True)
     bind.add_argument("--origin-session-id", required=True)
@@ -3687,7 +4106,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "stop-owned":
             result = stop_owned(args.run_dir)
         elif args.command == "snapshot":
-            result = snapshot(args.run_dir, args.session_id)
+            result = snapshot(args.run_dir, args.session_id, memory_ids=args.memory_id)
         elif args.command == "refresh-launcher-fingerprints":
             result = refresh_launcher_fingerprints(args.run_dir, source_files=args.source_file, reason=args.reason)
         elif args.command == "repair-ready-launcher":
@@ -3702,6 +4121,8 @@ def main(argv: list[str] | None = None) -> int:
             result = repair_evidence_replay(args.run_dir, reason=args.reason, expected_e2e_sha256=args.expected_e2e_sha256, expected_startup_sha256=args.expected_startup_sha256, interrupted_trace=args.interrupted_trace, origin_session_id=args.origin_session_id, task_id=args.task_id, task_session_id=args.task_session_id, memory_id=args.memory_id)
         elif args.command == "refresh-final-verification":
             result = refresh_final_verification(args.run_dir, reason=args.reason, expected_source_hashes=dict(zip(FINAL_VERIFICATION_SOURCE_PATHS, (args.expected_probe_sha256, args.expected_probe_tests_sha256, args.expected_e2e_sha256, args.expected_startup_sha256))), trace_path=args.trace_path)
+        elif args.command == "resume-owned":
+            result = resume_owned(args.run_dir, reason=args.reason, source_files=args.source_file, expected_e2e_sha256=args.expected_e2e_sha256, expected_startup_sha256=args.expected_startup_sha256, retry_failed_once=args.retry_failed_once)
         elif args.command == "_api-child":
             _api_child(args.run_dir)
             return 0
