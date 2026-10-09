@@ -25,7 +25,7 @@ describe("speech detection configuration", () => {
       scope: "synthetic_tts_and_deterministic_noise",
       acoustic_validation: "not_claimed",
     });
-    expect(config.capture).toMatchObject({ pre_roll_ms: 240, silence_threshold_ms: 520, candidate_buffer_limit_ms: 1000 });
+    expect(config.capture).toMatchObject({ pre_roll_ms: 240, silence_threshold_ms: 300, candidate_buffer_limit_ms: 1000 });
     expect(config.input_gate).toMatchObject({ probability_threshold: 0.6, window_frames: 3, minimum_positive_frames: 2 });
     expect(config.barge_in_gate.normal).toMatchObject({ probability_threshold: 0.8, window_frames: 6, minimum_positive_frames: 5 });
     expect(config.barge_in_gate.fast).toMatchObject({ probability_threshold: 0.95, window_frames: 4, minimum_positive_frames: 3 });

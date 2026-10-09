@@ -22,7 +22,7 @@
   },
   "capture": {
     "pre_roll_ms": 240,
-    "silence_threshold_ms": 520,
+    "silence_threshold_ms": 300,
     "active_probability_threshold": 0.45,
     "candidate_reject_window_frames": 3,
     "candidate_reject_probability_threshold": 0.6,

@@ -83,7 +83,7 @@ describe("SpeechGate", () => {
     expect(observed).toEqual(["candidate_rejected"]);
   });
 
-  it("有效输入不因低于打断门槛而丢弃，并按样本量累计520ms结束静音", () => {
+  it("有效输入不因低于打断门槛而丢弃，并按样本量累计300ms结束静音", () => {
     const gate = new SpeechGate();
     gate.consume(frame(0, 0.7));
     gate.consume(frame(1, 0.7));
@@ -93,10 +93,10 @@ describe("SpeechGate", () => {
     const belowInterruptThreshold = gate.consume(frame(3, 0.5));
     expect(belowInterruptThreshold.map((item) => item.type)).toEqual(["input_audio"]);
 
-    for (let index = 4; index < 20; index += 1) {
+    for (let index = 4; index < 13; index += 1) {
       expect(gate.consume(frame(index, 0.4)).some((item) => item.type === "input_end")).toBe(false);
     }
-    const ended = gate.consume(frame(20, 0.4));
-    expect(ended.at(-1)).toMatchObject({ type: "input_end", endSample: 21 * 512 });
+    const ended = gate.consume(frame(13, 0.4));
+    expect(ended.at(-1)).toMatchObject({ type: "input_end", endSample: 14 * 512 });
   });
 });
