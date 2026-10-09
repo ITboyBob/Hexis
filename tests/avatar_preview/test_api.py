@@ -751,6 +751,9 @@ async def test_database_context_is_read_only_and_connection_is_closed(monkeypatc
     monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
     monkeypatch.setenv("AVATAR_TEST_DSN", "postgresql://selected/test")
     context = {"identity": [], "worldview": [], "goals": [], "relationships": []}
+    raw_database_context = {
+        key: value for key, value in context.items() if key != "relationships"
+    }
     seen = {"readonly": False, "closed": False, "dsn": None}
 
     class Transaction:
@@ -767,7 +770,9 @@ async def test_database_context_is_read_only_and_connection_is_closed(monkeypatc
 
         async def fetchval(self, query):
             assert query == "SELECT get_appraisal_db_context()"
-            return json.dumps({**context, "dopamine_state": {"secret": True}})
+            return json.dumps(
+                {**raw_database_context, "dopamine_state": {"secret": True}}
+            )
 
         async def close(self):
             seen["closed"] = True

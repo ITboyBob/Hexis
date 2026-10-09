@@ -113,23 +113,69 @@ async def test_evaluate_rejects_empty_message_and_tool_calls():
 
 
 @pytest.mark.asyncio
-async def test_read_db_context_filters_extras_and_surfaces_read_failure():
+@pytest.mark.parametrize("missing_key", avatar_emotion.CONTEXT_KEYS)
+async def test_read_db_context_fills_missing_db_categories(missing_key):
     read_db_context = getattr(avatar_emotion, "read_db_context", None)
     assert callable(read_db_context), "Phase 2 must add the DB context reader"
+    database_context = {
+        key: value for key, value in BASE_CONTEXT.items() if key != missing_key
+    }
 
     class Connection:
         async def fetchval(self, query):
             assert query == "SELECT get_appraisal_db_context()"
-            return json.dumps({**BASE_CONTEXT, "dopamine_state": {"x": 1}})
+            return json.dumps({**database_context, "dopamine_state": {"x": 1}})
 
-    assert await read_db_context(Connection()) == BASE_CONTEXT
+    assert await read_db_context(Connection()) == {
+        **database_context,
+        missing_key: [],
+    }
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    ["[]", "null", "not-json", json.dumps(json.dumps(BASE_CONTEXT))],
+)
+async def test_read_db_context_rejects_non_object_or_invalid_json(raw):
+    class Connection:
+        async def fetchval(self, query):
+            assert query == "SELECT get_appraisal_db_context()"
+            return raw
+
+    with pytest.raises(
+        (ValueError, json.JSONDecodeError), match="四类上下文|Expecting value"
+    ):
+        await avatar_emotion.read_db_context(Connection())
+
+
+@pytest.mark.asyncio
+async def test_read_db_context_surfaces_database_failure():
     class BrokenConnection:
         async def fetchval(self, _query):
             raise OSError("database unavailable")
 
     with pytest.raises(OSError, match="database unavailable"):
-        await read_db_context(BrokenConnection())
+        await avatar_emotion.read_db_context(BrokenConnection())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_key", avatar_emotion.CONTEXT_KEYS)
+async def test_select_context_and_evaluate_inputs_stay_strict_when_a_category_is_missing(
+    missing_key,
+):
+    incomplete = {
+        key: value for key, value in BASE_CONTEXT.items() if key != missing_key
+    }
+    with pytest.raises(ValueError, match="四类上下文"):
+        avatar_emotion.select_context(incomplete)
+    with pytest.raises(ValueError, match="四类上下文"):
+        await avatar_emotion.evaluate(
+            "问题",
+            incomplete,
+            CONFIG,
+            call=lambda **_kwargs: None,
+        )
 
 
 def test_synthetic_semantic_cases_have_predeclared_acceptable_sets():
