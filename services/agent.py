@@ -195,7 +195,7 @@ def _subconscious_trace_events(output: SubconsciousOutput) -> list[AgentEventDat
     ]
 
 
-def _memory_event_preview(
+def memory_event_preview(
     memory: "Memory", content_budget: int = 260
 ) -> dict[str, Any]:
     memory_type = getattr(memory, "type", None)
@@ -223,10 +223,10 @@ def _memory_event_preview(
     return {key: value for key, value in preview.items() if value not in ("", None)}
 
 
-def _memory_event_previews(
+def memory_event_previews(
     memories: list["Memory"], limit: int = 10
 ) -> list[dict[str, Any]]:
-    return [_memory_event_preview(memory) for memory in memories[:limit]]
+    return [memory_event_preview(memory) for memory in memories[:limit]]
 
 
 # ---------------------------------------------------------------------------
@@ -957,7 +957,7 @@ async def run_agent(
                                 "phase": "memory_recall",
                                 "status": "end",
                                 "count": len(context.memories),
-                                "memories": _memory_event_previews(context.memories),
+                                "memories": memory_event_previews(context.memories),
                             },
                         )
                     )
@@ -1305,7 +1305,7 @@ async def stream_agent(
                         "phase": "memory_recall",
                         "status": "end",
                         "count": len(context.memories),
-                        "memories": _memory_event_previews(context.memories),
+                        "memories": memory_event_previews(context.memories),
                     },
                 )
             except Exception as exc:

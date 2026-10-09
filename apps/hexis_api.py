@@ -313,6 +313,7 @@ async def _close_owned_voice_session(session: Any, reason: str) -> None:
     """结束精确的本进程媒体对象与持久行，不扫其它聊天或云 session。"""
     cloud_session_id = session.cloud_session_id
     session._behavior_event_dispatch = None
+    session._memory_recall_dispatch = None
     try:
         await session.close(reason)
     except Exception:
@@ -3906,8 +3907,21 @@ async def voice_realtime_media(websocket: WebSocket, media_session_id: str):
             }
         )
 
+    async def dispatch_memory_recall(payload: dict[str, Any]) -> None:
+        await send_server_message(
+            {
+                "schema_version": 1,
+                "type": "memory_recall",
+                "session_id": str(session.session_id),
+                "media_session_id": session.media_session_id,
+                "producer_seq": 0,
+                **payload,
+            }
+        )
+
     session._input_error_dispatch = send_input_error
     session._behavior_event_dispatch = dispatch_behavior_event
+    session._memory_recall_dispatch = dispatch_memory_recall
 
     async def stream_response(output: dict[str, Any]) -> None:
         response_id = output["response_id"]

@@ -13,7 +13,7 @@ from core.cognitive_memory_api import (
     CognitiveMemory,
     render_chat_memory_context_db,
 )
-from services.agent import render_chat_continuity_context_db
+from services.agent import memory_event_previews, render_chat_continuity_context_db
 from services.voice_instructions import M4InstructionBundle, VoiceInstructionError, render_per_turn
 
 
@@ -27,6 +27,8 @@ class VoiceHydrationResult:
     instructions_hash: str
     hydrate_ms: float
     memory_count: int
+    memory_previews: tuple[dict[str, Any], ...]
+    recall_performed: bool
     persona_context: str
     continuity_context: str
     memory_context: str
@@ -137,6 +139,8 @@ async def hydrate_voice_context(
         instructions_hash=stable_instructions_hash,
         hydrate_ms=(loop.time() - started) * 1000,
         memory_count=len(context.memories),
+        memory_previews=tuple(memory_event_previews(context.memories, memory_limit)),
+        recall_performed=True,
         persona_context=persona_raw.strip(),
         continuity_context=continuity or "## Conversation Continuity Packet\nNo continuity records are available.",
         memory_context=memory_context.strip() or "## Memory Context\nNo relevant memories were retrieved.",
@@ -189,7 +193,8 @@ async def _hydrate_database_only_context(
     return VoiceHydrationResult(
         per_response_instructions=rendered.text, instructions_hash=stable_instructions_hash,
         hydrate_ms=(asyncio.get_running_loop().time() - started) * 1000,
-        memory_count=0, persona_context=persona_raw.strip(), continuity_context=continuity,
+        memory_count=0, memory_previews=(), recall_performed=False,
+        persona_context=persona_raw.strip(), continuity_context=continuity,
         memory_context=memory, temporal_context=temporal.removeprefix("Current date and time: "),
         token_count=rendered.token_count, tokenizer=rendered.tokenizer,
         tokenizer_is_model_exact=rendered.tokenizer_is_model_exact,

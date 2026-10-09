@@ -166,6 +166,8 @@ async def test_restricted_hydration_and_emotion_use_only_persona_time_and_regist
     assert gate.late_diagnostics == ()
     assert coordinator.last_evaluation_task is None
     assert gate.hydration.memory_count == 0
+    assert gate.hydration.memory_previews == ()
+    assert gate.hydration.recall_performed is False
     assert "not performed" in gate.hydration.memory_context
     assert "本次会话真实历史" in gate.hydration.continuity_context
     assert summary["session_execution_policy"] == POLICY

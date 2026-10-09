@@ -215,6 +215,38 @@ describe("parseRealtimeServerMessage", () => {
     expect(() => parseRealtimeServerMessage({ ...result, status: "done" })).toThrow(/status/i);
     expect(() => parseRealtimeServerMessage({ ...result, cancellation_complete: true })).toThrow(/unsupported/);
   });
+
+  it("parses strict memory recall messages and rejects inconsistent previews", () => {
+    const recall = {
+      ...envelope,
+      type: "memory_recall",
+      input_turn_id: "input-1",
+      stimulus_revision: 2,
+      count: 1,
+      memories: [{
+        id: "11111111-1111-4111-8111-111111111111",
+        type: "semantic",
+        content: "用户偏好中文",
+        similarity: 0.91,
+        source: "vector",
+      }],
+      hydrate_ms: 12.5,
+      recall_performed: true,
+    };
+
+    expect(parseRealtimeServerMessage(recall)).toEqual(recall);
+    expect(() => parseRealtimeServerMessage({ ...recall, count: 2 })).toThrow(/count/i);
+    expect(() => parseRealtimeServerMessage({ ...recall, stimulus_revision: -1 })).toThrow(/stimulus_revision/i);
+    expect(() => parseRealtimeServerMessage({ ...recall, memories: [{ content: "missing identity" }] })).toThrow(/missing id/i);
+    expect(() => parseRealtimeServerMessage({ ...recall, recall_performed: false })).toThrow(/recall_performed/i);
+    expect(() => parseRealtimeServerMessage({ ...recall, memories: [{ ...recall.memories[0], content: "长".repeat(261) }] })).toThrow(/content/i);
+    expect(() => parseRealtimeServerMessage({ ...recall, memories: [{ ...recall.memories[0], id: "invalid" }] })).toThrow(/id/i);
+    expect(() => parseRealtimeServerMessage({ ...recall, hydrate_ms: Number.NaN })).toThrow(/hydrate_ms/i);
+    expect(() => parseRealtimeServerMessage({ ...recall, count: -1 })).toThrow(/count/i);
+    expect(() => parseRealtimeServerMessage({ ...recall, memories: [{ ...recall.memories[0], similarity: "0.91" }] })).toThrow(/similarity/i);
+    expect(parseRealtimeServerMessage({ ...recall, count: 0, memories: [] })).toEqual({ ...recall, count: 0, memories: [] });
+    expect(parseRealtimeServerMessage({ ...recall, count: 0, memories: [], recall_performed: false })).toEqual({ ...recall, count: 0, memories: [], recall_performed: false });
+  });
 });
 
 function audioWithExtra(envelope: { schema_version: number; session_id: string; media_session_id: string; producer_seq: number }) {

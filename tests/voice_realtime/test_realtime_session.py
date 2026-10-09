@@ -422,6 +422,177 @@ async def test_authorized_response_uses_server_identity_and_binds_playback_recei
     assert session._response_claims == {}
 
 
+async def test_memory_recall_is_dispatched_once_before_the_first_model_request():
+    from unittest.mock import AsyncMock
+
+    order = []
+    payloads = []
+    send_started = asyncio.Event()
+    send_completed = asyncio.Event()
+    client = FakeClient([])
+    session = make_session(client)
+    await session.start("stable")
+    input_turn_id = "turn-memory"
+    identity = {
+        "session_id": str(session.session_id),
+        "input_turn_id": input_turn_id,
+        "input_order": 3,
+        "stimulus_revision": 1,
+    }
+    session._input_gate_results[input_turn_id] = SimpleNamespace(
+        identity=identity,
+        released=True,
+        context_ready=True,
+        hydration=SimpleNamespace(
+            temporal_context="2026-10-09 12:00 (Asia/Shanghai)",
+            persona_context="Name: Hexis",
+            continuity_context="## Conversation Continuity Packet\nNo prior turns.",
+            memory_context="## Memory Context\nOne result.",
+            instructions_hash="a" * 64,
+            hydrate_ms=12.5,
+            memory_count=1,
+            memory_previews=({
+                "id": str(uuid4()),
+                "type": "semantic",
+                "content": "用户偏好中文",
+            },),
+            recall_performed=True,
+        ),
+        evaluation={"status": "missing"},
+        visual_window={"status": "closed", "owner": "service"},
+    )
+
+    async def dispatch(payload):
+        send_started.set()
+        await send_completed.wait()
+        order.append("memory")
+        payloads.append(payload)
+
+    original_create = client.create_first_response
+
+    async def create_first_response(response_id):
+        order.append("model")
+        await original_create(response_id)
+
+    session._memory_recall_dispatch = dispatch
+    session._event_sink = AsyncMock()
+    client.create_first_response = create_first_response
+    session.bind_voice_turn(
+        input_turn_id=input_turn_id,
+        input_order=3,
+        user_text="继续",
+        context_version="a" * 64,
+        turn_id=uuid4(),
+    )
+    response_task = asyncio.create_task(session.start_authorized_response(input_turn_id))
+    await asyncio.wait_for(send_started.wait(), timeout=1)
+    assert client.responses == []
+    send_completed.set()
+    output = await asyncio.wait_for(response_task, timeout=1)
+    await session._publish_memory_recall(input_turn_id)
+
+    assert order == ["memory", "model"]
+    assert len(payloads) == 1
+    assert payloads[0] == {
+        "input_turn_id": input_turn_id,
+        "stimulus_revision": 1,
+        "count": 1,
+        "memories": list(session._input_gate_results[input_turn_id].hydration.memory_previews),
+        "hydrate_ms": 12.5,
+        "recall_performed": True,
+    }
+    session._event_sink.assert_not_called()
+    session.authorize_voice_recall_call(
+        response_id=output["response_id"], call_id="recall-1",
+        name="voice_recall", arguments='{"query":"继续"}',
+    )
+    await session.release_response(output["response_id"])
+    followup = await session.start_voice_recall_followup(
+        input_turn_id=input_turn_id, call_id="recall-1", tool_output="未召回记忆",
+    )
+    assert order == ["memory", "model", "model"]
+    assert len(payloads) == 1
+    await session.release_response(followup["response_id"])
+
+
+async def test_memory_activity_gate_failure_and_session_close_prevent_delivery():
+    from unittest.mock import AsyncMock
+
+    session = make_session(FakeClient([]))
+    await session.start("stable")
+    dispatch = AsyncMock()
+    session._memory_recall_dispatch = dispatch
+    session._input_gate_results["failed"] = SimpleNamespace(
+        released=True, context_ready=False, hydration=None,
+    )
+    with pytest.raises(VoiceRealtimeSessionError, match="context gate is not ready"):
+        await session.start_authorized_response("failed")
+    dispatch.assert_not_called()
+    assert session.client.responses == []
+    await session.close()
+    assert session._memory_recall_dispatch is None
+
+
+async def test_media_websocket_sends_transient_memory_recall_and_detaches_on_close(monkeypatch):
+    from unittest.mock import AsyncMock
+    from starlette.websockets import WebSocketDisconnect
+    from services.voice_realtime_transport import BargeInCapability
+    import apps.hexis_api as api
+
+    session = make_session(FakeClient([]))
+    await session.start("stable")
+    session._barge_in_capability = BargeInCapability(
+        supported=True, configuration_id="test", maximum_receipt_prefix_items=256,
+    )
+    session._event_sink = AsyncMock()
+    registry = VoiceRealtimeSessionRegistry()
+    registry.register(session.session_id, session)
+    monkeypatch.setattr(api, "_voice_realtime_registry", registry)
+    monkeypatch.setattr(api, "_pool", None)
+    monkeypatch.setenv("HEXIS_UI_ORIGIN", "http://localhost:3477")
+    attached = asyncio.Event()
+    disconnected = asyncio.Event()
+    messages = []
+
+    class Socket:
+        headers = {"origin": "http://localhost:3477"}
+
+        async def accept(self):
+            pass
+
+        async def send_json(self, value):
+            messages.append(value)
+
+        async def receive_text(self):
+            attached.set()
+            await disconnected.wait()
+            raise WebSocketDisconnect()
+
+        async def close(self, **_kwargs):
+            pass
+
+    task = asyncio.create_task(api.voice_realtime_media(Socket(), session.media_session_id))
+    try:
+        await asyncio.wait_for(attached.wait(), timeout=1)
+        payload = {
+            "input_turn_id": str(uuid4()), "stimulus_revision": 0,
+            "count": 0, "memories": [], "hydrate_ms": 1.5, "recall_performed": True,
+        }
+        await session._memory_recall_dispatch(payload)
+        assert [message["type"] for message in messages] == ["ready", "memory_recall"]
+        assert messages[1] == {
+            "schema_version": 1, "type": "memory_recall",
+            "session_id": str(session.session_id), "media_session_id": session.media_session_id,
+            "producer_seq": 1, **payload,
+        }
+        session._event_sink.assert_not_called()
+    finally:
+        disconnected.set()
+        await asyncio.wait_for(task, timeout=1)
+    assert session._memory_recall_dispatch is None
+    assert not session.ready
+
+
 @pytest.mark.parametrize("terminal_first", [False, True])
 async def test_audio_response_can_start_next_turn_after_generation_and_playback_finish(terminal_first):
     session = make_session(FakeClient([]))

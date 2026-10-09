@@ -432,6 +432,54 @@ describe("TalkMode", () => {
     expect(screen.getByTestId("voice-stage-bubble")).toHaveTextContent("thinking");
   });
 
+  it("forwards current memory hydration without changing the avatar and drops stale media", async () => {
+    configureSelectionMedia();
+    const onMemoryRecall = vi.fn();
+    const view = render(<TalkMode sessionId="session-1" onMemoryRecall={onMemoryRecall} />);
+    fireEvent.click(screen.getByRole("button", { name: "Start Talk mode" }));
+    await screen.findByText("Listening");
+
+    const message = {
+      schema_version: 1,
+      type: "memory_recall",
+      session_id: "session-1",
+      media_session_id: "media-1",
+      producer_seq: 1,
+      input_turn_id: "input-1",
+      stimulus_revision: 0,
+      count: 1,
+      memories: [{
+        id: "11111111-1111-4111-8111-111111111111",
+        type: "semantic",
+        content: "用户偏好中文",
+      }],
+      hydrate_ms: 4.5,
+      recall_performed: true,
+    };
+    act(() => FakeWebSocket.instances[0].onmessage?.({ data: JSON.stringify(message) }));
+    expect(onMemoryRecall).toHaveBeenCalledOnce();
+    expect(onMemoryRecall).toHaveBeenCalledWith(expect.objectContaining({
+      type: "memory_recall",
+      input_turn_id: "input-1",
+    }));
+    expect(screen.getByTestId("talk-avatar-engine")).toHaveTextContent("idle");
+
+    act(() => FakeWebSocket.instances[0].onmessage?.({
+      data: JSON.stringify({ ...message, producer_seq: 2, media_session_id: "media-old" }),
+    }));
+    act(() => FakeWebSocket.instances[0].onmessage?.({
+      data: JSON.stringify({ ...message, producer_seq: 3, session_id: "session-old" }),
+    }));
+    expect(onMemoryRecall).toHaveBeenCalledOnce();
+    const updatedCallback = vi.fn();
+    view.rerender(<TalkMode sessionId="session-1" onMemoryRecall={updatedCallback} />);
+    act(() => FakeWebSocket.instances[0].onmessage?.({
+      data: JSON.stringify({ ...message, producer_seq: 4, input_turn_id: "input-2" }),
+    }));
+    expect(updatedCallback).toHaveBeenCalledOnce();
+    expect(onMemoryRecall).toHaveBeenCalledOnce();
+  });
+
   it("does not create a realtime session when microphone permission is denied", async () => {
     const getUserMedia = vi.fn().mockRejectedValue(new Error("Permission denied"));
     Object.defineProperty(navigator, "mediaDevices", {

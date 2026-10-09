@@ -287,6 +287,40 @@ class ServerGeneration(ServerEnvelope):
         return self
 
 
+class ServerMemoryPreview(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    id: UUID
+    type: str = Field(min_length=1, max_length=40)
+    content: str = Field(min_length=1, max_length=260)
+    similarity: float | None = None
+    relevance_score: float | None = None
+    importance: float | None = None
+    trust_level: float | None = None
+    confidence: float | None = None
+    source: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+class ServerMemoryRecall(ServerEnvelope):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    type: Literal["memory_recall"]
+    input_turn_id: str = Field(min_length=1, max_length=200)
+    stimulus_revision: int = Field(ge=0, strict=True)
+    count: int = Field(ge=0, le=10, strict=True)
+    memories: list[ServerMemoryPreview] = Field(max_length=10)
+    hydrate_ms: float = Field(ge=0)
+    recall_performed: bool = Field(strict=True)
+
+    @model_validator(mode="after")
+    def _validate_memory_recall(self) -> "ServerMemoryRecall":
+        if self.count != len(self.memories):
+            raise ValueError("memory recall count must match previews")
+        if not self.recall_performed and self.count != 0:
+            raise ValueError("memory recall disabled state must not include previews")
+        return self
+
+
 class ServerM5Selection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -343,6 +377,7 @@ ServerMessage = Annotated[
         ServerReady,
         ServerAudioChunk,
         ServerGeneration,
+        ServerMemoryRecall,
         ServerM5SelectionOpened,
         ServerCaptureSuspended,
         ServerCaptureResumed,

@@ -124,6 +124,18 @@ export type RealtimeSessionResponse = {
   barge_in_capability: BargeInCapability;
 };
 
+export type VoiceMemoryPreview = {
+  id: string;
+  type: string;
+  content: string;
+  similarity?: number;
+  relevance_score?: number;
+  importance?: number;
+  trust_level?: number;
+  confidence?: number;
+  source?: string;
+};
+
 export type RealtimeServerMessage =
   | {
       schema_version: 1;
@@ -134,6 +146,19 @@ export type RealtimeServerMessage =
       cloud_session_id: string;
       instructions_hash: string;
       barge_in_capability: BargeInCapability;
+    }
+  | {
+      schema_version: 1;
+      type: "memory_recall";
+      session_id: string;
+      media_session_id: string;
+      producer_seq: number;
+      input_turn_id: string;
+      stimulus_revision: number;
+      count: number;
+      memories: VoiceMemoryPreview[];
+      hydrate_ms: number;
+      recall_performed: boolean;
     }
   | {
       schema_version: 1;
@@ -279,6 +304,40 @@ function requireInteger(value: MessageRecord, key: string, minimum = 0): void {
   }
 }
 
+function requireFiniteNumber(value: MessageRecord, key: string, minimum?: number): void {
+  const field = value[key];
+  if (
+    typeof field !== "number" ||
+    !Number.isFinite(field) ||
+    (minimum !== undefined && field < minimum)
+  ) {
+    throw new Error(`The voice service message has an invalid ${key}.`);
+  }
+}
+
+function parseMemoryPreview(value: unknown): VoiceMemoryPreview {
+  if (!isMessageRecord(value)) throw new Error("The voice service memory preview is invalid.");
+  requireExactFields(
+    value,
+    ["id", "type", "content"],
+    ["similarity", "relevance_score", "importance", "trust_level", "confidence", "source"],
+  );
+  for (const key of ["id", "type", "content"]) requireString(value, key);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.id as string)) {
+    throw new Error("The voice service memory preview has an invalid id.");
+  }
+  for (const [key, limit] of [["type", 40], ["content", 260], ["source", 100]] as const) {
+    if (typeof value[key] === "string" && Array.from(value[key]).length > limit) {
+      throw new Error(`The voice service memory preview has an invalid ${key}.`);
+    }
+  }
+  for (const key of ["similarity", "relevance_score", "importance", "trust_level", "confidence"]) {
+    if (value[key] !== undefined) requireFiniteNumber(value, key);
+  }
+  if (value.source !== undefined) requireString(value, "source");
+  return value as VoiceMemoryPreview;
+}
+
 function validateEnvelope(value: MessageRecord, type: string): void {
   if (value.schema_version !== 1 || value.type !== type) {
     throw new Error("The voice service message has an unsupported schema or type.");
@@ -337,6 +396,30 @@ export function parseRealtimeServerMessage(value: unknown): RealtimeServerMessag
       throw new Error("The voice service message has an invalid instructions_hash.");
     }
     parseBargeInCapability(value.barge_in_capability);
+  } else if (type === "memory_recall") {
+    requireExactFields(value, [
+      "schema_version", "type", "session_id", "media_session_id", "producer_seq",
+      "input_turn_id", "stimulus_revision", "count", "memories", "hydrate_ms",
+      "recall_performed",
+    ]);
+    validateEnvelope(value, type);
+    requireString(value, "input_turn_id");
+    requireInteger(value, "stimulus_revision");
+    requireInteger(value, "count");
+    requireFiniteNumber(value, "hydrate_ms", 0);
+    if (typeof value.recall_performed !== "boolean") {
+      throw new Error("The voice service message has an invalid recall_performed flag.");
+    }
+    if (!Array.isArray(value.memories) || value.memories.length > 10) {
+      throw new Error("The voice service message has invalid memories.");
+    }
+    value.memories.forEach(parseMemoryPreview);
+    if (value.count !== value.memories.length) {
+      throw new Error("The voice service message count does not match its memory previews.");
+    }
+    if (value.recall_performed === false && value.count !== 0) {
+      throw new Error("The voice service message recall_performed flag conflicts with its count.");
+    }
   } else if (type === "audio_chunk") {
     requireExactFields(value, [
       "schema_version", "type", "session_id", "media_session_id", "producer_seq",

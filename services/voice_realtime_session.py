@@ -6,6 +6,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import math
 import time
 from collections import OrderedDict
 from typing import Any
@@ -115,7 +116,9 @@ class VoiceRealtimeSession:
         self._input_order = 0
         self._event_sink: Any | None = None
         self._behavior_event_dispatch: Any | None = None
+        self._memory_recall_dispatch: Any | None = None
         self._response_dispatch: Any | None = None
+        self._memory_recall_inputs: set[str] = set()
         # Producer sequence 0 is reserved for voice_session_ready.
         self._event_seq = 1
 
@@ -280,6 +283,7 @@ class VoiceRealtimeSession:
         async with self._instruction_turn_lock:
             await self._responses_idle.wait()
             instructions, facts = self.response_instructions(input_turn_id)
+            await self._publish_memory_recall(input_turn_id)
             await self.client.update_session_instructions(instructions)
             async with self._foreground_command_lock:
                 response_id = str(uuid4())
@@ -331,6 +335,58 @@ class VoiceRealtimeSession:
                     "input_turn_id": input_turn_id,
                     "turn_id": str(turn["turn_id"]) if turn is not None else None,
                 }
+
+    async def _publish_memory_recall(self, input_turn_id: str) -> None:
+        """Send one transient hydration preview before this input's first model request."""
+        if input_turn_id in self._memory_recall_inputs:
+            return
+        dispatch = self._memory_recall_dispatch
+        if dispatch is None:
+            return
+        gate = self._input_gate_results.get(input_turn_id)
+        if gate is None or not gate.released or not gate.context_ready or gate.hydration is None:
+            raise VoiceRealtimeSessionError("input hydration is unavailable for memory Activity")
+        identity = gate.identity
+        if (
+            identity.get("session_id") != str(self.session_id)
+            or identity.get("input_turn_id") != input_turn_id
+        ):
+            raise VoiceRealtimeSessionError("memory Activity input identity is stale")
+        hydration = gate.hydration
+        previews = getattr(hydration, "memory_previews", None)
+        count = getattr(hydration, "memory_count", None)
+        hydrate_ms = getattr(hydration, "hydrate_ms", None)
+        recall_performed = getattr(hydration, "recall_performed", None)
+        stimulus_revision = identity.get("stimulus_revision")
+        if (
+            not isinstance(previews, tuple)
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count != len(previews)
+            or count < 0
+            or count > 10
+            or any(not isinstance(preview, dict) for preview in previews)
+            or not isinstance(hydrate_ms, (int, float))
+            or isinstance(hydrate_ms, bool)
+            or not math.isfinite(float(hydrate_ms))
+            or hydrate_ms < 0
+            or not isinstance(recall_performed, bool)
+            or (not recall_performed and count != 0)
+            or not isinstance(stimulus_revision, int)
+            or isinstance(stimulus_revision, bool)
+            or stimulus_revision < 0
+        ):
+            raise VoiceRealtimeSessionError("input hydration has invalid memory Activity data")
+        payload = {
+            "input_turn_id": input_turn_id,
+            "stimulus_revision": stimulus_revision,
+            "count": count,
+            "memories": [dict(preview) for preview in previews],
+            "hydrate_ms": float(hydrate_ms),
+            "recall_performed": recall_performed,
+        }
+        await dispatch(payload)
+        self._memory_recall_inputs.add(input_turn_id)
 
     def bind_voice_turn(
         self,
@@ -1086,6 +1142,7 @@ class VoiceRealtimeSession:
             return
         self._closed = True
         self._ready = False
+        self._memory_recall_dispatch = None
         self._closed_event.set()
         await self.client.close()
 

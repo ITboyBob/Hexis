@@ -39,6 +39,7 @@ import { AttachmentCard, type AttachmentKind } from "./attachment-card";
 import { MessagePresentationView, ToolMessageCard } from "./message-presentation";
 import { VoiceRecorder } from "./voice-recorder";
 import { TalkMode } from "./talk-mode";
+import { voiceMemoryRecallLog, type VoiceMemoryRecallMessage } from "@/lib/voice-memory-activity";
 import { TaskList } from "./task-list";
 
 type ChatMessage = {
@@ -1563,6 +1564,14 @@ export default function ChatPage() {
       scopedEvent,
     ]);
   }, [sessionId]);
+
+  const handleVoiceMemoryRecall = useCallback((message: VoiceMemoryRecallMessage) => {
+    if (message.session_id !== sessionIdRef.current) return;
+    const event = voiceMemoryRecallLog(message);
+    setEvents((prev) => prev.some((item) => item.id === event.id && item.sessionId === event.sessionId)
+      ? prev
+      : [...prev.slice(-(MAX_ACTIVITY_EVENTS - 1)), event]);
+  }, []);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -3166,6 +3175,7 @@ export default function ChatPage() {
                 sessionId={sessionId}
                 selectionOpen={Boolean(taskSelectionForOrigin)}
                 onSelectionOpened={setTaskSelection}
+                onMemoryRecall={handleVoiceMemoryRecall}
                 onSessionId={(nextSessionId) => {
                   saveSessionId(nextSessionId);
                   setActiveSessionId(nextSessionId);

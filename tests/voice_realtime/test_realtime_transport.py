@@ -342,6 +342,29 @@ def test_parses_server_ready_audio_generation_event_and_error():
             "reason": None,
         }
     )
+    memory_recall = parse_server_message(
+        {
+            "schema_version": 1,
+            "type": "memory_recall",
+            "session_id": str(session_id),
+            "media_session_id": "media-1",
+            "producer_seq": 4,
+            "input_turn_id": str(uuid4()),
+            "stimulus_revision": 1,
+            "count": 1,
+            "memories": [
+                {
+                    "id": str(uuid4()),
+                    "type": "semantic",
+                    "content": "用户偏好中文",
+                    "similarity": 0.91,
+                    "source": "vector",
+                }
+            ],
+            "hydrate_ms": 12.5,
+            "recall_performed": True,
+        }
+    )
     selection = parse_server_message(
         {
             "schema_version": 1,
@@ -402,6 +425,9 @@ def test_parses_server_ready_audio_generation_event_and_error():
     assert generation.type == "generation"
     assert generation.turn_id is None
     assert generation_done.reason is None
+    assert memory_recall.type == "memory_recall"
+    assert memory_recall.count == 1
+    assert memory_recall.memories[0].content == "用户偏好中文"
     assert selection.type == "m5_selection_opened"
     assert selection.selection.version == 2
     assert suspended.type == "capture_suspended"
@@ -424,6 +450,38 @@ def test_server_media_messages_reject_unknown_fields():
                 "unsupported": True,
             }
         )
+
+
+def test_server_memory_recall_rejects_count_or_policy_conflicts():
+    base = {
+        "schema_version": 1,
+        "type": "memory_recall",
+        "session_id": str(uuid4()),
+        "media_session_id": "media-1",
+        "producer_seq": 1,
+        "input_turn_id": str(uuid4()),
+        "stimulus_revision": 0,
+        "count": 0,
+        "memories": [],
+        "hydrate_ms": 1.0,
+        "recall_performed": True,
+    }
+    with pytest.raises(ValidationError, match="count"):
+        parse_server_message({
+            **base,
+            "count": 1,
+        })
+    with pytest.raises(ValidationError, match="disabled state"):
+        parse_server_message({
+            **base,
+            "count": 1,
+            "memories": [{
+                "id": str(uuid4()),
+                "type": "semantic",
+                "content": "不应出现",
+            }],
+            "recall_performed": False,
+        })
 
 
 def test_server_generation_variants_require_their_production_fields_and_reject_mixed_shapes():

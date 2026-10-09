@@ -44,7 +44,17 @@ class FakeHydrator:
 
     async def hydrate(self, message, **kwargs):
         self.kwargs = kwargs
-        return SimpleNamespace(memories=[object()])
+        return SimpleNamespace(memories=[SimpleNamespace(
+            id=uuid4(),
+            type=SimpleNamespace(value="semantic"),
+            content="记忆正文" * 100,
+            similarity=0.91,
+            relevance_score=0.88,
+            importance=0.7,
+            trust_level=0.8,
+            confidence=0.9,
+            source="vector",
+        )])
 
 
 async def _fake_render(connection, name):
@@ -82,6 +92,12 @@ async def test_hydrates_renders_and_reports_interval(monkeypatch):
     assert result.instructions_hash == "a" * 64
     assert result.hydrate_ms >= 0
     assert result.memory_count == 1
+    assert result.recall_performed is True
+    assert len(result.memory_previews) == 1
+    assert result.memory_previews[0]["type"] == "semantic"
+    assert result.memory_previews[0]["similarity"] == 0.91
+    assert result.memory_previews[0]["source"] == "vector"
+    assert len(result.memory_previews[0]["content"]) == 260
     assert "## Active Persona" in result.per_response_instructions
     assert result.token_count > 0
     assert result.tokenizer_is_model_exact is False
@@ -97,6 +113,33 @@ async def test_memory_limit_cannot_exceed_ten():
             stable_instructions_hash="a" * 64,
             memory_limit=11,
         )
+
+
+@pytest.mark.parametrize("count", [0, 10])
+async def test_hydration_previews_include_zero_and_ten_memory_results(monkeypatch, count):
+    connection = FakeConnection()
+    hydrator = FakeHydrator(connection)
+    memory = (await hydrator.hydrate("继续")).memories[0]
+
+    async def hydrate(*_args, **_kwargs):
+        return SimpleNamespace(memories=[memory] * count)
+
+    monkeypatch.setattr(hydrator, "hydrate", hydrate)
+    monkeypatch.setattr("services.voice_context_hydration.CognitiveMemory", lambda pool: hydrator)
+    monkeypatch.setattr(
+        "services.voice_context_hydration.render_chat_memory_context_db",
+        lambda conn, context, **kwargs: _fake_render(conn, "memory"),
+    )
+    monkeypatch.setattr(
+        "services.voice_context_hydration.render_chat_continuity_context_db",
+        lambda conn, session_id, **kwargs: _fake_render(conn, "continuity"),
+    )
+    result = await hydrate_voice_context(
+        connection, session_id=uuid4(), message="继续", stable_instructions_hash="a" * 64,
+    )
+    assert result.memory_count == count
+    assert len(result.memory_previews) == count
+    assert result.recall_performed is True
 
 
 async def test_over_budget_continuity_fails_without_truncating(monkeypatch):

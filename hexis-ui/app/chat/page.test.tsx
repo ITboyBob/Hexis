@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { isImageAttachmentFile, uploadFileName } from "./attachment-helpers";
 import ChatPage from "./page";
+import { voiceMemoryRecallLog } from "@/lib/voice-memory-activity";
 
 describe("chat attachment helpers", () => {
   it("detects pasted clipboard images by mime type", () => {
@@ -847,6 +848,66 @@ describe("ChatPage recall activity", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     sessionStorage.clear();
+  });
+
+  it("maps voice hydration into the existing Memory pane and restores it after refresh", async () => {
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    const message = {
+      schema_version: 1 as const,
+      type: "memory_recall" as const,
+      session_id: sessionId,
+      media_session_id: "media-1",
+      producer_seq: 1,
+      input_turn_id: "input-1",
+      stimulus_revision: 2,
+      count: 1,
+      memories: [{
+        id: "22222222-2222-4222-8222-222222222222",
+        type: "semantic",
+        content: "前台语音水合记忆",
+        similarity: 0.93,
+      }],
+      hydrate_ms: 8.5,
+      recall_performed: true,
+    };
+    const event = voiceMemoryRecallLog(message, Date.now());
+    expect(event.id).toBe("voice-memory:input-1:2");
+    expect(event.category).toBe("memory");
+    sessionStorage.setItem("hexis-chat-session-id", sessionId);
+    sessionStorage.setItem("hexis-chat-activity-events", JSON.stringify([event]));
+    stubFetchWithChatEvents([]);
+
+    const first = render(<ChatPage />);
+    expect(await screen.findByText("前台语音水合记忆")).toBeInTheDocument();
+    expect(screen.getByText("1 recent events")).toBeInTheDocument();
+    first.unmount();
+
+    render(<ChatPage />);
+    expect(await screen.findByText("前台语音水合记忆")).toBeInTheDocument();
+    expect(screen.getByText("1 recent events")).toBeInTheDocument();
+  });
+
+  it("labels restricted voice hydration as not recalled instead of zero results", () => {
+    const event = voiceMemoryRecallLog({
+      schema_version: 1,
+      type: "memory_recall",
+      session_id: "11111111-1111-4111-8111-111111111111",
+      media_session_id: "media-1",
+      producer_seq: 1,
+      input_turn_id: "input-restricted",
+      stimulus_revision: 0,
+      count: 0,
+      memories: [],
+      hydrate_ms: 3,
+      recall_performed: false,
+    });
+
+    expect(event.detail).toBe("Memory recall was not performed by the selected policy");
+    expect(event.raw).toEqual(expect.objectContaining({
+      kind: "memory_recall",
+      count: 0,
+      recall_performed: false,
+    }));
   });
 
   it("shows the full recall body verbatim in the expanded activity list", async () => {

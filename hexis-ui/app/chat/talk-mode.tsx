@@ -67,12 +67,14 @@ export function TalkMode({
   onSessionId,
   selectionOpen = false,
   onSelectionOpened,
+  onMemoryRecall,
 }: {
   disabled?: boolean;
   sessionId?: string | null;
   onSessionId?: (sessionId: string) => void;
   selectionOpen?: boolean;
   onSelectionOpened?: (selection: M5TaskSelection) => void;
+  onMemoryRecall?: (message: Extract<RealtimeServerMessage, { type: "memory_recall" }>) => void;
 }) {
   const [phase, setPhase] = useState<TalkPhase>("idle");
   const [speaking, setSpeaking] = useState(false);
@@ -88,6 +90,10 @@ export function TalkMode({
   const activeRef = useRef(false);
   const mountedRef = useRef(true);
   const sessionIdRef = useRef(sessionId);
+  const onMemoryRecallRef = useRef(onMemoryRecall);
+  useLayoutEffect(() => {
+    onMemoryRecallRef.current = onMemoryRecall;
+  }, [onMemoryRecall]);
   const selectionPauseRef = useRef<SelectionPause | null>(null);
   const statusCardRef = useRef<HTMLDivElement>(null);
   const avatar = projectVoiceAvatar(avatarState);
@@ -371,6 +377,14 @@ export function TalkMode({
                 : initialVoiceAvatarState(message.session_id);
               return setVoiceAvatarMediaSession(sessionState, message.media_session_id);
             });
+            return;
+          }
+          if (message.type === "memory_recall") {
+            if (
+              message.session_id !== clientRef.current?.activeSessionId ||
+              message.media_session_id !== clientRef.current?.activeMediaSessionId
+            ) return;
+            onMemoryRecallRef.current?.(message);
             return;
           }
           if (message.type === "event") {
