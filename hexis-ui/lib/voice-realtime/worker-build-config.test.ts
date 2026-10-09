@@ -5,13 +5,15 @@ afterEach(() => {
   vi.resetModules();
 });
 
-describe("explicit Worker dev build directory", () => {
+describe("explicit Worker and Talk dev build directory", () => {
   it.each([
     ["worker", ".next/voice-barge-in-unit", ".next/voice-barge-in-unit"],
     ["worker", "", undefined],
-    ["talk", ".next/voice-barge-in-unit", undefined],
+    ["talk", ".next/voice-barge-in-unit", ".next/voice-barge-in-unit"],
+    ["talk", "", undefined],
     ["", ".next/voice-barge-in-unit", undefined],
-  ])("uses the directory only for an explicitly selected worker (%s, %s)", async (target, directory, expected) => {
+    ["other", ".next/voice-barge-in-unit", undefined],
+  ])("uses the directory only for an explicitly selected worker or talk (%s, %s)", async (target, directory, expected) => {
     vi.stubEnv("HEXIS_UI_TEST_TARGET", target);
     vi.stubEnv("HEXIS_UI_DIST_DIR", directory);
     vi.resetModules();

@@ -85,12 +85,12 @@ describe("SpeechGate", () => {
 
   it("有效输入不因低于打断门槛而丢弃，并按样本量累计300ms结束静音", () => {
     const gate = new SpeechGate();
-    gate.consume(frame(0, 0.7));
-    gate.consume(frame(1, 0.7));
+    gate.consume(frame(0, 0.9));
+    gate.consume(frame(1, 0.9));
     const started = gate.consume(frame(2, 0.4));
     expect(started[0]?.type).toBe("input_start");
 
-    const belowInterruptThreshold = gate.consume(frame(3, 0.5));
+    const belowInterruptThreshold = gate.consume(frame(3, 0.77));
     expect(belowInterruptThreshold.map((item) => item.type)).toEqual(["input_audio"]);
 
     for (let index = 4; index < 13; index += 1) {
@@ -98,5 +98,131 @@ describe("SpeechGate", () => {
     }
     const ended = gate.consume(frame(13, 0.4));
     expect(ended.at(-1)).toMatchObject({ type: "input_end", endSample: 14 * 512 });
+  });
+
+  it("0.65的人声概率仍按现有2/3帧规则启动输入", () => {
+    const gate = new SpeechGate();
+    expect(gate.consume(frame(0, 0.65))).toEqual([]);
+    expect(gate.consume(frame(1, 0.65))).toEqual([]);
+    expect(gate.consume(frame(2, 0.65)).map((event) => event.type)).toEqual([
+      "input_start", "input_audio", "input_audio",
+    ]);
+  });
+
+  it.each([0.45, 0.65, 0.749])("录入后概率为%f的帧累计静音，第10个完整帧结束输入", (probability) => {
+    const gate = new SpeechGate();
+    for (let index = 0; index < 3; index += 1) gate.consume(frame(index, 0.9));
+
+    for (let index = 3; index < 12; index += 1) {
+      expect(gate.consume(frame(index, probability)).map((event) => event.type)).toEqual(["input_audio"]);
+    }
+    const ended = gate.consume(frame(12, probability));
+    expect(ended.map((event) => event.type)).toEqual(["input_audio", "input_end"]);
+    expect(ended.at(-1)).toMatchObject({ startSample: 0, endSample: 13 * 512, endMonotonicMs: 416 });
+  });
+
+  it.each([0.75, 0.9])("录入后概率为%f的帧清零静音累计", (probability) => {
+    const gate = new SpeechGate();
+    for (let index = 0; index < 3; index += 1) gate.consume(frame(index, 0.9));
+    for (let index = 3; index < 12; index += 1) gate.consume(frame(index, 0.65));
+
+    expect(gate.consume(frame(12, probability)).map((event) => event.type)).toEqual(["input_audio"]);
+    for (let index = 13; index < 22; index += 1) {
+      expect(gate.consume(frame(index, 0.65)).some((event) => event.type === "input_end")).toBe(false);
+    }
+    expect(gate.consume(frame(22, 0.65)).at(-1)).toMatchObject({ type: "input_end", endSample: 23 * 512 });
+  });
+
+  it("候选确认时累计低于结束阈值的尾帧，并在较高概率帧处停止回溯", () => {
+    const gate = new SpeechGate();
+    gate.consume(frame(0, 0.9));
+    gate.consume(frame(1, 0.65));
+    expect(gate.consume(frame(2, 0.4))[0]?.type).toBe("input_start");
+
+    for (let index = 3; index < 10; index += 1) {
+      expect(gate.consume(frame(index, 0.1)).some((event) => event.type === "input_end")).toBe(false);
+    }
+    expect(gate.consume(frame(10, 0.1)).at(-1)).toMatchObject({ type: "input_end", endSample: 11 * 512 });
+  });
+
+  it("候选尾部全部低于结束阈值时，只累计候选样本而不计入pre-roll", () => {
+    const gate = new SpeechGate();
+    for (let index = 0; index < 10; index += 1) gate.consume(frame(index, 0.1));
+    gate.consume(frame(10, 0.65));
+    gate.consume(frame(11, 0.65));
+    const started = gate.consume(frame(12, 0.65));
+    expect(started[0]).toMatchObject({ type: "input_start", frame: { startSample: 1280 } });
+    expect(started.some((event) => event.type === "input_end")).toBe(false);
+
+    for (let index = 13; index < 19; index += 1) {
+      expect(gate.consume(frame(index, 0.1)).some((event) => event.type === "input_end")).toBe(false);
+    }
+    expect(gate.consume(frame(19, 0.1)).at(-1)).toMatchObject({ type: "input_end", endSample: 20 * 512 });
+  });
+
+  it("候选确认时已累计超过300ms尾部静音，应当帧结束且不被后续人声清零", () => {
+    const gate = new SpeechGate();
+    for (let index = 0; index < 10; index += 1) {
+      expect(gate.consume(frame(index, index % 3 === 0 ? 0.65 : 0.4))).toEqual([]);
+    }
+
+    const confirmed = gate.consume(frame(10, 0.65));
+    expect(confirmed[0]?.type).toBe("input_start");
+    expect(confirmed.filter((event) => "frame" in event)).toHaveLength(11);
+    expect(confirmed.filter((event) => event.type === "input_end")).toEqual([{
+      type: "input_end", startSample: 0, endSample: 11 * 512, endMonotonicMs: 352,
+    }]);
+    expect(gate.consume(frame(11, 0.9))).toEqual([]);
+    expect(gate.consume(frame(12, 0.9))).toEqual([]);
+    expect(gate.consume(frame(13, 0.9))[0]?.type).toBe("input_start");
+  });
+
+  it("累计4799个静音样本不结束，达到4800个样本时结束", () => {
+    const gate = new SpeechGate();
+    for (let index = 0; index < 3; index += 1) gate.consume(frame(index, 0.9));
+    for (let index = 3; index < 12; index += 1) {
+      expect(gate.consume(frame(index, 0.65)).some((event) => event.type === "input_end")).toBe(false);
+    }
+    const beforeBoundary = frame(12, 0.65, 12, 191);
+    expect(gate.consume(beforeBoundary).some((event) => event.type === "input_end")).toBe(false);
+    const finalSample: SpeechFrame = {
+      ...frame(13, 0.65, 13, 1),
+      startSample: beforeBoundary.endSample,
+      endSample: beforeBoundary.endSample + 1,
+      startMonotonicMs: beforeBoundary.endMonotonicMs,
+      endMonotonicMs: beforeBoundary.endMonotonicMs + 1 / 16,
+    };
+    expect(gate.consume(finalSample).at(-1)).toMatchObject({ type: "input_end", endSample: 3 * 512 + 4800 });
+  });
+
+  it("reset后不继承上一段的静音样本", () => {
+    const gate = new SpeechGate();
+    for (let index = 0; index < 3; index += 1) gate.consume(frame(index, 0.9));
+    for (let index = 3; index < 12; index += 1) gate.consume(frame(index, 0.65));
+    gate.reset();
+
+    for (let index = 12; index < 14; index += 1) expect(gate.consume(frame(index, 0.9))).toEqual([]);
+    expect(gate.consume(frame(14, 0.9))[0]?.type).toBe("input_start");
+    for (let index = 15; index < 24; index += 1) {
+      expect(gate.consume(frame(index, 0.65)).some((event) => event.type === "input_end")).toBe(false);
+    }
+    expect(gate.consume(frame(24, 0.65)).at(-1)).toMatchObject({ type: "input_end", endSample: 25 * 512 });
+  });
+
+  it("每段只产生一次input_end，结束后仍可启动下一段", () => {
+    const gate = new SpeechGate();
+    const events: string[] = [];
+    for (let index = 0; index < 36; index += 1) {
+      const voiced = index < 3 || (index >= 23 && index < 26);
+      const trailing = (index >= 3 && index < 13) || index >= 26;
+      const probability = voiced ? 0.9 : trailing ? 0.65 : 0.1;
+      events.push(...gate.consume(frame(index, probability)).map((event) => event.type));
+      if (index === 22) expect(events.filter((type) => type === "input_end")).toHaveLength(1);
+    }
+    expect(events.filter((type) => type === "input_start")).toHaveLength(2);
+    expect(events.filter((type) => type === "input_end")).toHaveLength(2);
+    for (let index = 36; index < 46; index += 1) {
+      expect(gate.consume(frame(index, 0.1)).some((event) => event.type === "input_end")).toBe(false);
+    }
   });
 });

@@ -18,6 +18,7 @@ export type SpeechGateEvent =
 
 export class SpeechGate {
   private readonly activeThreshold = config.capture.active_probability_threshold;
+  private readonly endThreshold = config.capture.end_probability_threshold;
   private readonly candidateRejectWindow = config.capture.candidate_reject_window_frames;
   private readonly candidateRejectThreshold = config.capture.candidate_reject_probability_threshold;
   private readonly candidateBufferLimitSamples = Math.floor(
@@ -79,17 +80,19 @@ export class SpeechGate {
       this.silenceSamples = 0;
       for (let index = this.candidate.length - 1; index >= 0; index -= 1) {
         const item = this.candidate[index];
-        if (item.probability >= this.activeThreshold) break;
+        if (item.probability >= this.endThreshold) break;
         this.silenceSamples += item.samples.length;
       }
       this.preRoll = [];
       this.preRollSamples = 0;
       this.candidate = [];
       this.candidateSamples = 0;
-      return prefix.map((item, index) => ({
+      const events: SpeechGateEvent[] = prefix.map((item, index) => ({
         type: index === 0 ? "input_start" : "input_audio",
         frame: this.toFrame(item),
       }));
+      if (this.silenceSamples >= this.silenceLimitSamples) events.push(this.endInput(frame));
+      return events;
     }
 
     const recent = this.candidate.slice(-this.candidateRejectWindow);
@@ -103,21 +106,24 @@ export class SpeechGate {
   }
 
   private consumeActive(frame: SpeechFrame): SpeechGateEvent[] {
-    if (frame.probability >= this.activeThreshold) this.silenceSamples = 0;
+    if (frame.probability >= this.endThreshold) this.silenceSamples = 0;
     else this.silenceSamples += frame.samples.length;
     const events: SpeechGateEvent[] = [{ type: "input_audio", frame: this.toFrame(frame) }];
-    if (this.silenceSamples >= this.silenceLimitSamples) {
-      events.push({
-        type: "input_end",
-        startSample: this.activeStartSample,
-        endSample: frame.endSample,
-        endMonotonicMs: frame.endMonotonicMs,
-      });
-      this.active = false;
-      this.activeStartSample = 0;
-      this.silenceSamples = 0;
-    }
+    if (this.silenceSamples >= this.silenceLimitSamples) events.push(this.endInput(frame));
     return events;
+  }
+
+  private endInput(frame: SpeechFrame): SpeechGateEvent {
+    const event: SpeechGateEvent = {
+      type: "input_end",
+      startSample: this.activeStartSample,
+      endSample: frame.endSample,
+      endMonotonicMs: frame.endMonotonicMs,
+    };
+    this.active = false;
+    this.activeStartSample = 0;
+    this.silenceSamples = 0;
+    return event;
   }
 
   private rejectCandidate(reason: "probability" | "buffer_limit"): SpeechGateEvent {

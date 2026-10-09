@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "configuration_id": "voice-barge-in-d1-20261008-a",
-  "validation_status": "frozen_synthetic_tuning_only",
+  "configuration_id": "voice-end-threshold-20261009-a",
+  "validation_status": "unvalidated",
   "calibration": {
     "dataset_id": "d1-20261008-a",
     "scope": "synthetic_tts_and_deterministic_noise",
@@ -24,6 +24,7 @@
     "pre_roll_ms": 240,
     "silence_threshold_ms": 300,
     "active_probability_threshold": 0.45,
+    "end_probability_threshold": 0.75,
     "candidate_reject_window_frames": 3,
     "candidate_reject_probability_threshold": 0.6,
     "candidate_buffer_limit_ms": 1000
