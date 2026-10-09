@@ -991,12 +991,15 @@ describe("ChatPage persisted tool activity", () => {
   const sessionId = "11111111-1111-4111-8111-111111111111";
 
   afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
     sessionStorage.clear();
   });
 
   it("replays persisted request and result once, consumes accepted results, and keeps long recall text readable", async () => {
     const recallText = "持久化 voice recall 正文".repeat(80);
+    const recordedAt = Date.now() - 60 * 60 * 1000;
     const calls: URL[] = [];
     const persisted = {
       session_id: sessionId,
@@ -1009,7 +1012,7 @@ describe("ChatPage persisted tool activity", () => {
           stream_id: "voice-tools",
           session_id: sessionId,
           seq: 1,
-          recorded_at: "2026-10-09T00:00:00.000Z",
+          recorded_at: new Date(recordedAt).toISOString(),
           call_id: "voice-call-1",
           activity: { id: "persisted-start", kind: "tool_call", title: "voice_recall", detail: '{"query":"Hexis"}' },
         },
@@ -1019,7 +1022,7 @@ describe("ChatPage persisted tool activity", () => {
           stream_id: "voice-tools",
           session_id: sessionId,
           seq: 2,
-          recorded_at: "2026-10-09T00:00:01.000Z",
+          recorded_at: new Date(recordedAt + 1000).toISOString(),
           call_id: "voice-call-1",
           activity: { id: "persisted-result", kind: "tool_result", title: "voice_recall", detail: recallText },
         },
@@ -1029,7 +1032,7 @@ describe("ChatPage persisted tool activity", () => {
           stream_id: "voice-tools",
           session_id: sessionId,
           seq: 3,
-          recorded_at: "2026-10-09T00:00:02.000Z",
+          recorded_at: new Date(recordedAt + 2000).toISOString(),
           call_id: "remember-call",
           activity: null,
         },
@@ -1062,6 +1065,70 @@ describe("ChatPage persisted tool activity", () => {
     render(<ChatPage />);
     await screen.findByText(recallText);
     expect(screen.getByText("2 recent events")).toBeInTheDocument();
+  });
+
+  it("retains persisted replay across TTL cleanup and refresh while transient tool logs expire", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const now = Date.now();
+    const recordedAt = now - 60 * 60 * 1000;
+    const calls: URL[] = [];
+    let unavailable = false;
+    sessionStorage.setItem("hexis-chat-session-id", sessionId);
+    sessionStorage.setItem("hexis-chat-activity-events", JSON.stringify([
+      { id: "local-tool", category: "tool", title: "read_file", detail: "临时本地工具日志", ts: now, sessionId },
+      { id: "expired-local", category: "tool", title: "read_file", detail: "已过期本地工具日志", ts: recordedAt, sessionId },
+    ]));
+    vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() })));
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname === "/api/status") return Response.json({ configured: true, agent_name: "Samantha" });
+      if (url.pathname === "/api/chat/activity") {
+        calls.push(url);
+        if (unavailable) return Response.json({}, { status: 503 });
+        return Response.json({
+          session_id: sessionId,
+          cursor: { "background-tools": 1 },
+          has_more: false,
+          events: url.searchParams.has("cursor") ? [] : [{
+            event_id: "old-persisted-tool",
+            event_type: "TOOL_RESULT",
+            stream_id: "background-tools",
+            session_id: sessionId,
+            seq: 1,
+            call_id: "old-persisted-call",
+            recorded_at: new Date(recordedAt).toISOString(),
+            activity: { kind: "tool_result", title: "read_file", detail: "一小时前的持久工具结果" },
+          }],
+        });
+      }
+      return Response.json({ messages: [] });
+    }) as unknown as typeof fetch);
+
+    const first = render(<ChatPage />);
+    await screen.findByLabelText("Message Samantha");
+    fireEvent.click(screen.getByRole("button", { name: "Show activity" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Activity/ }));
+    expect(await screen.findByText("一小时前的持久工具结果")).toBeInTheDocument();
+    expect(screen.getByText("临时本地工具日志")).toBeInTheDocument();
+    expect(screen.queryByText("已过期本地工具日志")).toBeNull();
+
+    vi.spyOn(Date, "now").mockReturnValue(now + 31 * 60 * 1000);
+    await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+    expect(screen.getByText("一小时前的持久工具结果")).toBeInTheDocument();
+    expect(screen.queryByText("临时本地工具日志")).toBeNull();
+    expect(calls.some((url) => url.searchParams.get("cursor") === JSON.stringify({ "background-tools": 1 }))).toBe(true);
+    const cached = JSON.parse(sessionStorage.getItem("hexis-chat-activity-events") || "[]");
+    expect(cached.find((event: { id: string }) => event.id === "old-persisted-tool")?.ts).toBe(recordedAt);
+
+    first.unmount();
+    unavailable = true;
+    render(<ChatPage />);
+    await screen.findByLabelText("Message Samantha");
+    fireEvent.click(screen.getByRole("button", { name: "Show activity" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Activity/ }));
+    expect(await screen.findByText("一小时前的持久工具结果")).toBeInTheDocument();
+    expect(await screen.findByText(/Activity replay returned HTTP 503/)).toBeInTheDocument();
+    expect(screen.queryByText("临时本地工具日志")).toBeNull();
   });
 
   it("shows the neutral unknown receipt label without inferring failure from success=false", async () => {
@@ -1443,7 +1510,41 @@ describe("ChatPage outbox replies", () => {
     });
   });
 
+  it("keeps activity closed by the user when the initial desktop viewport sync runs late", async () => {
+    let initialViewportSync: FrameRequestCallback | undefined;
+    vi.stubGlobal("requestAnimationFrame", vi.fn((callback: FrameRequestCallback) => {
+      initialViewportSync = callback;
+      return 1;
+    }));
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    vi.stubGlobal("matchMedia", vi.fn(() => ({
+      matches: true,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })));
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) =>
+      Response.json(String(input).endsWith("/api/status")
+        ? { configured: true, agent_name: "Samantha" }
+        : {})
+    ));
+
+    render(<ChatPage />);
+    await screen.findByLabelText("Message Samantha");
+    fireEvent.click(screen.getByRole("button", { name: "Show activity" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close activity" }));
+    act(() => initialViewportSync?.(0));
+
+    expect(screen.getByRole("button", { name: "Show activity" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Activity" })).toBeNull();
+  });
+
   it("opens and returns from the fixed task session without mixing conversation history", async () => {
+    let initialViewportSync: FrameRequestCallback | undefined;
+    vi.stubGlobal("requestAnimationFrame", vi.fn((callback: FrameRequestCallback) => {
+      initialViewportSync = callback;
+      return 1;
+    }));
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
     const origin = "11111111-1111-4111-8111-111111111111";
     const taskSession = "22222222-2222-4222-8222-222222222222";
     const secondTaskSession = "44444444-4444-4444-8444-444444444444";
@@ -1548,6 +1649,9 @@ describe("ChatPage outbox replies", () => {
     fireEvent.click(screen.getByRole("button", { name: "Show activity" }));
     expect(await screen.findByText("Task A README output")).toBeInTheDocument();
     expect(screen.queryByText("Task B only output")).toBeNull();
+    // The user opened Activity before the deferred initial viewport check ran.
+    act(() => initialViewportSync?.(0));
+    expect(screen.getByRole("button", { name: "Hide activity" })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "任务列表" }));
     fireEvent.click(await screen.findByRole("button", { name: /进入任务：S9专项任务 B/ }));

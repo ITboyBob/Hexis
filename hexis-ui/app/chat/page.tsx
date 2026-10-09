@@ -504,6 +504,7 @@ type LogEvent = {
   raw?: unknown;
   ts: number;
   sessionId?: string | null;
+  persisted?: boolean;
 };
 
 type AgentStatus = {
@@ -662,7 +663,7 @@ function saveSession(messages: ChatMessage[]) {
 function pruneActivityEvents(events: LogEvent[]): LogEvent[] {
   const cutoff = Date.now() - ACTIVITY_TTL_MS;
   return events
-    .filter((event) => event.ts >= cutoff)
+    .filter((event) => event.persisted || event.ts >= cutoff)
     .slice(-MAX_ACTIVITY_EVENTS);
 }
 
@@ -699,6 +700,7 @@ function parseActivityEvents(value: unknown): LogEvent[] {
       raw: record.raw,
       ts: record.ts,
       sessionId: typeof record.sessionId === "string" ? record.sessionId : null,
+      persisted: record.persisted === true,
     }));
   }
   return pruneActivityEvents(events);
@@ -1085,6 +1087,7 @@ export default function ChatPage() {
   const [historyIndex, setHistoryIndex] = useState<number | null>(null);
   const [historyDraft, setHistoryDraft] = useState("");
   const [showInspector, setShowInspector] = useState(false);
+  const inspectorVisibilityChosen = useRef(false);
   const [showInbox, setShowInbox] = useState(false);
   const taskDrafts = useRef(new Map<string, string>());
   const taskNavigationRequest = useRef(0);
@@ -1505,7 +1508,9 @@ export default function ChatPage() {
   useEffect(() => {
     const desktop = window.matchMedia("(min-width: 1024px)");
     const sync = () => setShowInspector(desktop.matches);
-    const frame = requestAnimationFrame(sync);
+    const frame = requestAnimationFrame(() => {
+      if (!inspectorVisibilityChosen.current) sync();
+    });
     desktop.addEventListener("change", sync);
     return () => {
       cancelAnimationFrame(frame);
@@ -1534,8 +1539,7 @@ export default function ChatPage() {
 
   useEffect(() => {
     const timer = setInterval(() => {
-      const cutoff = Date.now() - ACTIVITY_TTL_MS;
-      setEvents((current) => current.filter((event) => event.ts >= cutoff));
+      setEvents(pruneActivityEvents);
     }, 60000);
     return () => clearInterval(timer);
   }, []);
@@ -1610,6 +1614,10 @@ export default function ChatPage() {
                 session_id: requestedSessionId,
               }));
             const merged = mergeToolActivityLogs(currentSessionTools, page.logs, requestedSessionId);
+            const persistedIds = new Set([
+              ...current.filter((event) => event.sessionId === requestedSessionId && event.persisted).map((event) => event.id),
+              ...page.logs.map((event) => event.id),
+            ]);
             const mergedEvents: LogEvent[] = merged.map((event) => ({
               id: event.id,
               category: "tool",
@@ -1618,6 +1626,7 @@ export default function ChatPage() {
               raw: event.raw,
               ts: event.ts,
               sessionId: event.session_id,
+              persisted: persistedIds.has(event.id),
             }));
             return pruneActivityEvents([...otherEvents, ...current.filter((event) => event.sessionId === requestedSessionId && event.category !== "tool"), ...mergedEvents]);
           });
@@ -2872,7 +2881,10 @@ export default function ChatPage() {
                 type="button"
                 aria-label={showInspector ? "Hide activity" : "Show activity"}
                 title={showInspector ? "Hide activity" : "Show activity"}
-                onClick={() => setShowInspector((value) => !value)}
+                onClick={() => {
+                  inspectorVisibilityChosen.current = true;
+                  setShowInspector((value) => !value);
+                }}
                 className={`flex h-9 w-9 items-center justify-center rounded-md ${showInspector ? "bg-[var(--surface-strong)] text-[var(--foreground)]" : "text-[var(--ink-soft)] hover:bg-[var(--surface-strong)]"}`}
               >
                 {showInspector ? <EyeOff size={17} /> : <Eye size={17} />}
@@ -3538,7 +3550,10 @@ export default function ChatPage() {
             expandedPanes={expandedActivityPanes}
             onTogglePane={toggleActivityPane}
             onClear={() => setEvents([])}
-            onClose={() => setShowInspector(false)}
+            onClose={() => {
+              inspectorVisibilityChosen.current = true;
+              setShowInspector(false);
+            }}
           />
         ) : null}
       </div>
