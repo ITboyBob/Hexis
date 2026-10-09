@@ -345,8 +345,8 @@ separately and cannot be cleared by any setting below.
 |-----|------|-------------|
 | `memory.source_trust_defaults` | object | Default trust by provenance kind when a writer does not provide an explicit value |
 | `memory.low_trust_threshold` | float | Sources below this trust render with a visible low-trust warning (default `0.5`) |
-| `contradictions.enabled` | bool | Queue new active semantic/worldview memories for detection (default `true`) |
-| `contradictions.detection_interval_seconds` | int | Minimum interval between model detection batches (default `86400`) |
+| `contradictions.enabled` | bool | 将新增且有效的 active episodic、semantic、worldview 记忆加入检测队列（默认 `true`） |
+| `contradictions.detection_interval_seconds` | int | 模型检测批次的最小启动间隔（默认 `28800` 秒，即 8 小时） |
 | `contradictions.detection_batch_size` | int | Maximum newly written memories checked per batch (default `20`) |
 | `contradictions.candidates_per_memory` | int | Maximum database-selected same-topic candidates per new memory (default `8`) |
 | `contradictions.candidate_similarity` | float | Minimum vector similarity; lexical matches remain eligible (default `0.55`) |

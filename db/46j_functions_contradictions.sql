@@ -4,9 +4,9 @@ SET check_function_bodies = off;
 
 INSERT INTO config_defaults (key, value, description) VALUES
     ('contradictions.enabled', 'true'::jsonb,
-     'Queue new semantic/worldview memories for contradiction detection.'),
-    ('contradictions.detection_interval_seconds', '86400'::jsonb,
-     'Minimum interval between batched model contradiction checks.'),
+     '将新增的 episodic、semantic、worldview 记忆加入矛盾检测队列。'),
+    ('contradictions.detection_interval_seconds', '28800'::jsonb,
+     '模型矛盾检测批次的最小启动间隔，默认八小时。'),
     ('contradictions.detection_batch_size', '20'::jsonb,
      'Maximum newly embedded memories checked in one contradiction-detection batch.'),
     ('contradictions.candidates_per_memory', '8'::jsonb,
@@ -99,7 +99,7 @@ BEGIN
     SELECT * INTO v_memory
     FROM memories
     WHERE id = p_memory_id
-      AND type IN ('semantic', 'worldview')
+      AND type IN ('episodic', 'semantic', 'worldview')
       AND status = 'active'
       AND (valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP);
     IF NOT FOUND THEN
@@ -139,12 +139,13 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    IF NEW.type IN ('semantic', 'worldview')
+    IF NEW.type IN ('episodic', 'semantic', 'worldview')
        AND NEW.status = 'active'
        AND (TG_OP = 'INSERT'
             OR OLD.content IS DISTINCT FROM NEW.content
             OR OLD.embedding_status IS DISTINCT FROM NEW.embedding_status
-            OR OLD.status IS DISTINCT FROM NEW.status) THEN
+            OR OLD.status IS DISTINCT FROM NEW.status
+            OR OLD.type IS DISTINCT FROM NEW.type) THEN
         PERFORM enqueue_contradiction_detection(NEW.id);
     END IF;
     RETURN NEW;
@@ -153,7 +154,7 @@ $$;
 
 DROP TRIGGER IF EXISTS trg_queue_memory_contradiction_detection ON memories;
 CREATE TRIGGER trg_queue_memory_contradiction_detection
-AFTER INSERT OR UPDATE OF content, embedding_status, status ON memories
+AFTER INSERT OR UPDATE OF content, embedding_status, status, type ON memories
 FOR EACH ROW EXECUTE FUNCTION queue_memory_contradiction_detection();
 
 CREATE OR REPLACE FUNCTION contradiction_candidate_memories(
@@ -196,7 +197,7 @@ BEGIN
                ts_rank_cd(to_tsvector('english', m.content), s.query, 32)::float AS word_rank
         FROM subject s
         JOIN memories m ON m.id <> s.id
-        WHERE m.type IN ('semantic', 'worldview')
+        WHERE m.type IN ('episodic', 'semantic', 'worldview')
           AND m.status = 'active'
           AND (m.valid_until IS NULL OR m.valid_until > CURRENT_TIMESTAMP)
           AND NOT EXISTS (
@@ -230,7 +231,7 @@ DECLARE
         p_limit, get_config_int('contradictions.detection_batch_size'), 20
     ), 1), 100);
     v_interval INT := LEAST(GREATEST(COALESCE(
-        get_config_int('contradictions.detection_interval_seconds'), 86400
+        get_config_int('contradictions.detection_interval_seconds'), 28800
     ), 10), 604800);
     v_state JSONB;
     v_last TIMESTAMPTZ;
@@ -264,6 +265,7 @@ BEGIN
                     AND q.claimed_at < CURRENT_TIMESTAMP - INTERVAL '15 minutes'
                 )
               )
+          AND m.type IN ('episodic', 'semantic', 'worldview')
           AND m.status = 'active'
           AND (m.valid_until IS NULL OR m.valid_until > CURRENT_TIMESTAMP)
         ORDER BY q.created_at, q.id
@@ -389,8 +391,7 @@ BEGIN
     IF NULLIF(btrim(COALESCE(p_tension, '')), '') IS NULL THEN
         RETURN jsonb_build_object('created', FALSE, 'reason', 'missing_tension');
     END IF;
-    -- Episodic memories participate in the same user-adjudicated ledger; the
-    -- detection queue/bootstrap stay semantic/worldview only.
+    -- 三类记忆共用自动检测队列和用户裁决账本。
     IF NOT EXISTS (
         SELECT 1 FROM memories
         WHERE id IN (p_memory_a, p_memory_b)
@@ -1090,7 +1091,7 @@ $$;
 INSERT INTO contradiction_detection_queue (memory_id, content_hash)
 SELECT m.id, encode(digest(m.content, 'sha256'), 'hex')
 FROM memories m
-WHERE m.type IN ('semantic', 'worldview')
+WHERE m.type IN ('episodic', 'semantic', 'worldview')
   AND m.status = 'active'
   AND (m.valid_until IS NULL OR m.valid_until > CURRENT_TIMESTAMP)
 ORDER BY m.updated_at DESC, m.id
