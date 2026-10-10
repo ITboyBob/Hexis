@@ -34,6 +34,7 @@ import type { ToolMessageView } from "../../lib/chat-tool-message";
 import { mergeToolActivityLogs, normalizeToolActivityPage } from "../../lib/tool-activity";
 import type { ToolActivityCursor, ToolActivityLog } from "../../lib/tool-activity";
 import type { M5Task, M5TaskSelection, M5TaskSnapshot } from "../../lib/m5-tasks";
+import { useM5Tasks } from "../../lib/m5-tasks";
 import { isImageAttachmentFile, normalizeUploadFile } from "./attachment-helpers";
 import { AttachmentCard, type AttachmentKind } from "./attachment-card";
 import { MessagePresentationView, ToolMessageCard } from "./message-presentation";
@@ -53,6 +54,7 @@ type ChatMessage = {
   incomplete?: boolean;
   error?: string;
   voice?: { inputTurnId?: string; turnId?: string; pending: boolean };
+  m5Report?: { reportId?: string };
 };
 
 // What a message draws for the files that came with it. Images carry a data
@@ -1057,6 +1059,10 @@ function dbMessagesToChatMessages(value: unknown): ChatMessage[] | null {
         role,
         content,
         attachments: attachmentViewsFromMetadata(record.metadata),
+        m5Report: role === "assistant" && metadata?.message_kind === "m5_report" &&
+          typeof record.message_id === "string" && record.message_id.trim() ? {
+            reportId: typeof metadata.report_id === "string" ? metadata.report_id : undefined,
+          } : undefined,
         voice: metadata?.channel === "voice" ? {
           inputTurnId: typeof metadata.input_turn_id === "string" ? metadata.input_turn_id : undefined,
           turnId: typeof metadata.agent_turn_id === "string" ? metadata.agent_turn_id : undefined,
@@ -1066,6 +1072,47 @@ function dbMessagesToChatMessages(value: unknown): ChatMessage[] | null {
     }
   }
   return messages;
+}
+
+function samePersistedMessage(local: ChatMessage, saved: ChatMessage): boolean {
+  return local.id === saved.id || Boolean(
+    local.role === saved.role && local.voice && saved.voice && (
+      local.role === "user"
+        ? local.voice.inputTurnId && local.voice.inputTurnId === saved.voice.inputTurnId
+        : local.voice.turnId && local.voice.turnId === saved.voice.turnId
+    )
+  );
+}
+
+function mergePersistedMessages(
+  current: ChatMessage[], restored: ChatMessage[], includeVoice: boolean
+): ChatMessage[] {
+  // 普通文字使用独立的前端 ID；只协调语音和具备数据库 ID 的后台报告。
+  const candidates = restored.filter((message) => message.m5Report || (includeVoice && message.voice));
+  const merged = current.map((local) => candidates.find((saved) => samePersistedMessage(local, saved)) ?? local);
+  for (let index = 0; index < restored.length; index++) {
+    const saved = restored[index];
+    if (!candidates.includes(saved) || merged.some((local) => samePersistedMessage(local, saved))) continue;
+    const next = restored.slice(index + 1).find((candidate) => merged.some((local) => samePersistedMessage(local, candidate)));
+    const previous = restored.slice(0, index).reverse().find((candidate) => merged.some((local) => samePersistedMessage(local, candidate)));
+    const insertion = next ? merged.findIndex((local) => samePersistedMessage(local, next))
+      : previous ? merged.findIndex((local) => samePersistedMessage(local, previous)) + 1 : merged.length;
+    merged.splice(insertion, 0, saved);
+  }
+  return merged;
+}
+
+function waitForHistoryRetry(delay: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, delay);
+    signal.addEventListener("abort", finish, { once: true });
+    if (signal.aborted) finish();
+  });
 }
 
 export default function ChatPage() {
@@ -1087,6 +1134,8 @@ export default function ChatPage() {
   const [searchConfigError, setSearchConfigError] = useState<string | null>(null);
   const [searchConfigNotice, setSearchConfigNotice] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [initialHistoryReady, setInitialHistoryReady] = useState(false);
+  const [reportSyncError, setReportSyncError] = useState<string | null>(null);
   const [taskNavigation, setTaskNavigation] = useState<M5TaskNavigation | null>(null);
   const [taskSelection, setTaskSelection] = useState<M5TaskSelection | null>(null);
   const [taskSessionLoading, setTaskSessionLoading] = useState(false);
@@ -1101,25 +1150,83 @@ export default function ChatPage() {
   const taskNavigationRequest = useRef(0);
   const sessionIdRef = useRef<string | null>(null);
   const voiceHistoryRequests = useRef(new Map<string, AbortController>());
+  const reportHistoryRequest = useRef<{
+    sessionId: string; controller: AbortController; dirty: boolean;
+  } | null>(null);
+  const historyGeneration = useRef(0);
+  const invalidateHistoryRequests = useCallback(() => {
+    historyGeneration.current++;
+    voiceHistoryRequests.current.forEach((controller) => controller.abort());
+    voiceHistoryRequests.current.clear();
+    reportHistoryRequest.current?.controller.abort();
+    reportHistoryRequest.current = null;
+  }, []);
   const activityCursors = useRef<Record<string, ToolActivityCursor>>({});
-  const setActiveSessionId = (nextSessionId: string | null) => {
+  const setActiveSessionId = useCallback((nextSessionId: string | null) => {
     if (sessionIdRef.current !== nextSessionId) {
-      voiceHistoryRequests.current.forEach((controller) => controller.abort());
-      voiceHistoryRequests.current.clear();
+      invalidateHistoryRequests();
+      setReportSyncError(null);
       setMessages((current) => current.filter((message) => !message.voice?.pending));
     }
     sessionIdRef.current = nextSessionId;
     setSessionId(nextSessionId);
-  };
+  }, [invalidateHistoryRequests]);
   useEffect(() => {
     sessionIdRef.current = sessionId;
   }, [sessionId]);
   useEffect(() => {
-    const requests = voiceHistoryRequests.current;
-    return () => {
-      requests.forEach((controller) => controller.abort());
-      requests.clear();
-    };
+    return invalidateHistoryRequests;
+  }, [invalidateHistoryRequests]);
+
+  const syncM5Reports = useCallback((requestedSessionId: string) => {
+    if (sessionIdRef.current !== requestedSessionId) return;
+    const active = reportHistoryRequest.current;
+    if (active?.sessionId === requestedSessionId) {
+      active.dirty = true;
+      return;
+    }
+    const request = { sessionId: requestedSessionId, controller: new AbortController(), dirty: false };
+    reportHistoryRequest.current = request;
+    const generation = historyGeneration.current;
+    const currentRequest = () => !request.controller.signal.aborted &&
+      historyGeneration.current === generation && sessionIdRef.current === requestedSessionId;
+    void (async () => {
+      try {
+        do {
+          request.dirty = false;
+          let failure: string | null = null;
+          for (const delay of [0, 250, 750, 1500]) {
+            if (delay) await waitForHistoryRetry(delay, request.controller.signal);
+            if (!currentRequest()) return;
+            try {
+              const response = await fetch(`/api/chat/session/${encodeURIComponent(requestedSessionId)}`, {
+                cache: "no-store", signal: request.controller.signal,
+              });
+              const payload = await response.json();
+              if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
+              const restored = dbMessagesToChatMessages(payload?.messages);
+              if (!restored) throw new Error("会话消息格式无效");
+              if (!currentRequest()) return;
+              setMessages((current) => currentRequest() ? mergePersistedMessages(current, restored, false) : current);
+              setReportSyncError(null);
+              setSessionNotice((notice) => notice?.startsWith("后台摘要同步暂不可用") ? null : notice);
+              failure = null;
+              break;
+            } catch (cause) {
+              if (!currentRequest()) return;
+              failure = cause instanceof Error ? cause.message : "无法读取会话消息";
+            }
+          }
+          if (failure && currentRequest()) {
+            const notice = `后台摘要同步暂不可用：${failure}。打开任务列表后点击重试。`;
+            setReportSyncError(notice);
+            setSessionNotice(notice);
+          }
+        } while (request.dirty && currentRequest());
+      } finally {
+        if (reportHistoryRequest.current === request) reportHistoryRequest.current = null;
+      }
+    })();
   }, []);
 
   const handleVoiceChatText = useCallback((update: VoiceChatText) => {
@@ -1153,16 +1260,7 @@ export default function ChatPage() {
     void (async () => {
       try {
         for (const delay of [250, 750, 1500]) {
-          await new Promise<void>((resolve) => {
-            const finish = () => {
-              clearTimeout(timer);
-              controller.signal.removeEventListener("abort", finish);
-              resolve();
-            };
-            const timer = setTimeout(finish, delay);
-            controller.signal.addEventListener("abort", finish, { once: true });
-            if (controller.signal.aborted) finish();
-          });
+          await waitForHistoryRetry(delay, controller.signal);
           if (controller.signal.aborted || sessionIdRef.current !== requestedSessionId) return;
           try {
             const response = await fetch(`/api/chat/session/${encodeURIComponent(requestedSessionId)}`, {
@@ -1174,25 +1272,7 @@ export default function ChatPage() {
             if (!restored || controller.signal.aborted || sessionIdRef.current !== requestedSessionId) continue;
             setMessages((current) => {
               if (controller.signal.aborted || sessionIdRef.current !== requestedSessionId) return current;
-              const sameMessage = (local: ChatMessage, saved: ChatMessage) => local.id === saved.id || (
-                local.role === saved.role && local.voice && saved.voice && (
-                  local.role === "user" ? Boolean(local.voice.inputTurnId && local.voice.inputTurnId === saved.voice.inputTurnId)
-                    : Boolean(local.voice.turnId && local.voice.turnId === saved.voice.turnId)
-                )
-              );
-              // Only reconcile voice records: ordinary Chat has independent frontend IDs.
-              const savedVoice = restored.filter((message) => message.voice);
-              const merged = current.map((local) => savedVoice.find((saved) => sameMessage(local, saved)) ?? local);
-              for (let index = 0; index < savedVoice.length; index++) {
-                const saved = savedVoice[index];
-                if (merged.some((local) => sameMessage(local, saved))) continue;
-                const next = savedVoice.slice(index + 1).find((candidate) => merged.some((local) => sameMessage(local, candidate)));
-                const previous = savedVoice.slice(0, index).reverse().find((candidate) => merged.some((local) => sameMessage(local, candidate)));
-                const insertion = next ? merged.findIndex((local) => sameMessage(local, next))
-                  : previous ? merged.findIndex((local) => sameMessage(local, previous)) + 1 : merged.length;
-                merged.splice(insertion, 0, saved);
-              }
-              return merged;
+              return mergePersistedMessages(current, restored, true);
             });
             if (restored.some((message) => message.role === "assistant" && message.voice?.turnId === turnId)) return;
           } catch {
@@ -1274,26 +1354,30 @@ export default function ChatPage() {
     let cancelled = false;
 
     const restore = async () => {
-      const saved = loadSession();
-      if (saved.length > 0 && !cancelled) setMessages(saved);
-
-      const sessionId = loadSessionId();
-      if (!sessionId) return;
-      if (!cancelled) setActiveSessionId(sessionId);
-      const savedTaskNavigation = loadM5TaskNavigation();
-      if (savedTaskNavigation?.taskSessionId === sessionId && !cancelled) {
-        setTaskNavigation(savedTaskNavigation);
-      }
       try {
+        const saved = loadSession();
+        if (saved.length > 0 && !cancelled) setMessages(saved);
+
+        const sessionId = loadSessionId();
+        if (!sessionId) return;
+        if (!cancelled) setActiveSessionId(sessionId);
+        const generation = historyGeneration.current;
+        const savedTaskNavigation = loadM5TaskNavigation();
+        if (savedTaskNavigation?.taskSessionId === sessionId && !cancelled) {
+          setTaskNavigation(savedTaskNavigation);
+        }
         const response = await fetch(`/api/chat/session/${encodeURIComponent(sessionId)}`, {
           cache: "no-store",
         });
         if (!response.ok) return;
         const payload = await response.json();
         const dbMessages = dbMessagesToChatMessages(payload?.messages);
-        if (dbMessages && !cancelled) setMessages(dbMessages);
+        if (dbMessages && !cancelled && historyGeneration.current === generation &&
+          sessionIdRef.current === sessionId) setMessages(dbMessages);
       } catch {
         // Keep the display cache; the next send still uses DB hydration.
+      } finally {
+        if (!cancelled) setInitialHistoryReady(true);
       }
     };
 
@@ -1301,7 +1385,7 @@ export default function ChatPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [setActiveSessionId]);
 
   const loadInbox = useCallback(async () => {
     try {
@@ -2107,6 +2191,7 @@ export default function ChatPage() {
     messages,
     sending,
     sessionId,
+    setActiveSessionId,
     taskSessionLoading,
   ]);
 
@@ -2141,6 +2226,16 @@ export default function ChatPage() {
   }, [taskNavigation]);
 
   const taskOriginSessionId = taskNavigation?.originSessionId || sessionId;
+  const m5Tasks = useM5Tasks(taskOriginSessionId, Boolean(taskOriginSessionId), Boolean(taskOriginSessionId));
+  useEffect(() => {
+    if (m5Tasks.snapshot) handleTaskSnapshot(m5Tasks.snapshot);
+  }, [m5Tasks.snapshot, handleTaskSnapshot]);
+  useEffect(() => {
+    const snapshot = m5Tasks.snapshot;
+    if (!initialHistoryReady || sessionActionBusy || taskSessionLoading ||
+      !snapshot || snapshot.origin_session_id !== sessionId) return;
+    syncM5Reports(snapshot.origin_session_id);
+  }, [m5Tasks.snapshot, sessionId, initialHistoryReady, sessionActionBusy, taskSessionLoading, syncM5Reports]);
   const taskSelectionForOrigin =
     taskSelection &&
     (!taskSelection.origin_session_id || taskSelection.origin_session_id === taskOriginSessionId)
@@ -2156,6 +2251,8 @@ export default function ChatPage() {
     );
     if (!confirmed) return;
 
+    invalidateHistoryRequests();
+    setReportSyncError(null);
     setSessionActionBusy("clear");
     setSessionNotice(null);
     try {
@@ -3304,10 +3401,13 @@ export default function ChatPage() {
               />
               <TaskList
                 originSessionId={taskOriginSessionId}
+                snapshot={m5Tasks.snapshot}
+                loading={m5Tasks.loading}
+                error={m5Tasks.error || reportSyncError}
+                reload={m5Tasks.reload}
                 currentTaskSessionId={taskNavigation?.taskSessionId === sessionId ? taskNavigation.taskSessionId : null}
                 onOpenTask={handleOpenTask}
                 onReturnToOrigin={handleReturnToOrigin}
-                onSnapshot={handleTaskSnapshot}
                 selection={taskSelectionForOrigin}
                 onSelectionChange={setTaskSelection}
               />

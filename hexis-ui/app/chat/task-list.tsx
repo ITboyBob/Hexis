@@ -3,7 +3,6 @@
 import { useEffect, useState } from "react";
 
 import {
-  useM5Tasks,
   type M5Task,
   type M5TaskSelection,
   type M5TaskSnapshot,
@@ -15,7 +14,10 @@ type TaskListProps = {
   currentTaskSessionId?: string | null;
   onOpenTask: (task: M5Task) => void;
   onReturnToOrigin?: () => void;
-  onSnapshot?: (snapshot: M5TaskSnapshot) => void;
+  snapshot: M5TaskSnapshot | null;
+  loading: boolean;
+  error: string | null;
+  reload: () => void;
   selection?: M5TaskSelection | null;
   onSelectionChange?: (selection: M5TaskSelection | null) => void;
 };
@@ -72,7 +74,10 @@ export function TaskList({
   currentTaskSessionId = null,
   onOpenTask,
   onReturnToOrigin,
-  onSnapshot,
+  snapshot,
+  loading,
+  error,
+  reload,
   selection = null,
   onSelectionChange,
 }: TaskListProps) {
@@ -86,11 +91,6 @@ export function TaskList({
     (!selection.origin_session_id || selection.origin_session_id === originSessionId)
       ? selection
       : null;
-  const { snapshot, loading, error, reload } = useM5Tasks(
-    originSessionId,
-    open || Boolean(currentSelection),
-    open
-  );
   const usableSnapshot =
     snapshot?.origin_session_id === originSessionId ? snapshot : null;
   const snapshotSelection =
@@ -102,10 +102,6 @@ export function TaskList({
         )
     ) ?? null;
   const activeSelection = currentSelection ?? snapshotSelection;
-
-  useEffect(() => {
-    if (usableSnapshot) onSnapshot?.(usableSnapshot);
-  }, [usableSnapshot, onSnapshot]);
 
   useEffect(() => {
     if (!currentSelection && snapshotSelection && originSessionId) {

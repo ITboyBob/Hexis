@@ -1,16 +1,21 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { ComponentProps } from "react";
 
-const { useM5TasksMock } = vi.hoisted(() => ({ useM5TasksMock: vi.fn() }));
+import { TaskList as TaskListView } from "./task-list";
 
-vi.mock("@/lib/m5-tasks", () => ({ useM5Tasks: useM5TasksMock }));
-
-import { TaskList } from "./task-list";
+type TaskState = Pick<ComponentProps<typeof TaskListView>, "snapshot" | "loading" | "error">;
+let taskState: TaskState;
+const reload = vi.fn();
+function TaskList(props: Omit<ComponentProps<typeof TaskListView>, keyof TaskState | "reload">) {
+  return <TaskListView {...props} {...taskState} reload={reload} />;
+}
 
 const origin = "11111111-1111-4111-8111-111111111111";
 
 beforeEach(() => {
-  useM5TasksMock.mockReturnValue({
+  reload.mockClear();
+  taskState = {
     snapshot: {
       origin_session_id: origin,
       event_cursor: { "m5-tasks": 5 },
@@ -46,7 +51,7 @@ beforeEach(() => {
     },
     loading: false,
     error: null,
-  });
+  };
 });
 
 describe("M5 task list", () => {
@@ -96,12 +101,14 @@ describe("M5 task list", () => {
   });
 
   it("reports unavailable data without fabricating an empty list", () => {
-    useM5TasksMock.mockReturnValue({ snapshot: null, loading: false, error: "状态暂不可用" });
+    taskState = { snapshot: null, loading: false, error: "状态暂不可用" };
     render(<TaskList originSessionId={origin} onOpenTask={vi.fn()} />);
     fireEvent.click(screen.getByRole("button", { name: "任务列表" }));
 
     expect(screen.getByText("状态暂不可用")).toBeInTheDocument();
     expect(screen.queryByText("暂无任务")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "重试任务列表" }));
+    expect(reload).toHaveBeenCalledOnce();
   });
 
   it("shows the M5 pend selection over the task list and keeps the list origin bound", () => {
@@ -121,6 +128,6 @@ describe("M5 task list", () => {
     expect(screen.getByRole("dialog", { name: "选择要继续的任务" })).toBeInTheDocument();
     expect(screen.getByText("继续下一道题并保留时间限制。")).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: /整理访谈问题/ })).toBeInTheDocument();
-    expect(useM5TasksMock).toHaveBeenLastCalledWith(origin, true, false);
+    expect(screen.getByRole("button", { name: "任务列表" })).toHaveAttribute("aria-expanded", "false");
   });
 });
