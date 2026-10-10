@@ -27,7 +27,7 @@ test.afterAll(async () => {
 test.afterEach(async ({ page }) => {
   const stop = page.getByRole("button", { name: "Stop Talk mode" });
   if (await stop.isVisible().catch(() => false)) {
-    await stop.click({ timeoutMs: 5_000 });
+    await stop.click({ timeout: 5_000 });
     await expect(page.getByRole("button", { name: "Start Talk mode" })).toBeVisible({ timeout: 10_000 });
   }
 });

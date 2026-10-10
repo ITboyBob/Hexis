@@ -36,6 +36,7 @@ describe("封闭情绪词表", () => {
       interval_ms: number;
       amplitude: number;
       source: Playback["source"];
+      reason?: string;
     }>();
   });
 });

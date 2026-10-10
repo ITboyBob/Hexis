@@ -11,7 +11,7 @@ describe("/api/chat", () => {
   it("forwards upstream SSE chunks without buffering the response", async () => {
     let releaseSecondChunk: (() => void) | undefined;
     const encoder = new TextEncoder();
-    const fetchMock = vi.fn(async () =>
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () =>
       new Response(
         new ReadableStream({
           start(controller) {
@@ -66,7 +66,7 @@ describe("/api/chat", () => {
 
   it("forwards configured API authentication to the stream endpoint", async () => {
     vi.stubEnv("HEXIS_API_KEY", "dashboard-api-key");
-    const fetchMock = vi.fn(async () =>
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () =>
       new Response("event: done\ndata: {}\n\n", {
         headers: { "Content-Type": "text/event-stream" },
       })
@@ -93,7 +93,7 @@ describe("/api/chat", () => {
       session_id: "10000000-0000-4000-8000-000000000001",
       client_message_id: "30000000-0000-4000-8000-000000000001",
     });
-    const fetchMock = vi.fn(async () =>
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () =>
       new Response("event: done\\ndata: {}\\n\\n", {
         headers: { "Content-Type": "text/event-stream" },
       })
