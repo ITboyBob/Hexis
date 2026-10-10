@@ -2,10 +2,10 @@
   "db_source": "hexis-env",
   "memory_limit": 10,
   "emotion": {
-    "provider": "openai-chat-completions-endpoint",
-    "model": "qwen-plus",
-    "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "provider": "aliyun-systemone",
+    "model": "decision-model-preview",
+    "endpoint": "https://llm-n5dppxzleuxpia6o.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/systemone",
     "api_key_env": "DASHSCOPE_API_KEY",
-    "timeout_ms": 1000
+    "timeout_ms": 3000
   }
 }
