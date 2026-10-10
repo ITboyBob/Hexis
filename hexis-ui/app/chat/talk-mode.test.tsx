@@ -480,6 +480,45 @@ describe("TalkMode", () => {
     expect(onMemoryRecall).toHaveBeenCalledOnce();
   });
 
+  it("即时传出用户转写及音频前的助手文字，排除其他文字通道与迟到回复", async () => {
+    configureSelectionMedia();
+    const onChatText = vi.fn();
+    const view = render(<TalkMode sessionId="session-1" onChatText={onChatText} />);
+    fireEvent.click(screen.getByRole("button", { name: "Start Talk mode" }));
+    await screen.findByText("Listening");
+    const send = (message: Record<string, unknown>) => act(() => {
+      FakeWebSocket.instances[0].onmessage?.({ data: JSON.stringify({
+        schema_version: 1, session_id: "session-1", media_session_id: "media-1", producer_seq: 1,
+        ...message,
+      }) });
+    });
+    send({ type: "event", event: {
+      schema_version: 1, event_id: "transcript-1", event_type: "voice_transcript_final",
+      stream_id: "voice", request_id: "input-1", response_id: null,
+      media_session_id: "media-1", producer_seq: 1, seq: 1, channel: "voice", source: "server",
+      producer_id: "hexis.voice", payload: { input_turn_id: "input-1", transcript: "用户原话" },
+    } });
+    const delta = {
+      type: "generation", response_id: "response-1", playback_id: "play-1", turn_id: "turn-1",
+      output_epoch: 1, kind: "audio_transcript_delta", text: "助手文字",
+    };
+    send(delta);
+    expect(onChatText.mock.calls.map(([value]) => value)).toEqual([
+      { sessionId: "session-1", kind: "user", inputTurnId: "input-1", text: "用户原话" },
+      { sessionId: "session-1", kind: "assistant", turnId: "turn-1", responseId: "response-1", text: "助手文字" },
+    ]);
+    send({ ...delta, kind: "text_delta", text: "不得重复" });
+    send({ ...delta, media_session_id: "media-old" });
+    const terminal = { ...delta, text: undefined };
+    send({ ...terminal, kind: "failed", reason: "failed" });
+    send(delta);
+    expect(onChatText).toHaveBeenCalledTimes(2);
+    const updated = vi.fn();
+    view.rerender(<TalkMode sessionId="session-1" onChatText={updated} />);
+    send({ ...delta, response_id: "response-2" });
+    expect(updated).toHaveBeenCalledOnce();
+  });
+
   it("does not create a realtime session when microphone permission is denied", async () => {
     const getUserMedia = vi.fn().mockRejectedValue(new Error("Permission denied"));
     Object.defineProperty(navigator, "mediaDevices", {
@@ -757,6 +796,30 @@ describe("TalkMode", () => {
     expect(screen.getByRole("button", { name: "Start Talk mode" })).toBeInTheDocument();
   });
 
+  it.each(["generation-first", "receipt-first"])("两项终态齐备才通知历史回读：%s", async (order) => {
+    const onVoiceTurnReady = vi.fn();
+    await startPlaybackTalk({ onVoiceTurnReady });
+    vi.useFakeTimers();
+    await act(async () => sendOutput("response-1", 0, btoa("\0".repeat(4800)), "turn-1"));
+    await act(async () => vi.advanceTimersByTimeAsync(25));
+    if (order === "generation-first") {
+      await act(async () => sendGeneration("response-1", "done", "turn-1"));
+      expect(onVoiceTurnReady).not.toHaveBeenCalled();
+      const context = PlaybackContext.instances[0];
+      context.currentTime = 0.12;
+      await act(async () => context.sources[0].onended?.());
+    } else {
+      await act(async () => captureMocks.onBargeIn?.());
+      expect(onVoiceTurnReady).not.toHaveBeenCalled();
+      act(() => sendGeneration("response-1", "done", "turn-1"));
+    }
+    expect(onVoiceTurnReady).toHaveBeenCalledOnce();
+    expect(onVoiceTurnReady).toHaveBeenCalledWith({ sessionId: "session-1", turnId: "turn-1" });
+    act(() => sendGeneration("response-1", "done", "turn-1"));
+    expect(onVoiceTurnReady).toHaveBeenCalledOnce();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Stop Talk mode" })));
+  });
+
   it("waits for the open receipt before sending later playback lifecycle receipts", async () => {
     await startPlaybackTalk();
     const originalFetch = vi.mocked(fetch).getMockImplementation()!;
@@ -952,7 +1015,7 @@ class PlaybackContext {
   }
 }
 
-async function startPlaybackTalk() {
+async function startPlaybackTalk(props: Partial<Parameters<typeof TalkMode>[0]> = {}) {
   PlaybackContext.instances = [];
   vi.stubGlobal("AudioContext", PlaybackContext);
   vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1));
@@ -967,16 +1030,16 @@ async function startPlaybackTalk() {
     return new Response(JSON.stringify({ session_id: "session-1", media_session_id: "media-1", websocket_url: "ws://127.0.0.1:43817/api/voice/realtime/media-1", barge_in_capability: { supported: true, configuration_id: "voice-barge-in-playback-initial-v1", maximum_receipt_prefix_items: 256 } }), { status: 200 });
   }));
   vi.stubGlobal("WebSocket", FakeWebSocket);
-  render(<TalkMode sessionId="session-1" />);
+  render(<TalkMode sessionId="session-1" {...props} />);
   fireEvent.click(screen.getByRole("button", { name: "Start Talk mode" }));
   await screen.findByText("Listening");
   return receipts;
 }
 
-function sendOutput(response_id: string, chunk_index: number, pcm_base64: string) {
-  FakeWebSocket.instances[0].onmessage?.({ data: JSON.stringify({ schema_version: 1, type: "audio_chunk", session_id: "session-1", media_session_id: "media-1", producer_seq: chunk_index + 1, response_id, playback_id: `play-${response_id}`, turn_id: null, output_epoch: 1, segment_id: "segment-1", segment_index: 0, chunk_seq: chunk_index + 1, pcm_base64 }) });
+function sendOutput(response_id: string, chunk_index: number, pcm_base64: string, turn_id: string | null = null) {
+  FakeWebSocket.instances[0].onmessage?.({ data: JSON.stringify({ schema_version: 1, type: "audio_chunk", session_id: "session-1", media_session_id: "media-1", producer_seq: chunk_index + 1, response_id, playback_id: `play-${response_id}`, turn_id, output_epoch: 1, segment_id: "segment-1", segment_index: 0, chunk_seq: chunk_index + 1, pcm_base64 }) });
 }
 
-function sendGeneration(response_id: string, kind: "done" | "failed") {
-  FakeWebSocket.instances[0].onmessage?.({ data: JSON.stringify({ schema_version: 1, type: "generation", session_id: "session-1", media_session_id: "media-1", producer_seq: 100, response_id, playback_id: `play-${response_id}`, turn_id: null, output_epoch: 1, kind, reason: null }) });
+function sendGeneration(response_id: string, kind: "done" | "failed", turn_id: string | null = null) {
+  FakeWebSocket.instances[0].onmessage?.({ data: JSON.stringify({ schema_version: 1, type: "generation", session_id: "session-1", media_session_id: "media-1", producer_seq: 100, response_id, playback_id: `play-${response_id}`, turn_id, output_epoch: 1, kind, reason: null }) });
 }

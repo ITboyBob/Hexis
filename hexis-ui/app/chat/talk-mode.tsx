@@ -35,6 +35,19 @@ type SelectionPause = {
   mediaSessionId: string;
 };
 
+export type VoiceChatText =
+  | { sessionId: string; kind: "user"; inputTurnId: string; text: string }
+  | { sessionId: string; kind: "assistant"; turnId: string; responseId: string; text: string };
+
+type VoiceResponseCompletion = {
+  sessionId: string;
+  mediaSessionId: string;
+  turnId: string;
+  generationDone: boolean;
+  receiptDone: boolean;
+  notified: boolean;
+};
+
 async function postPlaybackReceipt(
   endpoint: string,
   event: NativePlaybackEventRequest,
@@ -68,6 +81,8 @@ export function TalkMode({
   selectionOpen = false,
   onSelectionOpened,
   onMemoryRecall,
+  onChatText,
+  onVoiceTurnReady,
 }: {
   disabled?: boolean;
   sessionId?: string | null;
@@ -75,6 +90,8 @@ export function TalkMode({
   selectionOpen?: boolean;
   onSelectionOpened?: (selection: M5TaskSelection) => void;
   onMemoryRecall?: (message: Extract<RealtimeServerMessage, { type: "memory_recall" }>) => void;
+  onChatText?: (message: VoiceChatText) => void;
+  onVoiceTurnReady?: (turn: { sessionId: string; turnId: string }) => void;
 }) {
   const [phase, setPhase] = useState<TalkPhase>("idle");
   const [speaking, setSpeaking] = useState(false);
@@ -91,12 +108,26 @@ export function TalkMode({
   const mountedRef = useRef(true);
   const sessionIdRef = useRef(sessionId);
   const onMemoryRecallRef = useRef(onMemoryRecall);
+  const onChatTextRef = useRef(onChatText);
+  const onVoiceTurnReadyRef = useRef(onVoiceTurnReady);
+  const responseCompletionsRef = useRef(new Map<string, VoiceResponseCompletion>());
   useLayoutEffect(() => {
     onMemoryRecallRef.current = onMemoryRecall;
-  }, [onMemoryRecall]);
+    onChatTextRef.current = onChatText;
+    onVoiceTurnReadyRef.current = onVoiceTurnReady;
+  }, [onMemoryRecall, onChatText, onVoiceTurnReady]);
   const selectionPauseRef = useRef<SelectionPause | null>(null);
   const statusCardRef = useRef<HTMLDivElement>(null);
   const avatar = projectVoiceAvatar(avatarState);
+
+  const notifyVoiceTurnReady = useCallback((responseId: string) => {
+    const completion = responseCompletionsRef.current.get(responseId);
+    if (!completion || !completion.generationDone || !completion.receiptDone || completion.notified) return;
+    if (!activeRef.current || clientRef.current?.activeSessionId !== completion.sessionId ||
+      clientRef.current?.activeMediaSessionId !== completion.mediaSessionId) return;
+    completion.notified = true;
+    onVoiceTurnReadyRef.current?.({ sessionId: completion.sessionId, turnId: completion.turnId });
+  }, []);
 
   const refreshSpeaking = useCallback(() => {
     if (mountedRef.current) {
@@ -343,6 +374,7 @@ export function TalkMode({
   const startTalk = useCallback(async () => {
     if (activeRef.current) return;
     invalidatedResponsesRef.current.clear();
+    responseCompletionsRef.current.clear();
     setError(null);
     setRetryAvailable(false);
     if (!window.isSecureContext) {
@@ -388,7 +420,17 @@ export function TalkMode({
             return;
           }
           if (message.type === "event") {
-            if (message.media_session_id !== clientRef.current?.activeMediaSessionId) return;
+            if (message.session_id !== clientRef.current?.activeSessionId ||
+              message.media_session_id !== clientRef.current?.activeMediaSessionId) return;
+            if (message.event.event_type === "voice_transcript_final") {
+              const { input_turn_id: inputTurnId, transcript } = message.event.payload;
+              if (typeof inputTurnId === "string" && typeof transcript === "string" && transcript.trim()) {
+                onChatTextRef.current?.({ sessionId: message.session_id, kind: "user", inputTurnId, text: transcript });
+              }
+            }
+            if (message.event.event_type === "voice_output_invalidated" && message.event.response_id) {
+              invalidateResponse(message.event.response_id);
+            }
             if (message.event.event_type === "voice_model_call_started") {
               const payload = message.event.payload;
               const responseId = payload.response_id;
@@ -418,7 +460,15 @@ export function TalkMode({
             return;
           }
           if (message.type === "audio_chunk") {
+            if (message.session_id !== clientRef.current?.activeSessionId ||
+              message.media_session_id !== clientRef.current?.activeMediaSessionId) return;
             if (invalidatedResponsesRef.current.has(message.response_id)) return;
+            if (message.turn_id && !responseCompletionsRef.current.has(message.response_id)) {
+              responseCompletionsRef.current.set(message.response_id, {
+                sessionId: message.session_id, mediaSessionId: message.media_session_id, turnId: message.turn_id,
+                generationDone: false, receiptDone: false, notified: false,
+              });
+            }
             activeBargeTargetRef.current = {
               response_id: message.response_id,
               playback_id: message.playback_id,
@@ -465,6 +515,13 @@ export function TalkMode({
                   receiptChain.current = receiptChain.current.then(async () => {
                     await postPlaybackReceipt(endpoint, event);
                     player.acknowledgeReceipt(event.producer_seq);
+                    if (event.action === "end" || event.action === "interrupt") {
+                      const completion = responseCompletionsRef.current.get(message.response_id);
+                      if (completion?.mediaSessionId === message.media_session_id) {
+                        completion.receiptDone = true;
+                        notifyVoiceTurnReady(message.response_id);
+                      }
+                    }
                   }).catch((receiptError: unknown) => {
                     if (mountedRef.current && !output?.failed) {
                       setError(receiptError instanceof Error ? receiptError.message : "Playback receipt could not be saved.");
@@ -494,7 +551,28 @@ export function TalkMode({
             return;
           }
           if (message.type === "generation") {
+            if (message.session_id !== clientRef.current?.activeSessionId ||
+              message.media_session_id !== clientRef.current?.activeMediaSessionId) return;
+            let completion = responseCompletionsRef.current.get(message.response_id);
+            if (!completion && message.turn_id) {
+              completion = {
+                sessionId: message.session_id, mediaSessionId: message.media_session_id, turnId: message.turn_id,
+                generationDone: false, receiptDone: false, notified: false,
+              };
+              responseCompletionsRef.current.set(message.response_id, completion);
+            }
+            if (message.kind === "done" || message.kind === "failed") {
+              if (completion) completion.generationDone = true;
+              notifyVoiceTurnReady(message.response_id);
+            }
             if (invalidatedResponsesRef.current.has(message.response_id)) return;
+            if (message.kind === "audio_transcript_delta" && message.turn_id && message.text) {
+              onChatTextRef.current?.({
+                sessionId: message.session_id, kind: "assistant", turnId: message.turn_id,
+                responseId: message.response_id, text: message.text,
+              });
+            }
+            if (message.kind === "failed") invalidateResponse(message.response_id);
             const output = outputsRef.current.get(message.response_id);
             if (!output) {
               if (activeBargeTargetRef.current?.response_id === message.response_id) {
@@ -548,7 +626,7 @@ export function TalkMode({
       setError(startError instanceof Error ? startError.message : "Talk could not start.");
       setRetryAvailable(true);
     }
-  }, [onSessionId, onSelectionOpened, pauseForSelection, stopOutputsForBargeIn, stopTalk, failOutput, invalidateResponse, refreshSpeaking]);
+  }, [onSessionId, onSelectionOpened, pauseForSelection, stopOutputsForBargeIn, stopTalk, failOutput, invalidateResponse, refreshSpeaking, notifyVoiceTurnReady]);
 
   const phaseLabel: Record<TalkPhase, string> = {
     idle: "Talk off",

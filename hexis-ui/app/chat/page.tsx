@@ -38,7 +38,7 @@ import { isImageAttachmentFile, normalizeUploadFile } from "./attachment-helpers
 import { AttachmentCard, type AttachmentKind } from "./attachment-card";
 import { MessagePresentationView, ToolMessageCard } from "./message-presentation";
 import { VoiceRecorder } from "./voice-recorder";
-import { TalkMode } from "./talk-mode";
+import { TalkMode, type VoiceChatText } from "./talk-mode";
 import { voiceMemoryRecallLog, type VoiceMemoryRecallMessage } from "@/lib/voice-memory-activity";
 import { TaskList } from "./task-list";
 
@@ -52,6 +52,7 @@ type ChatMessage = {
   ui?: ChatUiArtifact[];
   incomplete?: boolean;
   error?: string;
+  voice?: { inputTurnId?: string; turnId?: string; pending: boolean };
 };
 
 // What a message draws for the files that came with it. Images carry a data
@@ -1050,11 +1051,17 @@ function dbMessagesToChatMessages(value: unknown): ChatMessage[] | null {
       continue;
     }
     if ((role === "user" || role === "assistant") && typeof content === "string") {
+      const metadata = record.metadata as Record<string, unknown> | undefined;
       messages.push({
         id: typeof record.message_id === "string" ? record.message_id : crypto.randomUUID(),
         role,
         content,
         attachments: attachmentViewsFromMetadata(record.metadata),
+        voice: metadata?.channel === "voice" ? {
+          inputTurnId: typeof metadata.input_turn_id === "string" ? metadata.input_turn_id : undefined,
+          turnId: typeof metadata.agent_turn_id === "string" ? metadata.agent_turn_id : undefined,
+          pending: false,
+        } : undefined,
       });
     }
   }
@@ -1093,14 +1100,111 @@ export default function ChatPage() {
   const taskDrafts = useRef(new Map<string, string>());
   const taskNavigationRequest = useRef(0);
   const sessionIdRef = useRef<string | null>(null);
+  const voiceHistoryRequests = useRef(new Map<string, AbortController>());
   const activityCursors = useRef<Record<string, ToolActivityCursor>>({});
   const setActiveSessionId = (nextSessionId: string | null) => {
+    if (sessionIdRef.current !== nextSessionId) {
+      voiceHistoryRequests.current.forEach((controller) => controller.abort());
+      voiceHistoryRequests.current.clear();
+      setMessages((current) => current.filter((message) => !message.voice?.pending));
+    }
     sessionIdRef.current = nextSessionId;
     setSessionId(nextSessionId);
   };
   useEffect(() => {
     sessionIdRef.current = sessionId;
   }, [sessionId]);
+  useEffect(() => {
+    const requests = voiceHistoryRequests.current;
+    return () => {
+      requests.forEach((controller) => controller.abort());
+      requests.clear();
+    };
+  }, []);
+
+  const handleVoiceChatText = useCallback((update: VoiceChatText) => {
+    if (sessionIdRef.current !== update.sessionId) return;
+    setMessages((current) => {
+      if (sessionIdRef.current !== update.sessionId) return current;
+      const match = current.findIndex((message) => message.role === update.kind && message.voice && (
+        update.kind === "user" ? message.voice.inputTurnId === update.inputTurnId : message.voice.turnId === update.turnId
+      ));
+      if (match >= 0) {
+        if (!current[match].voice?.pending) return current;
+        return current.map((message, index) => index !== match ? message : {
+          ...message, content: update.kind === "user" ? update.text : message.content + update.text,
+        });
+      }
+      return [...current, {
+        id: `voice:${update.kind}:${update.kind === "user" ? update.inputTurnId : update.turnId}`,
+        role: update.kind, content: update.text,
+        voice: update.kind === "user"
+          ? { inputTurnId: update.inputTurnId, pending: true }
+          : { turnId: update.turnId, pending: true },
+      }];
+    });
+  }, []);
+
+  const handleVoiceTurnReady = useCallback(({ sessionId: requestedSessionId, turnId }: { sessionId: string; turnId: string }) => {
+    if (sessionIdRef.current !== requestedSessionId) return;
+    voiceHistoryRequests.current.get(turnId)?.abort();
+    const controller = new AbortController();
+    voiceHistoryRequests.current.set(turnId, controller);
+    void (async () => {
+      try {
+        for (const delay of [250, 750, 1500]) {
+          await new Promise<void>((resolve) => {
+            const finish = () => {
+              clearTimeout(timer);
+              controller.signal.removeEventListener("abort", finish);
+              resolve();
+            };
+            const timer = setTimeout(finish, delay);
+            controller.signal.addEventListener("abort", finish, { once: true });
+            if (controller.signal.aborted) finish();
+          });
+          if (controller.signal.aborted || sessionIdRef.current !== requestedSessionId) return;
+          try {
+            const response = await fetch(`/api/chat/session/${encodeURIComponent(requestedSessionId)}`, {
+              cache: "no-store", signal: controller.signal,
+            });
+            if (!response.ok) continue;
+            const payload = await response.json();
+            const restored = dbMessagesToChatMessages(payload?.messages);
+            if (!restored || controller.signal.aborted || sessionIdRef.current !== requestedSessionId) continue;
+            setMessages((current) => {
+              if (controller.signal.aborted || sessionIdRef.current !== requestedSessionId) return current;
+              const sameMessage = (local: ChatMessage, saved: ChatMessage) => local.id === saved.id || (
+                local.role === saved.role && local.voice && saved.voice && (
+                  local.role === "user" ? Boolean(local.voice.inputTurnId && local.voice.inputTurnId === saved.voice.inputTurnId)
+                    : Boolean(local.voice.turnId && local.voice.turnId === saved.voice.turnId)
+                )
+              );
+              // Only reconcile voice records: ordinary Chat has independent frontend IDs.
+              const savedVoice = restored.filter((message) => message.voice);
+              const merged = current.map((local) => savedVoice.find((saved) => sameMessage(local, saved)) ?? local);
+              for (let index = 0; index < savedVoice.length; index++) {
+                const saved = savedVoice[index];
+                if (merged.some((local) => sameMessage(local, saved))) continue;
+                const next = savedVoice.slice(index + 1).find((candidate) => merged.some((local) => sameMessage(local, candidate)));
+                const previous = savedVoice.slice(0, index).reverse().find((candidate) => merged.some((local) => sameMessage(local, candidate)));
+                const insertion = next ? merged.findIndex((local) => sameMessage(local, next))
+                  : previous ? merged.findIndex((local) => sameMessage(local, previous)) + 1 : merged.length;
+                merged.splice(insertion, 0, saved);
+              }
+              return merged;
+            });
+            if (restored.some((message) => message.role === "assistant" && message.voice?.turnId === turnId)) return;
+          } catch {
+            if (controller.signal.aborted) return;
+            // A failed refresh leaves the live preview intact for the next attempt.
+          }
+        }
+      } finally {
+        if (voiceHistoryRequests.current.get(turnId) === controller) voiceHistoryRequests.current.delete(turnId);
+      }
+    })();
+  }, []);
   const [inbox, setInbox] = useState<InboxData>({
     unread: 0,
     messages: [],
@@ -1154,7 +1258,7 @@ export default function ChatPage() {
         .filter((msg) =>
           (msg.role === "user" || msg.role === "assistant") &&
           msg.content.trim() &&
-          !msg.incomplete
+          !msg.incomplete && !msg.voice?.pending
         )
         .map((msg) => ({ role: msg.role, content: msg.content })),
     [messages]
@@ -1499,7 +1603,7 @@ export default function ChatPage() {
   // Save display cache on message change. This is not sent as authoritative
   // history once a DB chat session exists.
   useEffect(() => {
-    saveSession(messages);
+    saveSession(messages.filter((message) => !message.voice?.pending));
   }, [messages]);
 
   useEffect(() => {
@@ -3176,6 +3280,8 @@ export default function ChatPage() {
                 selectionOpen={Boolean(taskSelectionForOrigin)}
                 onSelectionOpened={setTaskSelection}
                 onMemoryRecall={handleVoiceMemoryRecall}
+                onChatText={handleVoiceChatText}
+                onVoiceTurnReady={handleVoiceTurnReady}
                 onSessionId={(nextSessionId) => {
                   saveSessionId(nextSessionId);
                   setActiveSessionId(nextSessionId);

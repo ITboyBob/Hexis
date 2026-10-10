@@ -4,6 +4,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { isImageAttachmentFile, uploadFileName } from "./attachment-helpers";
 import ChatPage from "./page";
 import { voiceMemoryRecallLog } from "@/lib/voice-memory-activity";
+import type { VoiceChatText } from "./talk-mode";
+
+const voiceChat = vi.hoisted(() => ({
+  onChatText: undefined as ((message: VoiceChatText) => void) | undefined,
+  onVoiceTurnReady: undefined as ((turn: { sessionId: string; turnId: string }) => void) | undefined,
+}));
+vi.mock("./talk-mode", () => ({
+  TalkMode: (props: typeof voiceChat) => {
+    voiceChat.onChatText = props.onChatText;
+    voiceChat.onVoiceTurnReady = props.onVoiceTurnReady;
+    return null;
+  },
+}));
 
 describe("chat attachment helpers", () => {
   it("detects pasted clipboard images by mime type", () => {
@@ -95,6 +108,7 @@ describe("ChatPage attachments", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     sessionStorage.clear();
   });
@@ -177,6 +191,156 @@ describe("ChatPage attachments", () => {
     expect(screen.queryByText("DO_NOT_RENDER_RAW_ARGUMENTS")).not.toBeInTheDocument();
     expect(screen.queryByText("DO_NOT_RENDER_RAW_DETAILS")).not.toBeInTheDocument();
     expect(screen.queryByText("Thinking...")).not.toBeInTheDocument();
+  });
+
+  it("语音文字即时更新，历史校正不重复且保留下一轮预览", async () => {
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    sessionStorage.setItem("hexis-chat-session-id", sessionId);
+    const persisted: Array<Record<string, unknown>> = [];
+    const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (input, options) =>
+      String(input) === `/api/chat/session/${sessionId}`
+        ? Response.json({ messages: persisted }) : originalFetch(input, options));
+    render(<ChatPage />);
+    await screen.findByPlaceholderText("Message Samantha");
+    await waitFor(() => expect(voiceChat.onChatText).toBeTypeOf("function"));
+    const user = { sessionId, kind: "user" as const, inputTurnId: "input-1", text: "用户原话" };
+    const assistant = { sessionId, kind: "assistant" as const, turnId: "turn-1", responseId: "response-1", text: "助手" };
+    act(() => {
+      voiceChat.onChatText?.(user);
+      voiceChat.onChatText?.(user);
+      voiceChat.onChatText?.(assistant);
+    });
+    expect(screen.getAllByText("用户原话")).toHaveLength(1);
+    expect(screen.getByText("助手")).toBeInTheDocument();
+    act(() => voiceChat.onChatText?.({ ...assistant, text: "回答" }));
+    expect(screen.getByText("助手回答")).toBeInTheDocument();
+    expect(sessionStorage.getItem("hexis-chat-display-messages") || "").not.toContain("用户原话");
+    persisted.push(
+      { message_id: "db-user", role: "user", content: "用户原话", metadata: { channel: "voice", input_turn_id: "input-1" } },
+      { message_id: "db-assistant", role: "assistant", content: "助手最终回答", metadata: { channel: "voice", agent_turn_id: "turn-1" } },
+    );
+    act(() => {
+      voiceChat.onVoiceTurnReady?.({ sessionId, turnId: "turn-1" });
+      voiceChat.onChatText?.({ ...user, inputTurnId: "input-2", text: "下一轮原话" });
+    });
+    await screen.findByText("助手最终回答");
+    expect(screen.queryByText("助手回答")).toBeNull();
+    expect(screen.getAllByText("用户原话")).toHaveLength(1);
+    expect(screen.getByText("下一轮原话")).toBeInTheDocument();
+    const cache = sessionStorage.getItem("hexis-chat-display-messages") || "";
+    expect(cache).toContain("助手最终回答");
+    expect(cache).not.toContain("下一轮原话");
+  });
+
+  it("会话切换清理语音预览并拒绝旧回调", async () => {
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    sessionStorage.setItem("hexis-chat-session-id", sessionId);
+    const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (input, options) => {
+      if (String(input) === "/api/chat/session") return Response.json({ session_id: "new-session" });
+      if (String(input).startsWith("/api/chat/session/")) return Response.json({ messages: [] });
+      return originalFetch(input, options);
+    });
+    render(<ChatPage />);
+    await screen.findByPlaceholderText("Message Samantha");
+    const oldCallback = voiceChat.onChatText;
+    act(() => oldCallback?.({ sessionId, kind: "user", inputTurnId: "input-1", text: "旧语音" }));
+    expect(screen.getByText("旧语音")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Start new conversation" }));
+    await waitFor(() => expect(sessionStorage.getItem("hexis-chat-session-id")).toBe("new-session"));
+    act(() => oldCallback?.({ sessionId, kind: "user", inputTurnId: "late", text: "迟到语音" }));
+    expect(screen.queryByText("旧语音")).toBeNull();
+    expect(screen.queryByText("迟到语音")).toBeNull();
+  });
+
+  it("后续轮次入库时，被打断的旧预览保持原有位置", async () => {
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    sessionStorage.setItem("hexis-chat-session-id", sessionId);
+    const persisted: Array<Record<string, unknown>> = [];
+    const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (input, options) =>
+      String(input) === `/api/chat/session/${sessionId}`
+        ? Response.json({ messages: persisted }) : originalFetch(input, options));
+    render(<ChatPage />);
+    await screen.findByPlaceholderText("Message Samantha");
+    act(() => {
+      voiceChat.onChatText?.({ sessionId, kind: "user", inputTurnId: "input-1", text: "第一轮用户" });
+      voiceChat.onChatText?.({ sessionId, kind: "assistant", turnId: "turn-1", responseId: "response-1", text: "未完整播放的预览" });
+      voiceChat.onChatText?.({ sessionId, kind: "user", inputTurnId: "input-2", text: "第二轮用户" });
+      voiceChat.onChatText?.({ sessionId, kind: "assistant", turnId: "turn-2", responseId: "response-2", text: "第二轮预览" });
+    });
+    persisted.push(
+      { message_id: "user-1", role: "user", content: "第一轮用户", metadata: { channel: "voice", input_turn_id: "input-1" } },
+      { message_id: "user-2", role: "user", content: "第二轮用户", metadata: { channel: "voice", input_turn_id: "input-2" } },
+      { message_id: "assistant-2", role: "assistant", content: "第二轮最终回答", metadata: { channel: "voice", agent_turn_id: "turn-2" } },
+    );
+    act(() => voiceChat.onVoiceTurnReady?.({ sessionId, turnId: "turn-2" }));
+    await screen.findByText("第二轮最终回答");
+    expect(screen.getByText("未完整播放的预览").compareDocumentPosition(screen.getByText("第二轮最终回答"))
+      & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("语音历史回读不重复已有的普通文字气泡", async () => {
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    sessionStorage.setItem("hexis-chat-session-id", sessionId);
+    sessionStorage.setItem("hexis-chat-display-messages", JSON.stringify([
+      { id: "frontend-user", role: "user", content: "普通文字问题" },
+      { id: "frontend-assistant", role: "assistant", content: "普通文字回答" },
+    ]));
+    let persisted: Array<Record<string, unknown>> | null = null;
+    const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (input, options) =>
+      String(input) === `/api/chat/session/${sessionId}`
+        ? Response.json({ messages: persisted }) : originalFetch(input, options));
+    render(<ChatPage />);
+    await screen.findByPlaceholderText("Message Samantha");
+    act(() => voiceChat.onChatText?.({ sessionId, kind: "assistant", turnId: "turn-1", responseId: "response-1", text: "语音预览" }));
+    persisted = [
+      { message_id: "db-user", role: "user", content: "普通文字问题" },
+      { message_id: "db-assistant", role: "assistant", content: "普通文字回答" },
+      { message_id: "db-voice", role: "assistant", content: "语音最终回答", metadata: { channel: "voice", agent_turn_id: "turn-1" } },
+    ];
+    act(() => voiceChat.onVoiceTurnReady?.({ sessionId, turnId: "turn-1" }));
+    await screen.findByText("语音最终回答");
+    expect(screen.getAllByText("普通文字问题")).toHaveLength(1);
+    expect(screen.getAllByText("普通文字回答")).toHaveLength(1);
+  });
+
+  it("历史暂不可用时保留预览并有限重试，稍后用入库文字校正", async () => {
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    sessionStorage.setItem("hexis-chat-session-id", sessionId);
+    const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+    let reads = 0;
+    let settling = false;
+    vi.mocked(fetch).mockImplementation(async (input, options) => {
+      if (String(input) !== `/api/chat/session/${sessionId}`) return originalFetch(input, options);
+      if (!settling) return Response.json({ messages: [] });
+      reads += 1;
+      if (reads === 1) return Response.json({}, { status: 503 });
+      return Response.json({ messages: reads === 2 ? [] : [{
+        message_id: "db-voice", role: "assistant", content: "校正文字",
+        metadata: { channel: "voice", agent_turn_id: "turn-1" },
+      }] });
+    });
+    render(<ChatPage />);
+    await screen.findByPlaceholderText("Message Samantha");
+    vi.useFakeTimers();
+    settling = true;
+    act(() => {
+      voiceChat.onChatText?.({ sessionId, kind: "assistant", turnId: "turn-1", responseId: "response-1", text: "流式预览" });
+      voiceChat.onVoiceTurnReady?.({ sessionId, turnId: "turn-1" });
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(screen.getByText("流式预览")).toBeInTheDocument();
+    await act(async () => vi.advanceTimersByTimeAsync(750));
+    expect(screen.getByText("流式预览")).toBeInTheDocument();
+    await act(async () => vi.advanceTimersByTimeAsync(1500));
+    expect(screen.getByText("校正文字")).toBeInTheDocument();
+    expect(screen.queryByText("流式预览")).toBeNull();
+    expect(reads).toBe(3);
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(reads).toBe(3);
   });
 
   it("does not send internal toolResult roles from display cache as provider chat history", async () => {
