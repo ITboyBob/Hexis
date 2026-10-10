@@ -267,6 +267,7 @@ services:
       HEXIS_CORS_ORIGINS: ${HEXIS_CORS_ORIGINS:-http://localhost:3477,http://localhost:3000}
       HEXIS_BROWSER_API_URL: ${HEXIS_BROWSER_API_URL:-http://127.0.0.1:43817}
       HEXIS_UI_ORIGIN: ${HEXIS_UI_ORIGIN:-http://localhost:3477}
+      HEXIS_REALTIME_CONFIG: ${HEXIS_REALTIME_CONFIG_CONTAINER:-/app/config/qwen-realtime.json}
       HEXIS_TTS_URL: ${HEXIS_TTS_URL:-http://host.docker.internal:42667}
       # 宿主进程使用的 HEXIS_M4_VOICE_CONFIG 可能是容器不可达的绝对路径。
       HEXIS_M4_VOICE_CONFIG: ${HEXIS_M4_VOICE_CONFIG_CONTAINER:-/app/config/m4-voice-runtime.json}
@@ -285,6 +286,12 @@ services:
       # writes back, so this is read-write; the store's .lock files serialize
       # host/container access. Also exposes user skills (~/.hexis/skills).
       - ~/.hexis:/root/.hexis
+      - type: bind
+        source: ${HEXIS_M4_INSTRUCTIONS_HOST:-/Users/itboybob/Project/geek_interview/docs/附录-语音对话层系统指令-M4测试版.md}
+        target: /Users/itboybob/Project/geek_interview/docs/附录-语音对话层系统指令-M4测试版.md
+        read_only: true
+        bind:
+          create_host_path: false
       # Talk 的输入门禁复用仓库配置，路径与上面的容器环境项一致。
       - ./config:/app/config:ro
     networks:

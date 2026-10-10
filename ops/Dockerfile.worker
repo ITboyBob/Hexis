@@ -37,6 +37,7 @@ COPY skills /app/skills
 COPY schemas /app/schemas
 COPY db /app/db
 COPY ops /app/ops
+COPY config/qwen-realtime.json /app/config/qwen-realtime.json
 COPY config/m4-voice-runtime.json /app/config/m4-voice-runtime.json
 COPY characters /app/characters
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -44,7 +45,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Build stamp (#93): content-derived, so clean builds of the same source agree
 # while any code or locked-dependency change journals a new running build.
-RUN find README.md pyproject.toml uv.lock apps core services channels plugins skills schemas db ops config/m4-voice-runtime.json characters \
+RUN find README.md pyproject.toml uv.lock apps core services channels plugins skills schemas db ops config/qwen-realtime.json config/m4-voice-runtime.json characters \
         -type f -print0 \
     | sort -z \
     | xargs -0 sha256sum \
