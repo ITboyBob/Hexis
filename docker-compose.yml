@@ -265,6 +265,8 @@ services:
       EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
       HEXIS_CORS_ORIGINS: ${HEXIS_CORS_ORIGINS:-http://localhost:3477,http://localhost:3000}
+      HEXIS_BROWSER_API_URL: ${HEXIS_BROWSER_API_URL:-http://127.0.0.1:43817}
+      HEXIS_UI_ORIGIN: ${HEXIS_UI_ORIGIN:-http://localhost:3477}
       HEXIS_TTS_URL: ${HEXIS_TTS_URL:-http://host.docker.internal:42667}
       # 宿主进程使用的 HEXIS_M4_VOICE_CONFIG 可能是容器不可达的绝对路径。
       HEXIS_M4_VOICE_CONFIG: ${HEXIS_M4_VOICE_CONFIG_CONTAINER:-/app/config/m4-voice-runtime.json}
@@ -363,6 +365,8 @@ services:
       HEXIS_DATABASE_URL: postgresql://${POSTGRES_USER:-hexis_user}:${POSTGRES_PASSWORD:-hexis_password}@db:5432/${POSTGRES_DB:-hexis_memory}
       DATABASE_URL: postgresql://${POSTGRES_USER:-hexis_user}:${POSTGRES_PASSWORD:-hexis_password}@db:5432/${POSTGRES_DB:-hexis_memory}
       HEXIS_API_URL: http://api:43817
+      HEXIS_BROWSER_API_URL: ${HEXIS_BROWSER_API_URL:-http://127.0.0.1:43817}
+      HEXIS_UI_ORIGIN: ${HEXIS_UI_ORIGIN:-http://localhost:3477}
       # Next.js standalone binds `process.env.HOSTNAME || '0.0.0.0'`. Docker
       # injects HOSTNAME=<container-id>, which resolves to ONE of this
       # container's two network IPs; the published-port forward arrives on
