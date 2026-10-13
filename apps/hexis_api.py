@@ -522,6 +522,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await auth_flow_coordinator.close()
+        await _rtc_runtime.shutdown()
         await _close_registered_voice_sessions()
         if _m5_lightweight_executor is not None:
             try:
@@ -3474,7 +3475,7 @@ async def register_m6_acceptance_chat_session():
     return {"session_id": str(selected_id), "api_start_id": _voice_barge_in_start_record["start_id"], "session_execution_policy": policy}
 
 
-@app.post("/api/voice/realtime/sessions")
+# 保留历史 WS 探针的直接调用接口，生产 HTTP 路由由下方 RTC router 提供。
 async def create_voice_realtime_session(req: VoiceRealtimeSessionRequest):
     """Create one server-owned cloud realtime session for a chat."""
 
@@ -6488,6 +6489,42 @@ async def init_consent_request(req: InitConsentRequest):
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
+
+
+def _load_rtc_config():
+    from services.voice_rtc import RtcConfig
+
+    if _voice_barge_in_environment is not None:
+        raise ValueError("The selected legacy WS acceptance policy cannot be reused for RTC; select the RTC runtime profile.")
+    selected = Path(os.environ.get("HEXIS_REALTIME_CONFIG") or Path(__file__).resolve().parents[1] / "config/qwen-realtime.json")
+    return RtcConfig.from_mapping(json.loads(selected.read_text(encoding="utf-8")))
+
+
+def _rtc_control_url(media_id: str) -> str:
+    old = urllib.parse.urlsplit(_browser_realtime_websocket_url(media_id))
+    return urllib.parse.urlunsplit((old.scheme, old.netloc, f"/api/voice/realtime/sessions/{media_id}/control", "", ""))
+
+
+def _rtc_tools(surface: str) -> list[dict[str, Any]]:
+    from services.voice_recall import VOICE_RECALL_TOOL
+    from services.m5_tool_contracts import realtime_tool_definitions
+
+    tools = [VOICE_RECALL_TOOL]
+    if surface == "m5":
+        tools.extend({"type": "function", "function": {k: v for k, v in item.items() if k != "type"}}
+                     for item in realtime_tool_definitions())
+    return tools
+
+
+from services.voice_rtc_api import RtcRuntime
+from services.voice_rtc_tools import make_rtc_tool_executor
+
+_rtc_runtime = RtcRuntime(
+    pool_provider=lambda: _pool, config_loader=_load_rtc_config, control_url=_rtc_control_url,
+    tools_provider=_rtc_tools,
+    tool_executor=make_rtc_tool_executor(lambda: _pool, lambda: _m5_task_worker, lambda: _m5_lightweight_executor),
+)
+app.include_router(_rtc_runtime.router)
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -193,7 +193,7 @@ describe("ChatPage attachments", () => {
     expect(screen.queryByText("Thinking...")).not.toBeInTheDocument();
   });
 
-  it("语音文字即时更新，历史校正不重复且保留下一轮预览", async () => {
+  it("不显示新用户转录，助手文字校正不重复且保留下一轮预览", async () => {
     const sessionId = "11111111-1111-4111-8111-111111111111";
     sessionStorage.setItem("hexis-chat-session-id", sessionId);
     const persisted: Array<Record<string, unknown>> = [];
@@ -211,7 +211,7 @@ describe("ChatPage attachments", () => {
       voiceChat.onChatText?.(user);
       voiceChat.onChatText?.(assistant);
     });
-    expect(screen.getAllByText("用户原话")).toHaveLength(1);
+    expect(screen.queryByText("用户原话")).toBeNull();
     expect(screen.getByText("助手")).toBeInTheDocument();
     act(() => voiceChat.onChatText?.({ ...assistant, text: "回答" }));
     expect(screen.getByText("助手回答")).toBeInTheDocument();
@@ -222,15 +222,15 @@ describe("ChatPage attachments", () => {
     );
     act(() => {
       voiceChat.onVoiceTurnReady?.({ sessionId, turnId: "turn-1" });
-      voiceChat.onChatText?.({ ...user, inputTurnId: "input-2", text: "下一轮原话" });
+      voiceChat.onChatText?.({ ...assistant, turnId: "turn-2", responseId: "response-2", text: "下一轮生成回复" });
     });
     await screen.findByText("助手最终回答");
     expect(screen.queryByText("助手回答")).toBeNull();
     expect(screen.getAllByText("用户原话")).toHaveLength(1);
-    expect(screen.getByText("下一轮原话")).toBeInTheDocument();
+    expect(screen.getByText("下一轮生成回复")).toBeInTheDocument();
     const cache = sessionStorage.getItem("hexis-chat-display-messages") || "";
     expect(cache).toContain("助手最终回答");
-    expect(cache).not.toContain("下一轮原话");
+    expect(cache).not.toContain("下一轮生成回复");
   });
 
   it("会话切换清理语音预览并拒绝旧回调", async () => {
@@ -245,7 +245,7 @@ describe("ChatPage attachments", () => {
     render(<ChatPage />);
     await screen.findByPlaceholderText("Message Samantha");
     const oldCallback = voiceChat.onChatText;
-    act(() => oldCallback?.({ sessionId, kind: "user", inputTurnId: "input-1", text: "旧语音" }));
+    act(() => oldCallback?.({ sessionId, kind: "assistant", turnId: "turn-1", responseId: "response-1", text: "旧语音" }));
     expect(screen.getByText("旧语音")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Start new conversation" }));
     await waitFor(() => expect(sessionStorage.getItem("hexis-chat-session-id")).toBe("new-session"));

@@ -53,7 +53,7 @@ type ChatMessage = {
   ui?: ChatUiArtifact[];
   incomplete?: boolean;
   error?: string;
-  voice?: { inputTurnId?: string; turnId?: string; pending: boolean };
+  voice?: { inputTurnId?: string; turnId?: string; responseId?: string; pending: boolean };
   m5Report?: { reportId?: string };
 };
 
@@ -1066,6 +1066,7 @@ function dbMessagesToChatMessages(value: unknown): ChatMessage[] | null {
         voice: metadata?.channel === "voice" ? {
           inputTurnId: typeof metadata.input_turn_id === "string" ? metadata.input_turn_id : undefined,
           turnId: typeof metadata.agent_turn_id === "string" ? metadata.agent_turn_id : undefined,
+          responseId: typeof metadata.response_id === "string" ? metadata.response_id : undefined,
           pending: false,
         } : undefined,
       });
@@ -1079,7 +1080,9 @@ function samePersistedMessage(local: ChatMessage, saved: ChatMessage): boolean {
     local.role === saved.role && local.voice && saved.voice && (
       local.role === "user"
         ? local.voice.inputTurnId && local.voice.inputTurnId === saved.voice.inputTurnId
-        : local.voice.turnId && local.voice.turnId === saved.voice.turnId
+        : local.voice.responseId && saved.voice.responseId
+          ? local.voice.responseId === saved.voice.responseId
+          : local.voice.turnId && local.voice.turnId === saved.voice.turnId
     )
   );
 }
@@ -1230,24 +1233,23 @@ export default function ChatPage() {
   }, []);
 
   const handleVoiceChatText = useCallback((update: VoiceChatText) => {
+    if (update.kind !== "assistant") return;
     if (sessionIdRef.current !== update.sessionId) return;
     setMessages((current) => {
       if (sessionIdRef.current !== update.sessionId) return current;
-      const match = current.findIndex((message) => message.role === update.kind && message.voice && (
-        update.kind === "user" ? message.voice.inputTurnId === update.inputTurnId : message.voice.turnId === update.turnId
+      const match = current.findIndex((message) => message.role === "assistant" && message.voice && (
+        message.voice.responseId ? message.voice.responseId === update.responseId : message.voice.turnId === update.turnId
       ));
       if (match >= 0) {
         if (!current[match].voice?.pending) return current;
         return current.map((message, index) => index !== match ? message : {
-          ...message, content: update.kind === "user" ? update.text : message.content + update.text,
+          ...message, content: update.final ? update.text : message.content + update.text,
         });
       }
       return [...current, {
-        id: `voice:${update.kind}:${update.kind === "user" ? update.inputTurnId : update.turnId}`,
+        id: `voice:assistant:${update.responseId}`,
         role: update.kind, content: update.text,
-        voice: update.kind === "user"
-          ? { inputTurnId: update.inputTurnId, pending: true }
-          : { turnId: update.turnId, pending: true },
+        voice: { turnId: update.turnId, responseId: update.responseId, pending: true },
       }];
     });
   }, []);

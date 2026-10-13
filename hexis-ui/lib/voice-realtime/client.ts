@@ -1,493 +1,318 @@
 "use client";
 
-import type {
-  BargeInCapability,
-  RealtimeClientMessage,
-  RealtimeServerMessage,
-} from "./contracts";
-import { parseRealtimeServerMessage, parseRealtimeSessionResponse } from "./contracts";
-import config from "./speech-detection-config.json";
+import { parseRtcDescriptor, parseRtcMessage, type RtcDescriptor, type RtcServerMessage } from "./rtc-contracts";
 
-export type VoiceRealtimeState =
-  | "idle"
-  | "connecting"
-  | "ready"
-  | "closed"
-  | "failed";
-
+export type VoiceRealtimeState = "idle" | "connecting" | "ready" | "closed" | "failed";
 type Options = {
-  onMessage?: (message: RealtimeServerMessage) => void;
+  onMessage?: (message: RtcServerMessage) => void;
   onStateChange?: (state: VoiceRealtimeState) => void;
+  onError?: (error: Error) => void;
   toolSurface?: "m4" | "m5";
 };
 
-function sameBargeInCapability(left: BargeInCapability, right: BargeInCapability): boolean {
-  return left.supported === right.supported
-    && left.configuration_id === right.configuration_id
-    && left.maximum_receipt_prefix_items === right.maximum_receipt_prefix_items;
+function deferred() {
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+  void promise.catch(() => undefined);
+  return { promise, resolve, reject };
 }
 
 export class VoiceRealtimeClient {
-  private generation = 0;
-  private stream: MediaStream | null = null;
-  private socket: WebSocket | null = null;
   private currentState: VoiceRealtimeState = "idle";
-  private pendingClose: Promise<void> = Promise.resolve();
-  private sessionId: string | null = null;
-  private mediaSessionId: string | null = null;
-  private expectedBargeInCapability: BargeInCapability | null = null;
-  private playbackEndpoint: string | null = null;
+  private generation = 0;
+  private descriptor: RtcDescriptor | null = null;
+  private stream: MediaStream | null = null;
+  private peer: RTCPeerConnection | null = null;
+  private senders: Array<{ sender: RTCRtpSender; track: MediaStreamTrack }> = [];
+  private channels = new Set<RTCDataChannel>();
+  private socket: WebSocket | null = null;
+  private audio: HTMLAudioElement | null = null;
+  private abort: AbortController | null = null;
+  private startup: ReturnType<typeof deferred> | null = null;
+  private controlReady: ReturnType<typeof deferred> | null = null;
   private producerSequence = 0;
-  private lastServerProducerSequence = 0;
-  private pendingCaptureControls = new Map<
-    string,
-    {
-      type: "capture_suspend" | "capture_resume";
-      captureInstanceId: string;
-      resolve: () => void;
-      reject: (error: Error) => void;
-      timer: ReturnType<typeof setTimeout>;
-    }
-  >();
+  private serverSequence = 0;
+  private cloudSessionId: string | null = null;
+  private configSent = false;
+  private restoring = false;
+  private heartbeat: ReturnType<typeof setInterval> | null = null;
+  private providerQueue: Promise<void> = Promise.resolve();
+  private commandIds = new Set<string>();
+  private captureEnabled = true;
 
   constructor(private readonly options: Options = {}) {}
-
-  get state(): VoiceRealtimeState {
-    return this.currentState;
-  }
-
-  async open(
-    sessionId: string | null,
-    onSessionId?: (sessionId: string) => void,
-  ): Promise<void> {
-    await this.pendingClose;
-    if (this.currentState === "connecting" || this.currentState === "ready") return;
-    const generation = ++this.generation;
-    this.expectedBargeInCapability = null;
-    this.lastServerProducerSequence = 0;
-    this.setState("connecting");
-
-    try {
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      if (generation !== this.generation) {
-        this.stopStream();
-        return;
-      }
-      let effectiveSessionId = sessionId;
-      if (!effectiveSessionId) {
-        const created = await fetch("/api/chat/session", { method: "POST" });
-        const payload = (await created.json().catch(() => ({}))) as {
-          session_id?: string;
-          error?: string;
-        };
-        if (!created.ok || !payload.session_id) {
-          throw new Error(payload.error || "Could not create a chat session for Talk.");
-        }
-        effectiveSessionId = payload.session_id;
-        onSessionId?.(effectiveSessionId);
-      }
-      if (generation !== this.generation) {
-        this.stopStream();
-        return;
-      }
-
-      const response = await fetch("/api/voice/realtime/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id: effectiveSessionId,
-          tool_surface: this.options.toolSurface ?? "m4",
-        }),
-      });
-      const responsePayload: unknown = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        const errorPayload = responsePayload && typeof responsePayload === "object"
-          ? responsePayload as { error?: unknown; detail?: unknown }
-          : {};
-        throw new Error(
-          (typeof errorPayload.error === "string" && errorPayload.error) ||
-            (typeof errorPayload.detail === "string" && errorPayload.detail) ||
-            "Could not start the realtime voice service.",
-        );
-      }
-      const payload = parseRealtimeSessionResponse(responsePayload);
-      if (payload.session_id !== effectiveSessionId) {
-        throw new Error("The realtime service returned a different chat session.");
-      }
-      if (generation !== this.generation) {
-        this.stopStream();
-        return;
-      }
-      this.sessionId = payload.session_id;
-      this.mediaSessionId = payload.media_session_id;
-      this.expectedBargeInCapability = payload.barge_in_capability;
-      this.playbackEndpoint = "/api/voice/playback";
-      this.producerSequence = 0;
-      this.lastServerProducerSequence = 0;
-
-      const socket = new WebSocket(payload.websocket_url);
-      this.socket = socket;
-      await new Promise<void>((resolve, reject) => {
-        let socketOpened = false;
-        let readyMessage: Extract<RealtimeServerMessage, { type: "ready" }> | null = null;
-        let settled = false;
-        const timeoutId = setTimeout(() => {
-          rejectHandshake(new Error(
-            `The voice service did not become ready within ${config.readiness.server_ready_timeout_ms}ms. Check the local API service, then retry Talk.`,
-          ));
-        }, config.readiness.server_ready_timeout_ms);
-
-        const resolveHandshake = () => {
-          if (settled || !socketOpened || !readyMessage) return;
-          settled = true;
-          clearTimeout(timeoutId);
-          resolve();
-        };
-        const rejectHandshake = (error: Error) => {
-          if (settled) {
-            if (generation === this.generation) this.fail(error.message);
-            return;
-          }
-          settled = true;
-          clearTimeout(timeoutId);
-          reject(error);
-        };
-        const handlePostReadyMessage = (message: RealtimeServerMessage) => {
-          if (message.producer_seq <= this.lastServerProducerSequence) {
-            throw new Error("The voice service message sequence did not increase.");
-          }
-          this.lastServerProducerSequence = message.producer_seq;
-          if (message.type === "capture_suspended" || message.type === "capture_resumed") {
-            const pending = this.pendingCaptureControls.get(message.control_id);
-            if (pending) {
-              clearTimeout(pending.timer);
-              this.pendingCaptureControls.delete(message.control_id);
-              const expectedType = pending.type === "capture_suspend"
-                ? "capture_suspended"
-                : "capture_resumed";
-              if (
-                message.type !== expectedType ||
-                message.session_id !== this.sessionId ||
-                message.media_session_id !== this.mediaSessionId ||
-                message.capture_instance_id !== pending.captureInstanceId
-              ) {
-                pending.reject(new Error("The voice service acknowledged a different capture identity."));
-              } else pending.resolve();
-            }
-            return;
-          }
-          this.options.onMessage?.(message);
-        };
-
-        socket.onopen = () => {
-          socketOpened = true;
-          resolveHandshake();
-        };
-        socket.onerror = () => rejectHandshake(new Error("The realtime voice connection failed."));
-        socket.onclose = () => {
-          if (!settled) {
-            rejectHandshake(new Error("The realtime voice connection closed before ready."));
-          } else if (generation === this.generation && this.currentState === "ready") {
-            this.fail("The voice connection closed unexpectedly.");
-          }
-        };
-        socket.onmessage = (event) => {
-          if (generation !== this.generation) return;
-          try {
-            const message = parseRealtimeServerMessage(JSON.parse(String(event.data)));
-            if (message.type === "ready") {
-              const expectedCapability = this.expectedBargeInCapability;
-              if (
-                message.session_id !== this.sessionId
-                || message.media_session_id !== this.mediaSessionId
-                || !expectedCapability
-                || !sameBargeInCapability(message.barge_in_capability, expectedCapability)
-              ) {
-                throw new Error("The realtime service ready identity or capability does not match its session description.");
-              }
-              if (!message.barge_in_capability.supported) {
-                throw new Error("The selected realtime service does not support confirmed voice barge-in.");
-              }
-              if (readyMessage) {
-                if (
-                  message.session_id !== readyMessage.session_id
-                  || message.media_session_id !== readyMessage.media_session_id
-                  || message.producer_seq !== readyMessage.producer_seq
-                  || message.cloud_session_id !== readyMessage.cloud_session_id
-                  || message.instructions_hash !== readyMessage.instructions_hash
-                  || !sameBargeInCapability(message.barge_in_capability, readyMessage.barge_in_capability)
-                ) {
-                  throw new Error("The realtime service repeated a different ready message.");
-                }
-                return;
-              }
-              readyMessage = message;
-              this.lastServerProducerSequence = message.producer_seq;
-              resolveHandshake();
-              return;
-            }
-            if (!readyMessage) throw new Error("The voice service sent data before its ready message.");
-            handlePostReadyMessage(message);
-          } catch (error) {
-            rejectHandshake(error instanceof Error ? error : new Error("The voice service sent an invalid message."));
-          }
-        };
-      });
-      if (generation !== this.generation) {
-        this.stopStream();
-        return;
-      }
-      this.setState("ready");
-    } catch (error) {
-      if (generation !== this.generation) {
-        this.stopStream();
-        return;
-      }
-      this.stopStream();
-      this.socket?.close();
-      this.socket = null;
-      this.expectedBargeInCapability = null;
-      this.setState("failed");
-      throw error instanceof Error ? error : new Error("Talk could not start.");
-    }
-  }
-
-  close(): Promise<void> {
-    this.generation += 1;
-    this.rejectPendingCaptureControls(new Error("Talk closed before capture control completed."));
-    const socket = this.socket;
-    this.socket = null;
-    this.stopStream();
-    this.expectedBargeInCapability = null;
-    this.playbackEndpoint = null;
-    this.setState("closed");
-    if (socket && socket.readyState <= WebSocket.OPEN) {
-      this.pendingClose = new Promise((resolve) => {
-        socket.addEventListener("close", () => resolve(), { once: true });
-        if (this.sessionId && this.mediaSessionId && socket.readyState === WebSocket.OPEN) {
-          socket.send(
-            JSON.stringify({
-              schema_version: 1,
-              type: "control",
-              session_id: this.sessionId,
-              media_session_id: this.mediaSessionId,
-              producer_seq: this.producerSequence++,
-              action: "close",
-              reason: "manual",
-            }),
-          );
-        } else {
-          socket.close();
-        }
-      });
-    } else {
-      this.pendingClose = Promise.resolve();
-    }
-    return this.pendingClose;
-  }
-
-  send(message: RealtimeClientMessage): void {
-    if (this.currentState !== "ready" || this.socket?.readyState !== WebSocket.OPEN) {
-      throw new Error("Talk is not connected.");
-    }
-    if (this.socket.bufferedAmount > 2_000_000) {
-      throw new Error("Talk audio queue is full. Stop Talk and retry when the connection is stable.");
-    }
-    this.socket.send(
-      JSON.stringify({
-        ...message,
-        session_id: this.sessionId,
-        media_session_id: this.mediaSessionId,
-        producer_seq: this.producerSequence++,
-      }),
-    );
-  }
-
-  sendControl(action: "barge_in", reason: string): void {
-    if (!reason.trim() || reason.length > 200) {
-      throw new Error("Talk control reason must contain 1 to 200 characters.");
-    }
-    this.send({
-      schema_version: 1,
-      type: "control",
-      session_id: "",
-      media_session_id: "",
-      producer_seq: 0,
-      action,
-      reason,
-    });
-  }
-
-  suspendCapture(captureInstanceId: string): Promise<void> {
-    return this.sendCaptureControl("capture_suspend", captureInstanceId);
-  }
-
-  resumeCapture(captureInstanceId: string): Promise<void> {
-    return this.sendCaptureControl("capture_resume", captureInstanceId);
-  }
-
-  private sendCaptureControl(
-    type: "capture_suspend" | "capture_resume",
-    captureInstanceId: string
-  ): Promise<void> {
-    const controlId = crypto.randomUUID();
-    return new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingCaptureControls.delete(controlId);
-        reject(new Error(`The voice service did not acknowledge ${type}.`));
-      }, 5_000);
-      this.pendingCaptureControls.set(controlId, {
-        type,
-        captureInstanceId,
-        resolve,
-        reject,
-        timer,
-      });
-      try {
-        this.send({
-          schema_version: 1,
-          type,
-          session_id: "",
-          media_session_id: "",
-          producer_seq: 0,
-          capture_instance_id: captureInstanceId,
-          control_id: controlId,
-        });
-      } catch (error: unknown) {
-        clearTimeout(timer);
-        this.pendingCaptureControls.delete(controlId);
-        reject(error instanceof Error ? error : new Error("Talk capture control failed."));
-      }
-    });
-  }
-
-  private rejectPendingCaptureControls(error: Error): void {
-    for (const [controlId, pending] of this.pendingCaptureControls) {
-      clearTimeout(pending.timer);
-      this.pendingCaptureControls.delete(controlId);
-      pending.reject(error);
-    }
-  }
-
-  get mediaStream(): MediaStream | null {
-    return this.stream;
-  }
-
-  get activeSessionId(): string | null {
-    return this.sessionId;
-  }
-
-  get activeMediaSessionId(): string | null {
-    return this.mediaSessionId;
-  }
-
-  get activePlaybackEndpoint(): string | null {
-    return this.playbackEndpoint;
-  }
-
-  get activeBargeInCapability(): BargeInCapability | null {
-    return this.currentState === "ready" ? this.expectedBargeInCapability : null;
-  }
-
-  openCapture(captureInstanceId: string): void {
-    this.send({
-      schema_version: 1,
-      type: "capture_open",
-      session_id: "",
-      media_session_id: "",
-      producer_seq: 0,
-      capture_instance_id: captureInstanceId,
-      sample_rate: 16_000,
-      channels: 1,
-      sample_format: "s16le",
-    });
-  }
-
-  sendAudioChunk(
-    captureInstanceId: string,
-    range: {
-      startFrame: number;
-      endFrame: number;
-      startMonotonicMs: number;
-      endMonotonicMs: number;
-      pcmBase64: string;
-    },
-  ): void {
-    this.send({
-      schema_version: 1,
-      type: "audio_chunk",
-      session_id: "",
-      media_session_id: "",
-      producer_seq: 0,
-      capture_instance_id: captureInstanceId,
-      start_frame: range.startFrame,
-      end_frame: range.endFrame,
-      start_monotonic_ms: range.startMonotonicMs,
-      end_monotonic_ms: range.endMonotonicMs,
-      pcm_base64: range.pcmBase64,
-    });
-  }
-
-  endUtterance(
-    captureInstanceId: string,
-    range: {
-      startFrame: number;
-      endFrame: number;
-      startMonotonicMs: number;
-      endMonotonicMs: number;
-      audioSha256: string;
-    },
-  ): void {
-    this.send({
-      schema_version: 1,
-      type: "utterance_end",
-      session_id: "",
-      media_session_id: "",
-      producer_seq: 0,
-      capture_instance_id: captureInstanceId,
-      start_frame: range.startFrame,
-      end_frame: range.endFrame,
-      start_monotonic_ms: range.startMonotonicMs,
-      end_monotonic_ms: range.endMonotonicMs,
-      audio_sha256: range.audioSha256,
-    });
-  }
-
-  private stopStream() {
-    this.stream?.getTracks().forEach((track) => track.stop());
-    this.stream = null;
-  }
-
-  private fail(message: string) {
-    this.generation += 1;
-    this.rejectPendingCaptureControls(new Error(message));
-    this.socket?.close();
-    this.socket = null;
-    this.stopStream();
-    this.expectedBargeInCapability = null;
-    this.setState("failed");
-    this.options.onMessage?.({
-      schema_version: 1,
-      type: "error",
-      session_id: this.sessionId ?? "",
-      media_session_id: this.mediaSessionId ?? "",
-      producer_seq: 0,
-      stage: "client",
-      code: "connection_failed",
-      message,
-      recoverable: true,
-    });
-  }
+  get state() { return this.currentState; }
+  get activeSessionId() { return this.descriptor?.session_id ?? null; }
+  get activeMediaSessionId() { return this.descriptor?.media_session_id ?? null; }
 
   private setState(state: VoiceRealtimeState) {
     this.currentState = state;
     this.options.onStateChange?.(state);
+  }
+
+  async open(sessionId: string | null, onSessionId?: (id: string) => void): Promise<void> {
+    if (this.state === "connecting" || this.state === "ready") return;
+    const generation = ++this.generation;
+    this.abort = new AbortController();
+    const abort = this.abort;
+    this.startup = deferred();
+    const startup = this.startup;
+    this.controlReady = deferred();
+    this.cloudSessionId = null;
+    this.configSent = false;
+    this.restoring = false;
+    this.producerSequence = 0;
+    this.serverSequence = 0;
+    this.captureEnabled = true;
+    this.commandIds.clear();
+    this.providerQueue = Promise.resolve();
+    this.setState("connecting");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia || typeof RTCPeerConnection === "undefined") {
+        throw new Error("Talk requires microphone access and WebRTC in a secure browser context.");
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+        channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true,
+      } });
+      if (generation !== this.generation) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      this.stream = stream;
+      if (!sessionId) {
+        const created = await fetch("/api/chat/session", { method: "POST", signal: abort.signal });
+        const body = await created.json();
+        if (generation !== this.generation) return;
+        if (!created.ok || typeof body.session_id !== "string") throw new Error(body.error || "Could not create a chat session for Talk.");
+        sessionId = body.session_id;
+        onSessionId?.(sessionId!);
+      }
+      const response = await fetch("/api/voice/realtime/sessions", {
+        method: "POST", headers: { "Content-Type": "application/json" }, signal: abort.signal,
+        body: JSON.stringify({ session_id: sessionId, tool_surface: this.options.toolSurface ?? "m4" }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error || body.detail || "Could not prepare the RTC voice session.");
+      const descriptor = parseRtcDescriptor(body);
+      if (generation !== this.generation) {
+        await fetch(descriptor.close_url, { method: "DELETE", signal: AbortSignal.timeout(descriptor.timeout_ms) });
+        return;
+      }
+      if (descriptor.session_id !== sessionId) throw new Error("RTC descriptor belongs to another chat session.");
+      this.descriptor = descriptor;
+      timer = setTimeout(() => this.fail(new Error("RTC startup timed out. Check the selected provider and retry Talk.")), descriptor.timeout_ms);
+      this.socket = new WebSocket(descriptor.control_url);
+      this.socket.onmessage = (event) => {
+        if (generation !== this.generation) return;
+        try { void this.handleControl(parseRtcMessage(JSON.parse(String(event.data)))).catch((error) => this.fail(error)); }
+        catch (error) { this.fail(error); }
+      };
+      this.socket.onerror = () => this.fail(new Error("RTC control connection failed. Check the local API address and retry Talk."));
+      this.socket.onclose = () => {
+        if (generation === this.generation && this.state !== "closed" && this.state !== "failed") this.fail(new Error("RTC control disconnected. Reopen Talk to continue."));
+      };
+      await this.controlReady.promise;
+      if (generation !== this.generation) return;
+      const peer = new RTCPeerConnection({ iceServers: [] });
+      this.peer = peer;
+      peer.onconnectionstatechange = () => {
+        if (generation === this.generation && ["failed", "disconnected", "closed"].includes(peer.connectionState)) {
+          this.fail(new Error(`WebRTC connection ${peer.connectionState}. Reopen Talk to continue.`));
+        }
+      };
+      peer.ontrack = (event) => {
+        if (generation !== this.generation || event.track.kind !== "audio") return;
+        if (!this.audio) {
+          this.audio = document.createElement("audio");
+          this.audio.autoplay = true;
+          this.audio.setAttribute("playsinline", "");
+          this.audio.hidden = true;
+          document.body.appendChild(this.audio);
+        }
+        this.audio.srcObject = event.streams[0] ?? new MediaStream([event.track]);
+        void this.audio.play().catch(() => {
+          if (generation === this.generation) this.fail(new Error("Browser audio playback was blocked. Allow audio and restart Talk."));
+        });
+      };
+      peer.ondatachannel = (event) => this.installChannel(event.channel, generation);
+      this.installChannel(peer.createDataChannel("oai-events", { ordered: true }), generation);
+      for (const track of stream.getAudioTracks()) {
+        const sender = peer.addTrack(track, stream);
+        this.senders.push({ sender, track });
+        await sender.replaceTrack(null);
+        if (generation !== this.generation) return;
+      }
+      const description = await peer.createOffer();
+      if (generation !== this.generation) return;
+      await peer.setLocalDescription(description);
+      if (generation !== this.generation) return;
+      if (peer.iceGatheringState !== "complete") {
+        await new Promise<void>((resolve, reject) => {
+          const check = () => {
+            if (peer.iceGatheringState === "complete") { cleanup(); resolve(); }
+          };
+          const cancel = () => { cleanup(); reject(new Error("RTC startup was closed.")); };
+          const cleanup = () => { peer.removeEventListener("icegatheringstatechange", check); abort.signal.removeEventListener("abort", cancel); };
+          peer.addEventListener("icegatheringstatechange", check);
+          abort.signal.addEventListener("abort", cancel, { once: true });
+          if (abort.signal.aborted) cancel(); else check();
+        });
+      }
+      if (generation !== this.generation) return;
+      const offer = peer.localDescription?.sdp;
+      if (!offer) throw new Error("Browser returned no SDP offer.");
+      const answer = await fetch(descriptor.offer_url, { method: "POST", signal: abort.signal,
+        headers: { "Content-Type": "application/sdp" }, body: offer });
+      if (generation !== this.generation) return;
+      if (!answer.ok) {
+        const failure = await answer.json().catch(() => ({}));
+        throw new Error(failure.error || failure.detail || `RTC signaling failed (${answer.status}).`);
+      }
+      const sdp = (await answer.text()).trim().replace(/\r?\n/g, "\r\n") + "\r\n";
+      if (generation !== this.generation) return;
+      await peer.setRemoteDescription({ type: "answer", sdp });
+      if (generation !== this.generation) return;
+      await startup.promise;
+      if (generation !== this.generation) return;
+      this.heartbeat = setInterval(() => {
+        try { this.sendControl({ type: "ping" }); } catch (error) { this.fail(error); }
+      }, descriptor.timeout_ms / 2);
+    } catch (error) {
+      const cause = error instanceof Error ? error : new Error("RTC startup failed.");
+      const failure = cause.name === "NotAllowedError"
+        ? new Error("Microphone permission was denied. Allow it in browser settings, then retry Talk.")
+        : cause.name === "NotFoundError"
+          ? new Error("No microphone is available. Connect one, then retry Talk.") : cause;
+      if (generation === this.generation) this.fail(failure);
+      throw failure;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private installChannel(channel: RTCDataChannel, generation: number) {
+    this.channels.add(channel);
+    channel.onmessage = (message) => {
+      this.providerQueue = this.providerQueue.then(async () => {
+        if (generation !== this.generation) return;
+        const raw = typeof message.data === "string" ? message.data
+          : message.data instanceof ArrayBuffer ? new TextDecoder().decode(message.data)
+          : await (message.data as Blob).text();
+        if (generation !== this.generation) return;
+        if (raw.length > 1_048_576) throw new Error("RTC provider control event is too large.");
+        const event = JSON.parse(raw) as Record<string, unknown>;
+        this.sendControl({ type: "provider_event", event });
+        if (event.type === "session.created") {
+          const session = event.session as { id?: string };
+          if (typeof session?.id !== "string") throw new Error("RTC cloud session identity is missing.");
+          if (this.cloudSessionId && this.cloudSessionId !== session.id) throw new Error("RTC cloud session identity changed.");
+          this.cloudSessionId = session.id;
+          if (!this.configSent) {
+            this.sendProvider({ type: "session.update", event_id: crypto.randomUUID(), session: this.descriptor!.session_config });
+            this.configSent = true;
+          }
+        }
+      }).catch((error) => this.fail(error));
+    };
+    channel.onerror = () => { if (generation === this.generation) this.fail(new Error("RTC DataChannel failed.")); };
+    channel.onclose = () => { if (generation === this.generation && this.state !== "closed" && this.state !== "failed") this.fail(new Error("RTC DataChannel closed. Reopen Talk to continue.")); };
+  }
+
+  private sendProvider(event: Record<string, unknown>) {
+    const channel = [...this.channels].find((candidate) => candidate.readyState === "open");
+    if (!channel || channel.bufferedAmount > 1_048_576) throw new Error("RTC DataChannel is unavailable or its queue is full.");
+    channel.send(JSON.stringify(event));
+  }
+
+  private sendControl(value: Record<string, unknown>) {
+    const descriptor = this.descriptor;
+    if (!descriptor || this.socket?.readyState !== WebSocket.OPEN || this.socket.bufferedAmount > 1_048_576) throw new Error("RTC host control is unavailable or its queue is full.");
+    this.socket.send(JSON.stringify({ ...value, schema_version: 2, session_id: descriptor.session_id,
+      media_session_id: descriptor.media_session_id, producer_seq: this.producerSequence++ }));
+  }
+
+  private async handleControl(message: RtcServerMessage) {
+    const generation = this.generation;
+    if (message.session_id !== this.descriptor?.session_id || message.media_session_id !== this.descriptor.media_session_id
+        || message.producer_seq !== this.serverSequence++) throw new Error("RTC host message identity or ordering does not match.");
+    if (message.type === "control_ready") this.controlReady?.resolve();
+    if (message.type === "ready") {
+      if (message.cloud_session_id !== this.cloudSessionId) throw new Error("RTC cloud and host identities disagree.");
+      if (!this.restoring) {
+        this.restoring = true;
+        for (const { sender, track } of this.senders) {
+          track.enabled = this.captureEnabled;
+          await sender.replaceTrack(track);
+          if (generation !== this.generation) return;
+        }
+        this.setState("ready");
+        this.startup?.resolve();
+      }
+    }
+    if (message.type === "provider_command") {
+      if (this.commandIds.has(message.command_id)) throw new Error("RTC host command was repeated; it was not replayed.");
+      this.commandIds.add(message.command_id);
+      if (!["conversation.item.create", "response.create"].includes(String(message.event.type))) throw new Error("Unsupported RTC host command.");
+      try {
+        this.sendProvider(message.event);
+        this.sendControl({ type: "command_ack", command_id: message.command_id, status: "sent" });
+      } catch (error) {
+        this.sendControl({ type: "command_ack", command_id: message.command_id, status: "unknown" });
+        throw error;
+      }
+    }
+    if (message.type === "error") throw new Error(message.message);
+    this.options.onMessage?.(message);
+  }
+
+  setCaptureEnabled(enabled: boolean) {
+    this.captureEnabled = enabled;
+    this.stream?.getAudioTracks().forEach((track) => { track.enabled = enabled; });
+  }
+
+  private fail(value: unknown) {
+    if (this.state === "closed" || this.state === "failed") return;
+    const error = value instanceof Error ? value : new Error(String(value));
+    this.options.onError?.(error);
+    void this.cleanup("failed", error);
+  }
+
+  private async cleanup(state: "closed" | "failed", error = new Error("Talk was closed.")) {
+    ++this.generation;
+    this.startup?.reject(error);
+    this.controlReady?.reject(error);
+    this.abort?.abort();
+    this.abort = null;
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.heartbeat = null;
+    const descriptor = this.descriptor;
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      try { this.sendControl({ type: "close", reason: state === "failed" ? "error" : "manual" }); } catch { /* 控制断线由宿主生命周期回收。 */ }
+    }
+    this.socket?.close(); this.socket = null;
+    this.channels.forEach((channel) => channel.close()); this.channels.clear();
+    this.peer?.close(); this.peer = null;
+    this.stream?.getTracks().forEach((track) => track.stop()); this.stream = null;
+    this.senders = [];
+    if (this.audio) { this.audio.pause(); this.audio.srcObject = null; this.audio.remove(); this.audio = null; }
+    this.descriptor = null;
+    this.setState(state);
+    if (descriptor) {
+      try {
+        const result = await fetch(descriptor.close_url, { method: "DELETE", signal: AbortSignal.timeout(descriptor.timeout_ms) });
+        if (!result.ok) throw new Error("Host close was not confirmed.");
+      } catch {
+        // 本地资源已经关闭；不将失去回执误报为宿主已完成回收。
+        this.options.onError?.(new Error(`${error.message} Local media is closed, but host cleanup is unconfirmed. Retry after the session lease expires.`));
+      }
+    }
+  }
+
+  close(): Promise<void> { return this.cleanup("closed"); }
+  getStats(): Promise<RTCStatsReport> {
+    if (!this.peer) return Promise.reject(new Error("RTC connection is unavailable."));
+    return this.peer.getStats();
   }
 }

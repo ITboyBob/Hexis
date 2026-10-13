@@ -161,7 +161,7 @@ describe("voice avatar production event projection", () => {
     expect(projectVoiceAvatar(state).composition.eye).toBe("happy");
   });
 
-  it("uses current actual playback feedback for motion and fences stale identities", () => {
+  it("保留历史回执身份，但不再用播放反馈驱动前台播报姿态", () => {
     const state = initialVoiceAvatarState(identity.session_id, "media-1");
     const playing = applyLocalPlaybackFeedback(state, {
       identity: {
@@ -192,8 +192,8 @@ describe("voice avatar production event projection", () => {
     });
 
     expect(projectVoiceAvatar(playing).composition).toMatchObject({
-      playing: true,
-      amplitude: 0.31,
+      playing: false,
+      amplitude: 0,
     });
     expect(stale.localPlayback?.identity.playback_id).toBe("play-1");
   });

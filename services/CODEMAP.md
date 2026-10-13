@@ -12,6 +12,8 @@ generated_at: 2026-09-20
 | Task | Domain | Target | Also Check |
 |---|---|---|---|
 | 理解一次对话回合如何组装系统提示并调用 agent | Agent Runtime | `chat.py` | `agent.py`, `skill_runtime.py` |
+| 理解 RTC 信令、控制转发、工具及媒体会话租约 | Realtime Voice | `voice_rtc_api.py`, `voice_rtc.py` | `voice_rtc_tools.py`, `voice_rtc_history.py` |
+| 理解 Talk 一次性人格、历史和记忆准备 | Realtime Voice | `voice_rtc_bootstrap.py` | `voice_context_hydration.py`, `voice_instructions.py` |
 | 理解统一 agent runner 如何服务聊天与心跳 | Agent Runtime | `agent.py` | `core/agent_loop.py`, `chat.py` |
 | 理解 agentic 心跳如何决策与收尾 | Heartbeat | `heartbeat_agentic.py` | `heartbeat_runner.py`, `heartbeat_prompt.py` |
 | 理解心跳 worker 与维护 worker 如何消费事件 | Worker Orchestration | `worker_service.py` | `core/gateway.py`, `core/state.py` |

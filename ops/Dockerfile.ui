@@ -13,7 +13,7 @@ COPY services/prompts/ /services/prompts/
 COPY characters/ /characters/
 ENV HEXIS_PROMPTS_DIR=/services/prompts
 ENV HEXIS_CHARACTERS_DIR=/characters
-RUN npm run prepare:voice-vad-assets && npx prisma generate && npm run build
+RUN npx prisma generate && npm run build
 
 FROM node:20-slim
 # libssl is required at runtime by the Prisma query engine.

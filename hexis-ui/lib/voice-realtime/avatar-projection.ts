@@ -129,18 +129,8 @@ export function applyVoiceBehaviorEvent(
   }
 
   if (event.event_type === "voice_speech_start" || event.event_type === "voice_speech_end") {
-    const activityId = typeof payload.capture_instance_id === "string"
-      ? payload.capture_instance_id
-      : event.media_session_id ?? "voice-capture";
-    return {
-      ...state,
-      preview: previewEvent(event, {
-        type: "input_activity",
-        activity_id: activityId,
-        speaking: event.event_type === "voice_speech_start",
-        source: "real",
-      }, state),
-    };
+    // 语音起止由云端负责，不再投影为前台姿态。
+    return state;
   }
 
   if (
@@ -211,14 +201,11 @@ export function projectVoiceAvatar(state: VoiceAvatarState): {
     && sameIdentity(state.preview.last_valid.identity, identity)
     ? state.preview.last_valid.label
     : undefined;
-  const localPlayback = state.localPlayback;
-  const playing = !!localPlayback && localPlayback.feedback.phase === "playing"
-    && localPlayback.identity.media_session_id === state.media_session_id;
   const composition: Composition = {
     ...focus,
-    pose: focus.pose === "listening" ? "listening" : hasCurrentModelCall || hasCurrentRecall ? "thinking" : "idle",
-    playing,
-    amplitude: playing ? localPlayback.feedback.amplitude : 0,
+    pose: hasCurrentModelCall || hasCurrentRecall ? "thinking" : "idle",
+    playing: false,
+    amplitude: 0,
   };
   return {
     composition,

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { VoiceRealtimeClient } from "./client";
+import { VoiceRealtimeClient } from "./legacy-client";
 import {
   parseRealtimeServerMessage,
   parseRealtimeSessionResponse,

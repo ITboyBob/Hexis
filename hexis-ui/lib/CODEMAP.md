@@ -16,6 +16,8 @@ generated_at: 2026-09-20
 | 理解如何解析 `HEXIS_DATABASE_URL`/实例名到连接串 | Instance Registry | `instance-registry.ts` | `prisma.ts` |
 | 理解代理到 Python API 的 URL、鉴权头与错误格式 | API Proxy | `python-api.ts` | `app/api/**/route.ts` |
 | 理解 SSE 透传与错误 SSE 的构造 | API Proxy | `python-api.ts` | `app/api/events/stream/route.ts` |
+| 理解 Talk 原生 WebRTC、配置门控与控制事件 | Realtime Voice | `voice-realtime/client.ts`, `voice-realtime/rtc-contracts.ts` | `app/chat/talk-mode.tsx`, `voice-realtime/avatar-projection.ts` |
+| 验证 Talk 建连期间关闭、异步任务取消及控制配置 | Realtime Voice | `voice-realtime/rtc-client.test.ts`, `voice-realtime/rtc-contracts.test.ts` | `app/chat/talk-rtc.test.tsx`, `e2e/voice-rtc.spec.ts` |
 | 理解 conscious LLM 配置读取与统一调用 | Shared LLM | `llm.ts` | `app/api/init/import-card/route.ts` |
 | 理解从 LLM 文本抽取 JSON | Shared LLM | `llm.ts` | `app/api/init/import-card/route.ts` |
 | 理解 init 路由错误响应与 embedding 相关判定 | Init Errors | `init-errors.ts` | `app/api/init/**/route.ts` |

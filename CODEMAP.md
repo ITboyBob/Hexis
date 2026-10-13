@@ -24,6 +24,7 @@ Hexis 是一个 Postgres 原生的认知架构：把任意 LLM 包装成具备�
 | 理解心跳循环、能量经济与自主决策 | Heartbeat | `services/CODEMAP.md`, `db/CODEMAP.md` | `services/worker_service.py`, `db/11_functions_core_heartbeat.sql` |
 | 理解 CLI 子命令与初始化向导 | CLI | `apps/CODEMAP.md` | `apps/hexis_cli.py`, `apps/hexis_init.py` |
 | 理解 HTTP API 与 SSE 流式聊天 | API Server | `apps/CODEMAP.md` | `apps/hexis_api.py`, `services/chat.py` |
+| 理解 Talk WebRTC、一次性上下文与音频元数据 | Realtime Voice | `services/CODEMAP.md`, `hexis-ui/lib/CODEMAP.md` | `docs/guides/voice-webrtc.md`, `apps/hexis_api.py` |
 | 理解多渠道消息适配与主动外发 | Channels | `channels/CODEMAP.md`, `services/CODEMAP.md` | `channels/manager.py`, `services/outbound_safety.py` |
 | 理解数据库 schema 与前向迁移机制 | Database | `db/CODEMAP.md`, `db/migrations/CODEMAP.md` | `core/migrations.py`, `db/00_tables.sql` |
 | 理解 HMX 记忆交换与心智可移植性 | Memory Exchange | `core/CODEMAP.md`, `schemas/CODEMAP.md` | `core/memory_exchange.py`, `core/protected_replacement.py` |

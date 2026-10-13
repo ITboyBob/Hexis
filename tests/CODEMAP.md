@@ -12,6 +12,7 @@ generated_at: 2026-09-20
 | Task | Domain | Target | Also Check |
 |---|---|---|---|
 | 理解测试如何拿到真实数据库连接与隔离 | 测试基建 | `conftest.py` | `utils.py` |
+| 验证 Talk RTC 控制、初始化、关闭终态与工具来源 | Realtime Voice | `voice_realtime/test_rtc_session.py`, `voice_realtime/test_rtc_api.py`, `voice_realtime/test_rtc_bootstrap.py` | `db/test_voice_rtc_history.py`, `db/test_voice_turn_completion.py` |
 | 理解 DB schema、迁移与 prompt 渲染的回归测试 | DB 层测试 | `db/CODEMAP.md` | `db/test_migrations.py`, `db/test_prompt_render.py` |
 | 理解记忆召回/巩固（RecMem）在 SQL 端的验证 | DB 层测试 | `db/test_recmem.py` | `db/test_memory_edges.py`, `db/test_retrieval_eval.py` |
 | 理解心跳状态机与能量经济的测试 | DB 层测试 | `db/test_heartbeat_state.py` | `db/test_heartbeat_economy.py`, `db/test_finalize_heartbeat.py` |

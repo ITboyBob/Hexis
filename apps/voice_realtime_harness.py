@@ -1,4 +1,7 @@
-"""One-shot controlled evidence harness for the BOB-101 voice path."""
+"""历史 BOB-101 WebSocket 探针；不再作为生产 Talk 的验收入口。
+
+新 Talk 的原生 WebRTC 验收由 hexis-ui 的 test:rtc 脚本和本地受控对端完成。
+"""
 
 from __future__ import annotations
 

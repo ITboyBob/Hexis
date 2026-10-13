@@ -24,6 +24,7 @@ _AUTHORIZATION_FIELDS = {
     "request_id",
     "actual_call_id",
 }
+_RTC_AUTHORIZATION_FIELDS = {"input_modality", "media_session_id", "provider_item_id"}
 _PENDING_AUTHORIZATION_FIELDS = _AUTHORIZATION_FIELDS | {"task_id"}
 
 
@@ -299,7 +300,7 @@ class M5TaskService:
         origin_session_id: UUID | str,
         command_id: UUID | str,
         description: str,
-        original_request: str,
+        original_request: str | None,
         authorization: dict[str, Any],
     ) -> dict[str, Any]:
         """Atomically accept a task and preserve its original business result."""
@@ -307,11 +308,17 @@ class M5TaskService:
         command_uuid = _uuid(command_id, "command_id")
         if not isinstance(description, str) or not description.strip():
             raise ValueError("task description must not be blank")
-        if not isinstance(original_request, str) or not original_request.strip():
-            raise ValueError("original user request must not be blank")
         if not isinstance(authorization, dict):
             raise ValueError("host authorization identity must be an object")
-        unknown = set(authorization) - _AUTHORIZATION_FIELDS
+        if original_request is None:
+            if authorization.get("input_modality") != "audio":
+                raise ValueError("audio source metadata is required without an original user transcript")
+            _uuid(authorization.get("media_session_id"), "media_session_id")
+            if not isinstance(authorization.get("provider_item_id"), str) or not authorization["provider_item_id"].strip():
+                raise ValueError("audio provider item identity is required")
+        elif not isinstance(original_request, str) or not original_request.strip() or "input_modality" in authorization:
+            raise ValueError("original text request must not be blank or mixed with audio metadata")
+        unknown = set(authorization) - (_AUTHORIZATION_FIELDS | _RTC_AUTHORIZATION_FIELDS)
         if unknown:
             raise ValueError(
                 f"host authorization contains unsupported fields: {sorted(unknown)}"
