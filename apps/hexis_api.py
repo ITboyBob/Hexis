@@ -6518,11 +6518,13 @@ def _rtc_tools(surface: str) -> list[dict[str, Any]]:
 
 from services.voice_rtc_api import RtcRuntime
 from services.voice_rtc_tools import make_rtc_tool_executor
+from services.voice_rtc_emotion import make_rtc_emotion_evaluator
 
 _rtc_runtime = RtcRuntime(
     pool_provider=lambda: _pool, config_loader=_load_rtc_config, control_url=_rtc_control_url,
     tools_provider=_rtc_tools,
     tool_executor=make_rtc_tool_executor(lambda: _pool, lambda: _m5_task_worker, lambda: _m5_lightweight_executor),
+    emotion_evaluator=make_rtc_emotion_evaluator(lambda: _pool),
 )
 app.include_router(_rtc_runtime.router)
 

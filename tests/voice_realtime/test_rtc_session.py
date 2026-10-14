@@ -69,12 +69,176 @@ async def ready(session):
     )
 
 
-async def test_bootstrap_explicitly_disables_transcription_and_uses_cloud_vad():
+async def test_bootstrap_enables_async_transcription_and_uses_cloud_vad():
     session, _, _ = make_session()
-    assert session.session_config["input_audio_transcription"] is None
+    assert session.session_config["input_audio_transcription"] == {
+        "model": "qwen3-asr-flash-realtime"
+    }
     assert session.session_config["turn_detection"] == {"type": "semantic_vad"}
     assert session.session_config["instructions"] == "真实会话上下文"
     assert "create_response" not in session.session_config["turn_detection"]
+
+
+async def test_transcription_branches_do_not_block_response_and_are_idempotent():
+    session, history, sent = make_session()
+    release = asyncio.Event()
+    evaluated = []
+
+    async def evaluate(text):
+        evaluated.append(text)
+        await release.wait()
+        return {"label": "happy", "wordset_version": "v1"}
+
+    async def save(**values):
+        await release.wait()
+        return {"message_id": str(uuid4())}
+
+    session.emotion_evaluator = evaluate
+    history.save_user_transcript = save
+    await ready(session)
+    transcript = {
+        "type": "conversation.item.input_audio_transcription.completed",
+        "item_id": "audio-1",
+        "transcript": "很高兴见到你",
+    }
+    await session.provider_event(transcript)
+    assert not evaluated
+    await session.provider_event(
+        {"type": "input_audio_buffer.committed", "item_id": "audio-1"}
+    )
+    await session.provider_event({**transcript, "event_id": "duplicate-final"})
+    await asyncio.sleep(0)
+    await asyncio.wait_for(
+        session.provider_event(
+            {"type": "response.created", "response": {"id": "response-1"}}
+        ),
+        0.1,
+    )
+    assert evaluated == ["很高兴见到你"]
+    assert sum(m["type"] == "user_text" for m in sent) == 1
+    release.set()
+    await asyncio.gather(*tuple(session._side_tasks))
+    assert any(m["type"] == "user_text_saved" for m in sent)
+    assert any(m["type"] == "emotion_result" and m["label"] == "happy" for m in sent)
+    assert not any(m["type"] == "provider_command" for m in sent)
+    await session.close()
+
+
+async def test_branch_failure_and_transcription_failure_keep_voice_ready():
+    session, history, sent = make_session()
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError("受控支路失败")
+
+    session.emotion_evaluator = fail
+    history.save_user_transcript = fail
+    await ready(session)
+    await session.provider_event(
+        {"type": "input_audio_buffer.committed", "item_id": "audio-1"}
+    )
+    await session.provider_event(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "audio-1",
+            "transcript": "你好",
+        }
+    )
+    await asyncio.gather(*tuple(session._side_tasks))
+    await session.provider_event(
+        {
+            "type": "conversation.item.input_audio_transcription.failed",
+            "item_id": "other",
+        }
+    )
+    assert session.ready and not session.closed.is_set()
+    assert any(m["type"] == "side_task_status" for m in sent)
+    assert not any(m["type"] == "error" for m in sent)
+    await session.close()
+
+
+async def test_close_cancels_pending_emotion_without_late_events():
+    session, history, sent = make_session()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def evaluate(text):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async def save(**values):
+        return {"message_id": str(uuid4())}
+
+    session.emotion_evaluator = evaluate
+    history.save_user_transcript = save
+    await ready(session)
+    await session.provider_event(
+        {"type": "input_audio_buffer.committed", "item_id": "audio-1"}
+    )
+    await session.provider_event(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "audio-1",
+            "transcript": "你好",
+        }
+    )
+    await asyncio.wait_for(started.wait(), 0.1)
+    await session.close()
+    assert cancelled.is_set()
+    assert not any(m["type"] == "emotion_result" for m in sent)
+
+
+@pytest.mark.parametrize("delivery_failure", [False, True])
+async def test_final_asr_after_response_done_and_side_delivery_failure(
+    delivery_failure,
+):
+    session, history, sent = make_session()
+    ran = []
+
+    async def save(**values):
+        ran.append("save")
+        return {"message_id": str(uuid4())}
+
+    async def evaluate(text):
+        ran.append("emotion")
+        return {"label": "curious", "wordset_version": "v1"}
+
+    history.save_user_transcript = save
+    session.emotion_evaluator = evaluate
+    await ready(session)
+    await session.provider_event(
+        {"type": "input_audio_buffer.committed", "item_id": "audio-1"}
+    )
+    await session.provider_event(
+        {"type": "response.created", "response": {"id": "reply"}}
+    )
+    await session.provider_event(
+        {
+            "type": "response.done",
+            "response": {"id": "reply", "status": "completed", "output": []},
+        }
+    )
+    if delivery_failure:
+
+        async def fail_send(message):
+            raise RtcProtocolError("受控发送队列已满")
+
+        session.send = fail_send
+    await session.provider_event(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "audio-1",
+            "transcript": "迟到的最终转录",
+        }
+    )
+    await asyncio.gather(*tuple(session._side_tasks))
+    assert sorted(ran) == ["emotion", "save"]
+    assert session.ready and not session.closed.is_set()
+    if not delivery_failure:
+        assert any(m["type"] == "user_text_saved" for m in sent)
+    await session.close()
 
 
 @pytest.mark.parametrize(

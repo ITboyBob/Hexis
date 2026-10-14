@@ -1,4 +1,5 @@
 import type { M5TaskSelection } from "../m5-tasks";
+import { isEmotion, WORDSET_VERSION, type Emotion } from "../avatar-preview/contracts";
 
 export type RtcDescriptor = {
   schema_version: 2; transport: "webrtc"; session_id: string; media_session_id: string;
@@ -6,12 +7,18 @@ export type RtcDescriptor = {
   context_version: string; model: string; session_config: Record<string, unknown>;
 };
 type Envelope = { schema_version: 2; session_id: string; media_session_id: string; producer_seq: number };
+type InputIdentity = { input_turn_id: string; input_order: number; turn_id: string };
 export type RtcServerMessage = Envelope & (
   | { type: "control_ready" }
   | { type: "ready"; cloud_session_id: string }
+  | (InputIdentity & { type: "input_committed" })
+  | (InputIdentity & { type: "user_text"; text: string })
+  | (InputIdentity & { type: "user_text_saved"; text: string; message_id: string })
+  | (InputIdentity & { type: "emotion_result"; label: Emotion; wordset_version: string })
+  | { type: "side_task_status"; branch: "transcription" | "transcript" | "emotion"; status: "failed"; code: string }
   | { type: "provider_command"; command_id: string; event: Record<string, unknown> }
-  | { type: "assistant_text"; response_id: string; turn_id: string; text: string }
-  | { type: "response_saved"; response_id: string; turn_id: string; text: string; status: string; playback_scope: "unknown" }
+  | { type: "assistant_text"; response_id: string; turn_id: string; text: string; input_turn_id?: string; input_order?: number }
+  | { type: "response_saved"; response_id: string; turn_id: string; text: string; status: string; playback_scope: "unknown"; input_turn_id?: string; input_order?: number }
   | { type: "m5_selection_opened"; selection: M5TaskSelection }
   | { type: "recall_result"; input_turn_id: string; result: Record<string, unknown> }
   | { type: "error"; code: string; message: string }
@@ -39,10 +46,10 @@ export function parseRtcDescriptor(value: unknown): RtcDescriptor {
   if (!/^[0-9a-f]{64}$/.test(data.context_version as string)) throw new Error("RTC prepared context version is invalid.");
   if (typeof data.timeout_ms !== "number" || !Number.isFinite(data.timeout_ms) || data.timeout_ms <= 0) throw new Error("RTC timeout is invalid.");
   const config = record(data.session_config);
-  if (config.input_audio_transcription !== null || record(config.turn_detection).type !== "semantic_vad"
+  if (record(config.input_audio_transcription).model !== "qwen3-asr-flash-realtime" || record(config.turn_detection).type !== "semantic_vad"
       || typeof config.instructions !== "string" || !config.instructions.trim()
       || !Array.isArray(config.modalities) || !config.modalities.includes("audio") || !config.modalities.includes("text")) {
-    throw new Error("RTC session must use prepared context, cloud VAD, and disabled input transcription.");
+    throw new Error("RTC session must use prepared context, cloud VAD, and asynchronous input transcription.");
   }
   return data as RtcDescriptor;
 }
@@ -52,12 +59,30 @@ export function parseRtcMessage(value: unknown): RtcServerMessage {
   if (data.schema_version !== 2 || !Number.isSafeInteger(data.producer_seq) || (data.producer_seq as number) < 0) throw new Error("RTC control envelope is invalid.");
   text(data.session_id); text(data.media_session_id);
   switch (data.type) {
+    case "input_committed":
+    case "user_text":
+    case "user_text_saved":
+    case "emotion_result": {
+      text(data.input_turn_id); text(data.turn_id);
+      if (!Number.isSafeInteger(data.input_order) || (data.input_order as number) < 0) throw new Error("RTC input ordering is invalid.");
+      if (data.type === "user_text" || data.type === "user_text_saved") {
+        if (typeof data.text !== "string" || !data.text.trim() || data.text.length > 32768) throw new Error("RTC user text is invalid.");
+        if (data.type === "user_text_saved") text(data.message_id);
+      }
+      if (data.type === "emotion_result" && (!isEmotion(data.label) || data.wordset_version !== WORDSET_VERSION)) throw new Error("RTC emotion is invalid.");
+      break;
+    }
+    case "side_task_status":
+      if (!["transcription", "transcript", "emotion"].includes(String(data.branch)) || data.status !== "failed") throw new Error("RTC side task status is invalid.");
+      text(data.code); break;
     case "control_ready": break;
     case "ready": text(data.cloud_session_id); break;
     case "provider_command": text(data.command_id); record(data.event); break;
     case "assistant_text":
     case "response_saved":
       text(data.response_id); text(data.turn_id);
+      if (data.input_turn_id !== undefined) text(data.input_turn_id);
+      if (data.input_order !== undefined && (!Number.isSafeInteger(data.input_order) || (data.input_order as number) < 0)) throw new Error("RTC output input order is invalid.");
       if (typeof data.text !== "string") throw new Error("RTC output text is invalid.");
       if (data.type === "response_saved" && (data.playback_scope !== "unknown" || typeof data.status !== "string")) throw new Error("RTC output receipt is invalid.");
       break;

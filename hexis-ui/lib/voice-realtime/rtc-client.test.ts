@@ -6,7 +6,7 @@ const descriptor = {
   control_url: "ws://127.0.0.1/control", offer_url: "/api/offer", close_url: "/api/close",
   timeout_ms: 30000, context_version: "a".repeat(64), model: "selected",
   session_config: { instructions: "上下文", modalities: ["text", "audio"], tools: [],
-    input_audio_transcription: null, turn_detection: { type: "semantic_vad" } },
+    input_audio_transcription: { model: "qwen3-asr-flash-realtime" }, turn_detection: { type: "semantic_vad" } },
 };
 
 let sockets: FakeSocket[];

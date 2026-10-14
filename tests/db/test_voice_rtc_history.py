@@ -91,6 +91,7 @@ async def test_audio_turn_has_no_user_text_and_generated_message_is_idempotent(d
             metadata = json.loads(rows[0]["metadata"])
             assert metadata["playback_scope"] == "unknown"
             assert metadata["content_source"] == "model_generation"
+            assert metadata["input_order"] == 0
             with pytest.raises(Exception):
                 async with conn.transaction():
                     await history.save_generated_output(
@@ -132,6 +133,69 @@ async def audio_input(conn):
     )
     turn = await RtcVoiceHistory(LeasePool(conn)).start_audio_input(**identity)
     return identity, turn
+
+
+async def test_transcript_is_saved_once_before_reply_without_recreating_turn(db_pool):
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            identity, turn = await audio_input(conn)
+            history = RtcVoiceHistory(LeasePool(conn))
+            await history.save_generated_output(
+                session_id=identity["session_id"],
+                media_session_id=identity["media_session_id"],
+                input_turn_id=identity["input_turn_id"],
+                turn_id=turn,
+                response_id="answer-before-asr",
+                assistant_text="你好呀",
+                status="completed",
+                context_version="a" * 64,
+                playback_scope="unknown",
+                final_for_turn=True,
+            )
+            values = dict(
+                session_id=identity["session_id"],
+                media_session_id=identity["media_session_id"],
+                input_turn_id=identity["input_turn_id"],
+                turn_id=turn,
+                text="你好",
+            )
+            result = await history.save_user_transcript(**values)
+            repeated = await history.save_user_transcript(**values)
+            assert result["message_id"] == repeated["message_id"]
+            rows = await conn.fetch(
+                "SELECT role,content FROM chat_messages WHERE session_id=$1 ORDER BY ordinal",
+                identity["session_id"],
+            )
+            assert [(r["role"], r["content"]) for r in rows] == [
+                ("user", "你好"),
+                ("assistant", "你好呀"),
+            ]
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM agent_turns WHERE session_id=$1",
+                    identity["session_id"],
+                )
+                == 1
+            )
+            assert (
+                await conn.fetchval("SELECT status FROM agent_turns WHERE id=$1", turn)
+                == "completed"
+            )
+            assert (
+                await conn.fetchval(
+                    "SELECT metadata->>'transcription_enabled' FROM voice_rtc_inputs WHERE input_turn_id=$1",
+                    identity["input_turn_id"],
+                )
+                == "true"
+            )
+            with pytest.raises(Exception):
+                async with conn.transaction():
+                    await history.save_user_transcript(
+                        **{**values, "text": "另一段文本"}
+                    )
+            with pytest.raises(Exception):
+                async with conn.transaction():
+                    await history.save_user_transcript(**{**values, "turn_id": uuid4()})
 
 
 async def test_rtc_tool_projection_and_task_source_metadata(db_pool):

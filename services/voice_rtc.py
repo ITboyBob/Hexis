@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -13,6 +14,9 @@ from urllib.parse import urlparse
 from uuid import UUID, uuid4, uuid5
 
 from services.m5_tool_bridge import BoundToolCall
+
+logger = logging.getLogger(__name__)
+INPUT_TRANSCRIPTION = {"model": "qwen3-asr-flash-realtime"}
 
 
 class RtcProtocolError(ValueError):
@@ -94,6 +98,7 @@ class RtcVoiceSession:
         ) = None,
         on_cloud_session: Callable[[str], Awaitable[None]] | None = None,
         on_usage: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        emotion_evaluator: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
     ):
         self.session_id = session_id
         self.media_session_id = media_session_id
@@ -104,6 +109,7 @@ class RtcVoiceSession:
         self.tool_executor = tool_executor
         self.on_cloud_session = on_cloud_session
         self.on_usage = on_usage
+        self.emotion_evaluator = emotion_evaluator
         self.tool_surface = "m5"
         self.ready = False
         self.closed = asyncio.Event()
@@ -112,7 +118,7 @@ class RtcVoiceSession:
             "modalities": ["text", "audio"],
             "instructions": context.instructions,
             "audio": {"output": {"voice": config.voice}},
-            "input_audio_transcription": None,
+            "input_audio_transcription": dict(INPUT_TRANSCRIPTION),
             "turn_detection": {"type": "semantic_vad"},
             "tools": tools,
         }
@@ -124,6 +130,9 @@ class RtcVoiceSession:
         self._followup_input: str | None = None
         self._followup_received: asyncio.Future | None = None
         self._tool_tasks: set[asyncio.Task] = set()
+        self._side_tasks: set[asyncio.Task] = set()
+        self._transcripts: dict[str, str | None] = {}
+        self._transcript_started: set[str] = set()
         self._command_waiters: dict[str, asyncio.Future] = {}
         self._speech_pending = False
         self._activity = asyncio.Event()
@@ -168,10 +177,12 @@ class RtcVoiceSession:
             "input_audio_buffer.append",
             "input_audio_buffer.commit",
             "response.audio.delta",
-        } or kind.startswith("conversation.item.input_audio_transcription."):
-            raise RtcProtocolError(
-                "unexpected PCM or input transcription event in WebRTC mode"
-            )
+        }:
+            raise RtcProtocolError("unexpected PCM event in WebRTC mode")
+        if kind.startswith("conversation.item.input_audio_transcription."):
+            if self.ready:
+                await self._input_transcription(event)
+            return
         if self._deduplicate(event):
             return
         if kind == "session.created":
@@ -198,7 +209,7 @@ class RtcVoiceSession:
                 or value.get("id", self.cloud_session_id) != self.cloud_session_id
                 or value.get("model", self.config.model) != self.config.model
                 or voice != self.config.voice
-                or value.get("input_audio_transcription") is not None
+                or value.get("input_audio_transcription") != INPUT_TRANSCRIPTION
                 or value.get("turn_detection", {}).get("type") != "semantic_vad"
                 or value.get("turn_detection", {}).get("create_response") is False
                 or value.get("instructions") != self.context.instructions
@@ -274,6 +285,8 @@ class RtcVoiceSession:
                 }
                 self._pending_inputs.append(item)
                 self._latest_input = item
+                await self.emit(type="input_committed", **self._input_identity(item))
+                await self._dispatch_transcript(item)
             self._activity.set()
             return
         if kind == "response.created":
@@ -323,6 +336,8 @@ class RtcVoiceSession:
                     type="assistant_text",
                     response_id=response_id,
                     turn_id=str(identity["turn_id"]),
+                    input_turn_id=identity["input_turn_id"],
+                    input_order=identity["input_order"],
                     text=str(event.get("delta") or ""),
                 )
             else:
@@ -409,6 +424,8 @@ class RtcVoiceSession:
                 type="response_saved",
                 response_id=response_id,
                 turn_id=str(identity["turn_id"]),
+                input_turn_id=identity["input_turn_id"],
+                input_order=identity["input_order"],
                 text=text,
                 status=status,
                 playback_scope="unknown",
@@ -418,6 +435,131 @@ class RtcVoiceSession:
                 self._tool_tasks.add(task)
                 task.add_done_callback(self._tool_tasks.discard)
             self._activity.set()
+
+    def _input_identity(self, item: str) -> dict[str, Any]:
+        identity = self.inputs[item]
+        return {
+            "input_turn_id": identity["input_turn_id"],
+            "input_order": identity["input_order"],
+            "turn_id": str(identity["turn_id"]),
+        }
+
+    async def _side_emit(self, **values: Any) -> None:
+        if self.closed.is_set():
+            return
+        try:
+            await self.emit(**values)
+        except Exception as exc:
+            logger.warning("RTC side event delivery failed (%s)", type(exc).__name__)
+
+    async def _input_transcription(self, event: dict[str, Any]) -> None:
+        kind = event["type"]
+        if kind not in {
+            "conversation.item.input_audio_transcription.completed",
+            "conversation.item.input_audio_transcription.failed",
+        }:
+            return  # 中间草稿不进入聊天记录或评估器。
+        item = event.get("item_id")
+        if not isinstance(item, str) or not item.strip() or len(item) > 4096:
+            await self._side_emit(
+                type="side_task_status",
+                branch="transcription",
+                status="failed",
+                code="invalid_input_identity",
+            )
+            return
+        if item in self._transcripts:
+            return
+        if len(self._transcripts) >= 512:
+            await self._side_emit(
+                type="side_task_status",
+                branch="transcription",
+                status="failed",
+                code="transcription_budget_exhausted",
+            )
+            return
+        text = event.get("transcript")
+        if (
+            kind.endswith(".failed")
+            or not isinstance(text, str)
+            or not text.strip()
+            or len(text) > 32768
+        ):
+            self._transcripts[item] = None
+            await self._side_emit(
+                type="side_task_status",
+                branch="transcription",
+                status="failed",
+                code="transcription_unavailable",
+            )
+            return
+        self._transcripts[item] = text
+        await self._dispatch_transcript(item)
+
+    async def _dispatch_transcript(self, item: str) -> None:
+        text = self._transcripts.get(item)
+        if (
+            not text
+            or item not in self.inputs
+            or item in self._transcript_started
+            or self.closed.is_set()
+        ):
+            return
+        self._transcript_started.add(item)
+        await self._side_emit(type="user_text", text=text, **self._input_identity(item))
+        for branch in ("transcript", "emotion"):
+            task = asyncio.create_task(self._run_side_task(item, text, branch))
+            self._side_tasks.add(task)
+            task.add_done_callback(self._side_tasks.discard)
+
+    async def _run_side_task(self, item: str, text: str, branch: str) -> None:
+        try:
+            if branch == "transcript":
+                identity = self.inputs[item]
+                result = await asyncio.wait_for(
+                    self.history.save_user_transcript(
+                        session_id=self.session_id,
+                        media_session_id=self.media_session_id,
+                        input_turn_id=UUID(identity["input_turn_id"]),
+                        turn_id=identity["turn_id"],
+                        text=text,
+                    ),
+                    timeout=self.config.timeout,
+                )
+                await self._side_emit(
+                    type="user_text_saved",
+                    text=text,
+                    message_id=str(result["message_id"]),
+                    **self._input_identity(item),
+                )
+            else:
+                if self.emotion_evaluator is None:
+                    raise RuntimeError("RTC emotion evaluator is unavailable")
+                result = await asyncio.wait_for(
+                    self.emotion_evaluator(text), timeout=self.config.timeout
+                )
+                from services.avatar_emotion import WORDSET_VERSION, validate_label
+
+                label = validate_label(result["label"])
+                if result.get("wordset_version") != WORDSET_VERSION:
+                    raise ValueError("RTC emotion wordset does not match")
+                await self._side_emit(
+                    type="emotion_result",
+                    label=label,
+                    wordset_version=WORDSET_VERSION,
+                    **self._input_identity(item),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("RTC %s task failed (%s)", branch, type(exc).__name__)
+            await self._side_emit(
+                type="side_task_status",
+                branch=branch,
+                status="failed",
+                code=type(exc).__name__,
+                **self._input_identity(item),
+            )
 
     def _response(self, response_id: Any) -> dict[str, Any]:
         if not isinstance(response_id, str) or response_id not in self.responses:
@@ -598,7 +740,12 @@ class RtcVoiceSession:
                         "voice control closed before command delivery was confirmed"
                     )
                 )
-        tasks = [t for t in self._tool_tasks if t is not asyncio.current_task()]
+        tasks = [
+            t
+            for t in self._tool_tasks | self._side_tasks
+            if t is not asyncio.current_task()
+        ]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        self._transcripts.clear()

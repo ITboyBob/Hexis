@@ -193,7 +193,7 @@ describe("ChatPage attachments", () => {
     expect(screen.queryByText("Thinking...")).not.toBeInTheDocument();
   });
 
-  it("不显示新用户转录，助手文字校正不重复且保留下一轮预览", async () => {
+  it("显示用户转录并去重，助手文字校正不重复且保留下一轮预览", async () => {
     const sessionId = "11111111-1111-4111-8111-111111111111";
     sessionStorage.setItem("hexis-chat-session-id", sessionId);
     const persisted: Array<Record<string, unknown>> = [];
@@ -211,7 +211,7 @@ describe("ChatPage attachments", () => {
       voiceChat.onChatText?.(user);
       voiceChat.onChatText?.(assistant);
     });
-    expect(screen.queryByText("用户原话")).toBeNull();
+    expect(screen.getAllByText("用户原话")).toHaveLength(1);
     expect(screen.getByText("助手")).toBeInTheDocument();
     act(() => voiceChat.onChatText?.({ ...assistant, text: "回答" }));
     expect(screen.getByText("助手回答")).toBeInTheDocument();

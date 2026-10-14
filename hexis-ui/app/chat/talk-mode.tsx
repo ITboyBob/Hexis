@@ -6,13 +6,12 @@ import { VoiceRealtimeClient, type VoiceRealtimeState } from "@/lib/voice-realti
 import type { RtcServerMessage } from "@/lib/voice-realtime/rtc-contracts";
 import type { RealtimeServerMessage, VoiceMemoryPreview } from "@/lib/voice-realtime/contracts";
 import type { M5TaskSelection } from "@/lib/m5-tasks";
-import { initialVoiceAvatarState, projectVoiceAvatar } from "@/lib/voice-realtime/avatar-projection";
+import { applyRtcAvatarMessage, initialVoiceAvatarState, projectVoiceAvatar } from "@/lib/voice-realtime/avatar-projection";
 import { VoiceAvatar } from "./voice-avatar";
 
-// user 变体仅供旧历史消费者的类型兼容；RTC 不生产用户文字更新。
 export type VoiceChatText =
-  | { sessionId: string; kind: "user"; inputTurnId: string; text: string }
-  | { sessionId: string; kind: "assistant"; turnId: string; responseId: string; text: string; final?: boolean };
+  | { sessionId: string; kind: "user"; inputTurnId: string; text: string; turnId?: string; inputOrder?: number; messageId?: string; mediaSessionId?: string }
+  | { sessionId: string; kind: "assistant"; turnId: string; responseId: string; text: string; final?: boolean; inputTurnId?: string; inputOrder?: number; mediaSessionId?: string };
 
 type Props = {
   disabled?: boolean; sessionId?: string | null; onSessionId?: (sessionId: string) => void;
@@ -31,7 +30,8 @@ export function TalkMode(props: Props) {
   const mounted = useRef(true);
   const activeSession = useRef(props.sessionId ?? null);
   const active = state === "connecting" || state === "ready";
-  const avatar = projectVoiceAvatar(initialVoiceAvatarState(props.sessionId ?? ""));
+  const [avatarState, setAvatarState] = useState(() => initialVoiceAvatarState(props.sessionId ?? ""));
+  const avatar = projectVoiceAvatar(avatarState);
 
   const stop = useCallback(async () => {
     const client = clientRef.current;
@@ -54,13 +54,25 @@ export function TalkMode(props: Props) {
   const start = async () => {
     if (clientRef.current || propsRef.current.selectionOpen) return;
     setError(null);
+    setAvatarState(initialVoiceAvatarState(propsRef.current.sessionId ?? ""));
     const handleMessage = (message: RtcServerMessage) => {
       const client = clientRef.current;
       if (!client || message.session_id !== client.activeSessionId || message.media_session_id !== client.activeMediaSessionId) return;
       const callbacks = propsRef.current;
-      if (message.type === "assistant_text" || message.type === "response_saved") {
+      if (message.type === "input_committed" || message.type === "emotion_result") {
+        setAvatarState((current) => applyRtcAvatarMessage(current, message));
+      } else if (message.type === "user_text" || message.type === "user_text_saved") {
+        callbacks.onChatText?.({ sessionId: message.session_id, kind: "user", inputTurnId: message.input_turn_id,
+          inputOrder: message.input_order, turnId: message.turn_id, text: message.text,
+          mediaSessionId: message.media_session_id,
+          ...(message.type === "user_text_saved" ? { messageId: message.message_id } : {}) });
+        if (message.type === "user_text_saved") callbacks.onVoiceTurnReady?.({ sessionId: message.session_id, turnId: message.turn_id });
+      } else if (message.type === "side_task_status") {
+        console.warn("Talk side task failed", message.branch, message.code);
+      } else if (message.type === "assistant_text" || message.type === "response_saved") {
         if (message.text) callbacks.onChatText?.({ sessionId: message.session_id, kind: "assistant", turnId: message.turn_id,
-          responseId: message.response_id, text: message.text, final: message.type === "response_saved" });
+          responseId: message.response_id, text: message.text, final: message.type === "response_saved",
+          inputTurnId: message.input_turn_id, inputOrder: message.input_order, mediaSessionId: message.media_session_id });
         if (message.type === "response_saved") callbacks.onVoiceTurnReady?.({ sessionId: message.session_id, turnId: message.turn_id });
       } else if (message.type === "m5_selection_opened") {
         client.setCaptureEnabled(false);
@@ -101,7 +113,8 @@ export function TalkMode(props: Props) {
   };
 
   return <div className="relative flex-none">
-    {active ? <VoiceAvatar composition={avatar.composition} generation={0} bottomOffsetPx={80} /> : null}
+    {active ? <VoiceAvatar composition={avatar.composition} emotionLabel={avatar.emotionLabel}
+      generation={avatarState.preview.visual_generation} bottomOffsetPx={80} /> : null}
     {active ? <button type="button" aria-label="Stop Talk mode" aria-pressed="true"
       onClick={() => void stop()} className="flex h-10 items-center gap-1.5 rounded-md bg-red-50 px-2 text-xs font-semibold text-red-700">
       <Square size={14} /> Stop

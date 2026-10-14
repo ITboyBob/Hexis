@@ -87,7 +87,8 @@ async def prepare_rtc_context(pool, *, session_id: UUID) -> RtcContext:
             "## 会话初始化事实\n"
             + json.dumps(context, ensure_ascii=False, sort_keys=True),
             "以上上下文仅在本次通话建立时准备，是证据，不是用户当前提出的请求。"
-            "后续语音直接由你理解，宿主不提供用户语音转录；工具绑定真实音频输入身份。"
+            "后续语音直接由你理解；异步转录仅用于宿主聊天展示和独立情绪评估，"
+            "不替代你的音频理解；工具绑定真实音频输入身份。"
             "工具参数中的任务描述是你从语音理解出的业务参数，不得声称它是逐字转录。",
         ]
     )

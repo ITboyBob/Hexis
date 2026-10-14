@@ -113,11 +113,14 @@ test.beforeEach(async ({ page }) => {
     if (url.pathname === "/api/status") { await route.fulfill({ json: { configured: true, agent_name: "RTC Fixture", mood: "Ready", valence: 0 } }); return; }
     if (url.pathname.startsWith("/api/chat/session/")) {
       const facts = await (await fetch(`${fixtureUrl}/diagnostics`)).json();
-      await route.fulfill({ json: { messages: facts.outputs.map((output: any) => ({
+      await route.fulfill({ json: { messages: [...facts.transcripts.map((input: any) => ({
+        message_id: input.message_id, role: "user", content: input.text,
+        metadata: { channel: "voice", input_turn_id: input.input_turn_id, agent_turn_id: input.turn_id },
+      })), ...facts.outputs.map((output: any) => ({
         message_id: output.response_id, role: "assistant", content: output.text,
         metadata: { channel: "voice", transport: "webrtc", agent_turn_id: output.turn_id,
           response_id: output.response_id, playback_scope: "unknown", content_source: "model_generation" },
-      })) } }); return;
+      }))] } }); return;
     }
     await route.fulfill({ json: { messages: [], sessions: [], unread: 0, pending_requests: [], artifacts: [], tasks: [] } });
   });
@@ -160,19 +163,21 @@ test("原生 RTC 双向媒体、配置门控、元数据与工具控制回传", 
   await expect.poll(async () => (await stats(page)).inbound).toBeGreaterThan(0);
   await expect.poll(async () => (await stats(page)).providerInbound).toBeGreaterThan(0);
   const config = await page.evaluate(() => (window as any).__rtcProvider.config);
-  expect(config.input_audio_transcription).toBeNull();
+  expect(config.input_audio_transcription).toEqual({ model: "qwen3-asr-flash-realtime" });
   expect(config.turn_detection).toEqual({ type: "semantic_vad" });
   await expect(page.getByText("Speaking", { exact: true })).not.toBeVisible();
   await expect(page.getByText("Listening", { exact: true })).not.toBeVisible();
   await page.evaluate(() => {
     const p = (window as any).__rtcProvider;
     p.send({ type: "input_audio_buffer.committed", item_id: "controlled-input" });
+    p.send({ type: "conversation.item.input_audio_transcription.completed", item_id: "controlled-input", transcript: "受控用户输入" });
     p.send({ type: "response.created", response: { id: "controlled-response" } });
     p.send({ type: "response.audio_transcript.delta", response_id: "controlled-response", item_id: "text", delta: "受控助手回复" });
     p.send({ type: "response.done", response: { id: "controlled-response", status: "completed",
       output: [{ type: "message", id: "text", content: [{ type: "audio", transcript: "受控助手回复" }] }] } });
   });
   await expect(page.locator("p").filter({ hasText: /^受控助手回复$/ })).toBeVisible();
+  await expect(page.locator("p").filter({ hasText: /^受控用户输入$/ })).toBeVisible();
   await page.evaluate(() => {
     const p = (window as any).__rtcProvider;
     p.send({ type: "input_audio_buffer.speech_started", item_id: "tool-input" });
@@ -192,6 +197,8 @@ test("原生 RTC 双向媒体、配置门控、元数据与工具控制回传", 
   await page.screenshot({ path: path.join(artifacts, "talk-connected.png"), fullPage: true });
   await info.attach("native-rtc-stats", { body: JSON.stringify({ before, after }), contentType: "application/json" });
   const facts = await (await fetch(`${fixtureUrl}/diagnostics`)).json();
+  expect(facts.transcripts.length - baseline.transcripts.length).toBe(1);
+  expect(facts.emotions.length - baseline.emotions.length).toBe(1);
   expect(facts.bootstraps - baseline.bootstraps).toBe(1);
   await info.attach("host-diagnostics", { body: JSON.stringify(facts), contentType: "application/json" });
   expect(facts.tool_calls - baseline.tool_calls).toBe(1);

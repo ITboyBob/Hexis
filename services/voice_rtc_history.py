@@ -1,6 +1,7 @@
-"""RTC 元数据与模型生成内容的数据库适配；不保存用户录音或转录。"""
+"""RTC 音频身份、最终转录及模型生成内容的数据库适配；不保存录音。"""
 
 from typing import Any
+import json
 from uuid import UUID
 
 
@@ -19,15 +20,21 @@ class RtcVoiceHistory:
         context_version: str,
     ) -> UUID:
         async with self.pool.acquire() as conn:
-            return await conn.fetchval(
-                "SELECT start_rtc_voice_input($1,$2,$3,$4,$5,$6)",
-                session_id,
-                media_session_id,
-                input_turn_id,
-                input_order,
-                provider_item_id,
-                context_version,
-            )
+            async with conn.transaction():
+                turn = await conn.fetchval(
+                    "SELECT start_rtc_voice_input($1,$2,$3,$4,$5,$6)",
+                    session_id,
+                    media_session_id,
+                    input_turn_id,
+                    input_order,
+                    provider_item_id,
+                    context_version,
+                )
+                await conn.execute(
+                    "UPDATE voice_rtc_inputs SET metadata=metadata || '{\"transcription_enabled\":true}'::jsonb WHERE input_turn_id=$1",
+                    input_turn_id,
+                )
+                return turn
 
     async def save_generated_output(
         self,
@@ -47,7 +54,7 @@ class RtcVoiceHistory:
             raise ValueError("RTC generation cannot prove browser playback completion")
         async with self.pool.acquire() as conn:
             await conn.fetchval(
-                "SELECT record_rtc_voice_output($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                "SELECT record_rtc_voice_output_with_input_order($1,$2,$3,$4,$5,$6,$7,$8,$9)",
                 session_id,
                 media_session_id,
                 input_turn_id,
@@ -58,3 +65,17 @@ class RtcVoiceHistory:
                 context_version,
                 final_for_turn,
             )
+
+    async def save_user_transcript(
+        self, *, session_id, media_session_id, input_turn_id, turn_id, text
+    ):
+        async with self.pool.acquire() as conn:
+            result = await conn.fetchval(
+                "SELECT save_rtc_user_transcript($1,$2,$3,$4,$5)",
+                session_id,
+                media_session_id,
+                input_turn_id,
+                turn_id,
+                text,
+            )
+        return json.loads(result) if isinstance(result, str) else result

@@ -17,12 +17,17 @@ class FixturePool:
         self.sessions = {}
         self.inputs = []
         self.outputs = []
+        self.transcripts = []
+        self.emotions = []
         self.bootstraps = 0
         self.offers = 0
         self.tool_calls = 0
         self.signaling_destinations = []
 
     def acquire(self):
+        return self
+
+    def transaction(self):
         return self
 
     async def __aenter__(self):
@@ -32,6 +37,16 @@ class FixturePool:
         return False
 
     async def fetchval(self, query, *args):
+        if "save_rtc_user_transcript" in query:
+            saved = {
+                "message_id": str(uuid4()),
+                "session_id": str(args[0]),
+                "turn_id": str(args[3]),
+                "input_turn_id": str(args[2]),
+                "text": args[4],
+            }
+            self.transcripts.append(saved)
+            return saved
         if "get_config_bool" in query:
             return True
         if "get_agent_consent_status" in query:
@@ -122,12 +137,20 @@ config = RtcConfig.from_mapping(
     }
 )
 port = int(os.environ["HEXIS_RTC_FIXTURE_PORT"])
+
+
+async def emotion(text):
+    pool.emotions.append({"text": text, "label": "happy"})
+    return {"label": "happy", "wordset_version": "v1"}
+
+
 runtime = RtcRuntime(
     pool_provider=lambda: pool,
     config_loader=lambda: config,
     control_url=lambda media: f"ws://127.0.0.1:{port}/api/voice/realtime/sessions/{media}/control",
     exchange_sdp=exchange,
     tool_executor=tool,
+    emotion_evaluator=emotion,
     tools_provider=lambda _surface: [
         {
             "type": "function",
@@ -160,6 +183,8 @@ async def diagnostics():
         "tool_calls": pool.tool_calls,
         "inputs": pool.inputs,
         "outputs": pool.outputs,
+        "transcripts": pool.transcripts,
+        "emotions": pool.emotions,
         "sessions": pool.sessions,
         "active_sessions": len(runtime.entries),
         "signaling_destinations": pool.signaling_destinations,

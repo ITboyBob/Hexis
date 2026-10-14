@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from services.voice_rtc_api import RtcRuntime
 from services.voice_rtc import RtcConfig
@@ -20,6 +21,9 @@ class Pool:
     def acquire(self):
         return self
 
+    def transaction(self):
+        return self
+
     async def __aenter__(self):
         return self
 
@@ -27,6 +31,10 @@ class Pool:
         return False
 
     async def fetchval(self, query, *args):
+        if "start_rtc_voice_input" in query:
+            return uuid4()
+        if "save_rtc_user_transcript" in query:
+            return {"message_id": str(uuid4())}
         if "get_config_bool" in query:
             return True
         if "get_agent_consent_status" in query:
@@ -92,7 +100,9 @@ def test_bootstrap_and_sdp_proxy_prepare_once_without_returning_credentials(
         assert result.status_code == 200
         descriptor = result.json()
         assert "test-credential" not in result.text
-        assert descriptor["session_config"]["input_audio_transcription"] is None
+        assert descriptor["session_config"]["input_audio_transcription"] == {
+            "model": "qwen3-asr-flash-realtime"
+        }
         media_id = descriptor["media_session_id"]
         answer = client.post(
             f"/api/voice/realtime/sessions/{media_id}/offer",
@@ -271,3 +281,69 @@ def test_context_failure_never_signals_or_keeps_media_session(monkeypatch):
         assert not app.state.rtc_runtime.entries
         assert not app.state.rtc_runtime._creating
         assert exchanges == []
+
+
+def test_control_websocket_delivers_transcript_and_emotion_with_stub(monkeypatch):
+    app, _, _ = make_app(monkeypatch)
+
+    async def emotion(text):
+        assert text == "用户输入"
+        return {"label": "happy", "wordset_version": "v1"}
+
+    app.state.rtc_runtime.emotion_evaluator = emotion
+    with TestClient(app) as client:
+        descriptor = client.post(
+            "/api/voice/realtime/sessions", json={"session_id": str(uuid4())}
+        ).json()
+        path = descriptor["control_url"].split("43817", 1)[1]
+        with client.websocket_connect(
+            path, headers={"origin": "http://localhost:3477"}
+        ) as ws:
+            assert ws.receive_json()["type"] == "control_ready"
+            seq = 0
+
+            def send(event):
+                nonlocal seq
+                ws.send_json(
+                    {
+                        "schema_version": 2,
+                        "session_id": descriptor["session_id"],
+                        "media_session_id": descriptor["media_session_id"],
+                        "producer_seq": seq,
+                        "type": "provider_event",
+                        "event": event,
+                    }
+                )
+                seq += 1
+
+            send({"type": "session.created", "session": {"id": "fixture-cloud"}})
+            send({"type": "session.updated", "session": descriptor["session_config"]})
+            assert ws.receive_json()["type"] == "ready"
+            send({"type": "input_audio_buffer.committed", "item_id": "input"})
+            assert ws.receive_json()["type"] == "input_committed"
+            send(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "item_id": "input",
+                    "transcript": "用户输入",
+                }
+            )
+            delivered = [ws.receive_json() for _ in range(3)]
+            assert {m["type"] for m in delivered} == {
+                "user_text",
+                "user_text_saved",
+                "emotion_result",
+            }
+            assert len({m["input_turn_id"] for m in delivered}) == 1
+            ws.send_json(
+                {
+                    "schema_version": 2,
+                    "session_id": descriptor["session_id"],
+                    "media_session_id": descriptor["media_session_id"],
+                    "producer_seq": seq,
+                    "type": "close",
+                    "reason": "manual",
+                }
+            )
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_json()

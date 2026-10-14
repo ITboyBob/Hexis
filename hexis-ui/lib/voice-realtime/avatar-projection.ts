@@ -12,6 +12,7 @@ import { initial, reduce } from "../avatar-preview/projection";
 import type { State as PreviewState } from "../avatar-preview/projection";
 import type { Composition } from "../avatar-preview/engine";
 import type { NativePlaybackIdentity } from "../voice-playback/native-player";
+import type { RtcServerMessage } from "./rtc-contracts";
 
 export type { VoiceBehaviorEvent } from "./contracts";
 
@@ -39,6 +40,23 @@ export function initialVoiceAvatarState(sessionId: string, mediaSessionId: strin
     recallActivities: {},
     localPlayback: null,
   };
+}
+
+/** RTC 结果只投影到当前已提交输入，复用既有表情与身份规则。 */
+export function applyRtcAvatarMessage(state: VoiceAvatarState, message: RtcServerMessage): VoiceAvatarState {
+  if (message.type !== "input_committed" && message.type !== "emotion_result") return state;
+  if (state.session_id !== message.session_id || state.media_session_id !== message.media_session_id) {
+    if (message.type !== "input_committed") return state;
+    state = initialVoiceAvatarState(message.session_id, message.media_session_id);
+  }
+  const identity: Identity = { session_id: message.session_id, input_turn_id: message.input_turn_id,
+    input_order: message.input_order, stimulus_revision: 0 };
+  const payload: Event["payload"] = message.type === "input_committed"
+    ? { type: "input_committed", identity, visual_owner: "service" }
+    : { type: "emotion", identity, wordset_version: message.wordset_version, status: "valid",
+      label: message.label, source: "real", visual_window: { status: "accepted", owner: "service", decision_seq: 1 } };
+  return { ...state, preview: reduce(state.preview, { event_id: `rtc:${message.producer_seq}`,
+    session_id: message.session_id, stream_id: message.media_session_id, producer_seq: message.producer_seq, payload }) };
 }
 
 export function setVoiceAvatarMediaSession(state: VoiceAvatarState, mediaSessionId: string): VoiceAvatarState {

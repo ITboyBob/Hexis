@@ -75,12 +75,14 @@ class RtcRuntime:
         tool_executor=None,
         tools_provider=None,
         origin_provider=None,
+        emotion_evaluator=None,
     ):
         self.pool_provider = pool_provider
         self.config_loader = config_loader
         self.control_url = control_url
         self.exchange_sdp = exchange_sdp
         self.tool_executor = tool_executor
+        self.emotion_evaluator = emotion_evaluator
         self.tools_provider = tools_provider or (lambda surface: [])
         self.origin_provider = origin_provider or (
             lambda: os.getenv("HEXIS_UI_ORIGIN", "http://localhost:3477")
@@ -237,6 +239,7 @@ class RtcRuntime:
                 tool_executor=self.tool_executor,
                 on_cloud_session=cloud_session,
                 on_usage=usage,
+                emotion_evaluator=self.emotion_evaluator,
             )
             session.tool_surface = req.tool_surface
             async with pool.acquire() as conn:

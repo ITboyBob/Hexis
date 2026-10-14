@@ -53,7 +53,7 @@ type ChatMessage = {
   ui?: ChatUiArtifact[];
   incomplete?: boolean;
   error?: string;
-  voice?: { inputTurnId?: string; turnId?: string; responseId?: string; pending: boolean };
+  voice?: { inputTurnId?: string; inputOrder?: number; mediaSessionId?: string; turnId?: string; responseId?: string; pending: boolean };
   m5Report?: { reportId?: string };
 };
 
@@ -1065,6 +1065,8 @@ function dbMessagesToChatMessages(value: unknown): ChatMessage[] | null {
           } : undefined,
         voice: metadata?.channel === "voice" ? {
           inputTurnId: typeof metadata.input_turn_id === "string" ? metadata.input_turn_id : undefined,
+          inputOrder: typeof metadata.input_order === "number" ? metadata.input_order : undefined,
+          mediaSessionId: typeof metadata.media_session_id === "string" ? metadata.media_session_id : undefined,
           turnId: typeof metadata.agent_turn_id === "string" ? metadata.agent_turn_id : undefined,
           responseId: typeof metadata.response_id === "string" ? metadata.response_id : undefined,
           pending: false,
@@ -1092,7 +1094,16 @@ function mergePersistedMessages(
 ): ChatMessage[] {
   // 普通文字使用独立的前端 ID；只协调语音和具备数据库 ID 的后台报告。
   const candidates = restored.filter((message) => message.m5Report || (includeVoice && message.voice));
-  const merged = current.map((local) => candidates.find((saved) => samePersistedMessage(local, saved)) ?? local);
+  const merged = current.map((local) => {
+    const saved = candidates.find((candidate) => samePersistedMessage(local, candidate));
+    if (!saved) return local;
+    if (!saved.voice) return saved;
+    return { ...saved, voice: { ...saved.voice,
+      inputOrder: saved.voice.inputOrder ?? local.voice?.inputOrder,
+      mediaSessionId: saved.voice.mediaSessionId ?? local.voice?.mediaSessionId,
+      inputTurnId: saved.voice.inputTurnId ?? local.voice?.inputTurnId,
+      turnId: saved.voice.turnId ?? local.voice?.turnId } };
+  });
   for (let index = 0; index < restored.length; index++) {
     const saved = restored[index];
     if (!candidates.includes(saved) || merged.some((local) => samePersistedMessage(local, saved))) continue;
@@ -1233,10 +1244,26 @@ export default function ChatPage() {
   }, []);
 
   const handleVoiceChatText = useCallback((update: VoiceChatText) => {
-    if (update.kind !== "assistant") return;
     if (sessionIdRef.current !== update.sessionId) return;
     setMessages((current) => {
       if (sessionIdRef.current !== update.sessionId) return current;
+      if (update.kind === "user") {
+        const match = current.findIndex((message) => message.role === "user" && message.voice?.inputTurnId === update.inputTurnId);
+        const message: ChatMessage = { id: update.messageId ?? `voice:user:${update.inputTurnId}`, role: "user", content: update.text,
+          voice: { inputTurnId: update.inputTurnId, inputOrder: update.inputOrder, mediaSessionId: update.mediaSessionId,
+            turnId: update.turnId, pending: !update.messageId } };
+        if (match >= 0) {
+          if (!current[match].voice?.pending && !update.messageId) return current;
+          return current.map((saved, index) => index === match ? message : saved);
+        }
+        const before = current.findIndex((saved) =>
+          (update.turnId && saved.voice?.turnId === update.turnId) ||
+          (update.mediaSessionId && saved.voice?.mediaSessionId === update.mediaSessionId &&
+            update.inputOrder !== undefined && saved.voice.inputOrder !== undefined && saved.voice.inputOrder > update.inputOrder));
+        const messages = [...current];
+        messages.splice(before >= 0 ? before : messages.length, 0, message);
+        return messages;
+      }
       const match = current.findIndex((message) => message.role === "assistant" && message.voice && (
         message.voice.responseId ? message.voice.responseId === update.responseId : message.voice.turnId === update.turnId
       ));
@@ -1249,7 +1276,8 @@ export default function ChatPage() {
       return [...current, {
         id: `voice:assistant:${update.responseId}`,
         role: update.kind, content: update.text,
-        voice: { turnId: update.turnId, responseId: update.responseId, pending: true },
+        voice: { turnId: update.turnId, responseId: update.responseId, inputTurnId: update.inputTurnId,
+          inputOrder: update.inputOrder, mediaSessionId: update.mediaSessionId, pending: true },
       }];
     });
   }, []);
